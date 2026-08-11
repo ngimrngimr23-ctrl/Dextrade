@@ -12,11 +12,14 @@ Market Search API, который сам подбирает ближайший �
 """
 
 import json
+import logging
 import re
 import time
 from pathlib import Path
 
 import aiohttp
+
+log = logging.getLogger("steam_bot.pricing")
 
 from sticker_catalog import get_catalog
 from storage import get_price, set_price
@@ -88,10 +91,20 @@ async def _price_overview(session: aiohttp.ClientSession, market_hash_name: str)
     params = {"appid": 730, "currency": 1, "market_hash_name": market_hash_name}
     async with session.get(url, params=params) as resp:
         if resp.status != 200:
+            log.warning("priceoverview: HTTP %s для %s", resp.status, market_hash_name)
+            return None
+        ctype = resp.content_type
+        if ctype != "application/json":
+            body_start = (await resp.text())[:200]
+            log.warning(
+                "priceoverview: не JSON (%s) для %s, похоже на блокировку Steam: %r",
+                ctype, market_hash_name, body_start,
+            )
             return None
         data = await resp.json()
 
     if not data.get("success"):
+        log.warning("priceoverview: success=false для %s (%r)", market_hash_name, data)
         return None
 
     raw = data.get("median_price") or data.get("lowest_price")
@@ -118,11 +131,21 @@ async def _search_price(session: aiohttp.ClientSession, query: str) -> tuple[str
     }
     async with session.get(url, params=params) as resp:
         if resp.status != 200:
+            log.warning("market/search: HTTP %s для запроса %r", resp.status, query)
+            return None
+        ctype = resp.content_type
+        if ctype != "application/json":
+            body_start = (await resp.text())[:200]
+            log.warning(
+                "market/search: не JSON (%s) для запроса %r, похоже на блокировку Steam: %r",
+                ctype, query, body_start,
+            )
             return None
         data = await resp.json()
 
     results = data.get("results") or []
     if not results:
+        log.warning("market/search: пусто для запроса %r", query)
         return None
 
     item = results[0]
@@ -174,4 +197,10 @@ async def get_sticker_prices(sticker_keys: set[str]) -> dict[str, float]:
                 import asyncio
                 await asyncio.sleep(1.2)
 
+    zero_count = sum(1 for v in result.values() if v == 0.0)
+    log.info(
+        "get_sticker_prices: %s ключей, %s с нулевой ценой (не найдено/заблокировано)",
+        len(result), zero_count,
+    )
     return result
+    
