@@ -28,6 +28,8 @@ IP типа Render) — есть запасной путь через ручну
 import json
 import logging
 import os
+import subprocess
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -155,12 +157,69 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return  # файл без активной /scanfile-сессии — просто игнорируем
 
     document = update.message.document
+    filename = (document.file_name or "").lower()
     try:
         tg_file = await context.bot.get_file(document.file_id)
-        raw = await tg_file.download_as_bytearray()
-        data = json.loads(bytes(raw).decode("utf-8"))
+        raw = bytes(await tg_file.download_as_bytearray())
+
+        # PDF (частый случай на мобильных: "Печать -> Сохранить как PDF"
+        # вместо обычного скачивания файла) — вытаскиваем текст через pdftotext
+        # и склеиваем строки, разорванные печатным макетом, перед парсингом JSON.
+        is_pdf = raw[:4] == b"%PDF" or filename.endswith(".pdf")
+        if is_pdf:
+            with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp_pdf:
+                tmp_pdf.write(raw)
+                tmp_pdf.flush()
+                proc = subprocess.run(
+                    ["pdftotext", "-raw", tmp_pdf.name, "-"],
+                    capture_output=True,
+                )
+            if proc.returncode != 0:
+                raise ValueError(f"не удалось извлечь текст из PDF: {proc.stderr.decode(errors='replace')}")
+            text = proc.stdout.decode("utf-8", errors="replace")
+            # pdftotext переносит длинные строки — склеиваем всё в одну строку,
+            # JSON без переносов внутри строковых значений парсится нормально
+            text = "".join(line.strip() for line in text.splitlines())
+            # при печати страницы с встроенным JSON-viewer'ом браузера (Chrome/Firefox)
+            # плавающая панель инструментов ("Автоформатировать", "Копировать" и т.п.)
+            # попадает в текстовый слой PDF прямо посреди JSON-строк, ломая парсинг —
+            # вычищаем известные подписи этой панели
+            for artifact in (
+                "Автоформатировать", "Свернуть все", "Развернуть все",
+                "Развернуть всё", "Свернуть всё", "Необработанные данные",
+                "Отфильтровать JSON", "Скопировать", "Копировать", "Сохранить как",
+                "Заголовки", "Pretty Print", "Raw Data", "Save As", "Copy",
+                "Collapse All", "Expand All", "Filter JSON",
+            ):
+                text = text.replace(artifact, "")
+        else:
+            text = None
+            for enc in ("utf-8", "utf-8-sig", "cp1251", "latin-1"):
+                try:
+                    text = raw.decode(enc)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if text is None:
+                raise ValueError("не удалось определить кодировку файла")
+            text = text.strip()
+
+        # если файл (HTML-страница целиком или PDF с шапкой браузера) содержит
+        # что-то до/после JSON — вытаскиваем именно JSON-объект
+        if not text.startswith("{"):
+            start = text.find("{")
+            end = text.rfind("}")
+            if start == -1 or end == -1 or end <= start:
+                raise ValueError("в файле не найден JSON-объект (похоже, это не тот файл)")
+            text = text[start:end + 1]
+
+        data = json.loads(text)
     except Exception as e:
-        await update.message.reply_text(f"Не смог прочитать файл как JSON: {e}")
+        await update.message.reply_text(
+            f"Не смог прочитать файл как JSON: {e}\n\n"
+            f"Присылай либо сохранённый .json (Ctrl+S -> Текстовый файл), либо "
+            f"PDF, сохранённый через «Печать -> Сохранить как PDF» с той же страницы."
+        )
         return
 
     total_count = data.get("total_count", 0)
@@ -241,3 +300,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+        
