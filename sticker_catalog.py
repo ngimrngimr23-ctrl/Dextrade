@@ -19,10 +19,13 @@ ByMykel/CSGO-API (статический JSON, обновляется мейнт
 """
 
 import json
+import logging
 import time
 from pathlib import Path
 
 import aiohttp
+
+log = logging.getLogger("steam_bot.sticker_catalog")
 
 from steam_client import STICKER_RE
 
@@ -50,12 +53,18 @@ async def _download_catalog() -> dict[str, str]:
             try:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                     if resp.status != 200:
+                        log.warning("sticker_catalog: HTTP %s для %s", resp.status, url)
                         continue
-                    items = await resp.json()
+                    # raw.githubusercontent.com отдаёт JSON с Content-Type: text/plain,
+                    # поэтому просим aiohttp не проверять mimetype строго (та же история,
+                    # что и в csgo_api.py)
+                    items = await resp.json(content_type=None)
             except Exception:
                 # источник временно недоступен — не валим весь бот, просто без этого файла
+                log.exception("sticker_catalog: не удалось скачать/распарсить %s", url)
                 continue
 
+            added = 0
             for item in items:
                 image = item.get("image")
                 name = item.get("market_hash_name")
@@ -64,7 +73,11 @@ async def _download_catalog() -> dict[str, str]:
                 key = _extract_key(image)
                 if key:
                     catalog[key] = name
+                    added += 1
 
+            log.info("sticker_catalog: %s записей из %s", added, url)
+
+    log.info("sticker_catalog: итого в каталоге %s ключей", len(catalog))
     return catalog
 
 
@@ -105,3 +118,4 @@ async def get_catalog(force_refresh: bool = False) -> dict[str, str]:
     if cached:
         return cached[0]
     return {}
+    
