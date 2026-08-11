@@ -35,7 +35,7 @@ def market_hash_name_from_url(url: str) -> str:
     """
     parsed = urllib.parse.urlparse(url)
     parts = parsed.path.rstrip("/").split("/")
-    # .../market/listings/730/<name>
+    # .../market/listings/730/<n>
     name_encoded = parts[-1]
     return urllib.parse.unquote(name_encoded)
 
@@ -68,7 +68,9 @@ def _sticker_code_to_display(collection: str, code: str) -> str:
 async def fetch_all_listings(market_hash_name: str) -> list[Listing]:
     """Тянем все страницы листингов для предмета и парсим цену + стикеры каждого лота."""
     listings: list[Listing] = []
-    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+    async with aiohttp.ClientSession(
+        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/plain, */*"}
+    ) as session:
         start = 0
         total_count = None
         while total_count is None or start < total_count:
@@ -79,6 +81,19 @@ async def fetch_all_listings(market_hash_name: str) -> list[Listing]:
                     await asyncio.sleep(10)
                     continue
                 resp.raise_for_status()
+
+                content_type = resp.headers.get("Content-Type", "")
+                if "application/json" not in content_type:
+                    # Steam вместо JSON отдал HTML — обычно это анти-бот/гео-заглушка
+                    # или блокировка датацентрового IP. Показываем начало страницы,
+                    # чтобы понять причину, вместо невнятной ошибки декодирования.
+                    body = await resp.text()
+                    snippet = body[:300].replace("\n", " ").strip()
+                    raise RuntimeError(
+                        f"Steam вернул не JSON, а {content_type!r}. "
+                        f"Начало ответа: {snippet!r}"
+                    )
+
                 data = await resp.json()
 
             total_count = data.get("total_count", 0)
