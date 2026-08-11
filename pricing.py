@@ -9,8 +9,22 @@ Market Search API, который сам подбирает ближайший �
 Это эвристика: на редких/новых кодах может промахнуться.
 Файл sticker_overrides.json — твой способ поправить конкретные коды руками,
 если бот подобрал не тот стикер (см. README).
+
+ИЗМЕНЕНИЯ (диагностика 429 на market/search, 2026-08):
+- если каталог (get_catalog) пустой — это раньше молча отправляло ВСЕ ключи
+  в market/search (жёсткий рейт-лимит) вместо priceoverview (мягкий).
+  Теперь это логируется явно.
+- добавлен retry с backoff на 429 для обоих эндпоинтов.
+- 0.0 больше не кэшируется при 429/сетевой ошибке — только при реальном
+  "предмет не найден" (200 OK, но пустой результат), чтобы не запирать
+  цену в ноль на 12 часов из-за временного рейт-лимита.
+- добавлена одноразовая диагностика при старте get_sticker_prices:
+  сравнивает, отвечает ли priceoverview на известном предмете, пока
+  market/search уже 429-ит — чтобы понять, забанен IP целиком или
+  только на search.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -19,13 +33,22 @@ from pathlib import Path
 
 import aiohttp
 
-log = logging.getLogger("steam_bot.pricing")
-
 from sticker_catalog import get_catalog
 from storage import get_price, set_price
 
+log = logging.getLogger("steam_bot.pricing")
+
 OVERRIDES_PATH = Path(__file__).parent / "sticker_overrides.json"
 CACHE_TTL_SECONDS = 12 * 60 * 60  # 12 часов — цены на стикеры не скачут ежеминутно
+
+MAX_RETRIES_429 = 3
+RETRY_BASE_DELAY = 8  # секунд, растёт экспоненциально: 8, 16, 32
+REQUEST_DELAY = 1.2  # пауза между запросами (используется для priceoverview)
+SEARCH_REQUEST_DELAY = 4.0  # market/search лимитируется жёстче — пауза больше
+
+# Предмет, который точно существует и стабильно торгуется — для диагностики
+# "жив ли вообще priceoverview с этого IP", независимо от каталога стикеров.
+DIAGNOSTIC_PROBE_NAME = "Sticker | Katowice 2014 (Holo)"
 
 # collection-код из имени файла -> человекочитаемое название турнира/капсулы
 COLLECTION_TO_EVENT = {
@@ -81,6 +104,37 @@ def _load_overrides() -> dict:
     return {}
 
 
+class RateLimited(Exception):
+    """Внутренний маркер: после MAX_RETRIES_429 попыток всё ещё 429."""
+
+
+async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict, label: str):
+    """
+    GET с retry на 429 (экспоненциальный backoff). Возвращает распарсенный JSON
+    или None при не-429 ошибке. Бросает RateLimited, если все попытки съели 429 —
+    это отдельный случай от "предмета не существует", чтобы вызывающий код не
+    кэшировал 0.0 как будто предмет реально не найден.
+    """
+    delay = RETRY_BASE_DELAY
+    for attempt in range(1, MAX_RETRIES_429 + 1):
+        async with session.get(url, params=params) as resp:
+            if resp.status == 429:
+                log.warning(
+                    "%s: HTTP 429 (попытка %s/%s) для запроса %r",
+                    label, attempt, MAX_RETRIES_429, params.get("query") or params.get("market_hash_name"),
+                )
+                if attempt == MAX_RETRIES_429:
+                    raise RateLimited()
+                await asyncio.sleep(delay)
+                delay *= 2
+                continue
+            if resp.status != 200:
+                log.warning("%s: HTTP %s для запроса %r", label, resp.status, params.get("query") or params.get("market_hash_name"))
+                return None
+            return await resp.json()
+    raise RateLimited()
+
+
 async def _price_overview(session: aiohttp.ClientSession, market_hash_name: str) -> float | None:
     """
     Точное имя уже известно (из каталога/override) -> берём priceoverview.
@@ -89,22 +143,9 @@ async def _price_overview(session: aiohttp.ClientSession, market_hash_name: str)
     """
     url = "https://steamcommunity.com/market/priceoverview/"
     params = {"appid": 730, "currency": 1, "market_hash_name": market_hash_name}
-    async with session.get(url, params=params) as resp:
-        if resp.status != 200:
-            log.warning("priceoverview: HTTP %s для %s", resp.status, market_hash_name)
-            return None
-        ctype = resp.content_type
-        if ctype != "application/json":
-            body_start = (await resp.text())[:200]
-            log.warning(
-                "priceoverview: не JSON (%s) для %s, похоже на блокировку Steam: %r",
-                ctype, market_hash_name, body_start,
-            )
-            return None
-        data = await resp.json()
+    data = await _get_with_retry(session, url, params, "priceoverview")
 
-    if not data.get("success"):
-        log.warning("priceoverview: success=false для %s (%r)", market_hash_name, data)
+    if not data or not data.get("success"):
         return None
 
     raw = data.get("median_price") or data.get("lowest_price")
@@ -129,23 +170,12 @@ async def _search_price(session: aiohttp.ClientSession, query: str) -> tuple[str
         "appid": 730,
         "norender": 1,
     }
-    async with session.get(url, params=params) as resp:
-        if resp.status != 200:
-            log.warning("market/search: HTTP %s для запроса %r", resp.status, query)
-            return None
-        ctype = resp.content_type
-        if ctype != "application/json":
-            body_start = (await resp.text())[:200]
-            log.warning(
-                "market/search: не JSON (%s) для запроса %r, похоже на блокировку Steam: %r",
-                ctype, query, body_start,
-            )
-            return None
-        data = await resp.json()
+    data = await _get_with_retry(session, url, params, "market/search")
 
+    if not data:
+        return None
     results = data.get("results") or []
     if not results:
-        log.warning("market/search: пусто для запроса %r", query)
         return None
 
     item = results[0]
@@ -155,27 +185,77 @@ async def _search_price(session: aiohttp.ClientSession, query: str) -> tuple[str
     return item.get("name", query), price_cents / 100.0
 
 
-async def _fetch_one_price(session: aiohttp.ClientSession, key: str, overrides: dict, catalog: dict) -> tuple[str, float]:
+async def _fetch_one_price(session: aiohttp.ClientSession, key: str, overrides: dict, catalog: dict) -> tuple[str, float, bool]:
+    """
+    Возвращает (имя, цена, ok). ok=False означает "не удалось узнать цену
+    из-за рейт-лимита/ошибки сети" — такое НЕ должно кэшироваться как 0.0,
+    в отличие от настоящего "предмет не найден на маркете".
+    """
     name_or_query, is_exact = _resolve_market_hash_name(key, overrides, catalog)
-    if is_exact:
-        price = await _price_overview(session, name_or_query)
-        if price is not None:
-            return name_or_query, price
-        # priceoverview иногда пуст для совсем неликвидных стикеров — пробуем search тем же именем
-        found = await _search_price(session, name_or_query)
-        return (found[0], found[1]) if found else (name_or_query, 0.0)
+    try:
+        if is_exact:
+            price = await _price_overview(session, name_or_query)
+            if price is not None:
+                return name_or_query, price, True
+            # priceoverview иногда пуст для совсем неликвидных стикеров — пробуем search тем же именем
+            found = await _search_price(session, name_or_query)
+            if found:
+                return found[0], found[1], True
+            return name_or_query, 0.0, True  # реально не найдено (200 OK, пусто)
 
-    found = await _search_price(session, name_or_query)
-    return (found[0], found[1]) if found else (name_or_query, 0.0)
+        found = await _search_price(session, name_or_query)
+        if found:
+            return found[0], found[1], True
+        return name_or_query, 0.0, True  # реально не найдено
+
+    except RateLimited:
+        return name_or_query, 0.0, False
+
+
+async def _diagnose_rate_limit(session: aiohttp.ClientSession) -> None:
+    """
+    Одноразовая проверка при старте партии: жив ли priceoverview с этого IP
+    независимо от каталога/search. Если он тоже 429-ит — банится сам IP
+    (датацентровый Render-адрес), а не только market/search.
+    Если priceoverview отвечает нормально, а search 429-ит — лимит именно
+    на search, и решение — просто не ходить туда без необходимости.
+    """
+    url = "https://steamcommunity.com/market/priceoverview/"
+    params = {"appid": 730, "currency": 1, "market_hash_name": DIAGNOSTIC_PROBE_NAME}
+    try:
+        async with session.get(url, params=params) as resp:
+            if resp.status == 429:
+                log.warning("ДИАГНОСТИКА: priceoverview ТОЖЕ вернул 429 — похоже, забанен сам IP, не только market/search")
+            elif resp.status == 200:
+                data = await resp.json()
+                if data.get("success"):
+                    log.info("ДИАГНОСТИКА: priceoverview отвечает нормально (%s) — бан похоже только на market/search", DIAGNOSTIC_PROBE_NAME)
+                else:
+                    log.warning("ДИАГНОСТИКА: priceoverview вернул 200, но success=false для %r", DIAGNOSTIC_PROBE_NAME)
+            else:
+                log.warning("ДИАГНОСТИКА: priceoverview вернул неожиданный статус %s", resp.status)
+    except Exception:
+        log.exception("ДИАГНОСТИКА: не удалось выполнить пробный запрос к priceoverview")
 
 
 async def get_sticker_prices(sticker_keys: set[str]) -> dict[str, float]:
     """
     На входе — множество ключей вида 'paris2023:sig_dupreeh_champion'.
     На выходе — {ключ: цена в USD}. Отсутствующие/не найденные просто не попадут в словарь.
+    Ключи, для которых запрос упёрся в рейт-лимит (а не "предмет реально не найден"),
+    тоже не попадут в результат и не закэшируются нулём — их подхватит следующий прогон.
     """
     overrides = _load_overrides()
     catalog = await get_catalog()
+
+    if not catalog:
+        log.warning(
+            "get_sticker_prices: каталог стикеров ПУСТ — все %s ключей уйдут в market/search "
+            "(жёсткий рейт-лимит) вместо priceoverview. Проверь sticker_catalog: "
+            "не упало ли скачивание с GitHub и не эфемерный ли диск под кэшем.",
+            len(sticker_keys),
+        )
+
     now = time.time()
     result: dict[str, float] = {}
     to_fetch = []
@@ -188,19 +268,29 @@ async def get_sticker_prices(sticker_keys: set[str]) -> dict[str, float]:
             to_fetch.append(key)
 
     if to_fetch:
+        rate_limited_count = 0
         async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
-            for key in to_fetch:
-                matched_name, price = await _fetch_one_price(session, key, overrides, catalog)
-                await set_price(key, matched_name, price, CACHE_TTL_SECONDS)
-                result[key] = price
-                # Steam лимитирует и priceoverview, и search — не долбим часто
-                import asyncio
-                await asyncio.sleep(1.2)
+            await _diagnose_rate_limit(session)
 
-    zero_count = sum(1 for v in result.values() if v == 0.0)
-    log.info(
-        "get_sticker_prices: %s ключей, %s с нулевой ценой (не найдено/заблокировано)",
-        len(result), zero_count,
-    )
+            for key in to_fetch:
+                name_or_query, is_exact = _resolve_market_hash_name(key, overrides, catalog)
+                matched_name, price, ok = await _fetch_one_price(session, key, overrides, catalog)
+
+                if ok:
+                    await set_price(key, matched_name, price, CACHE_TTL_SECONDS)
+                    result[key] = price
+                else:
+                    rate_limited_count += 1
+
+                # market/search лимитируется жёстче priceoverview — пауза больше именно для него
+                await asyncio.sleep(REQUEST_DELAY if is_exact else SEARCH_REQUEST_DELAY)
+
+        if rate_limited_count:
+            log.warning(
+                "get_sticker_prices: %s ключей из %s не удалось узнать из-за рейт-лимита "
+                "(не закэшированы нулём, будут повторены в следующем прогоне)",
+                rate_limited_count, len(to_fetch),
+            )
+
     return result
     
