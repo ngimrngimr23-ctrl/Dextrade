@@ -1,0 +1,4 @@
+{
+  "_comment": "Если бот неверно угадал название стикера по коду — впиши сюда точный запрос для Steam Market Search. Ключ = 'коллекция:код' (см. в логах или sticker_prices.db, колонка sticker_key).",
+  "paris2023:sig_dupreeh_champion": "dupreeh (Champion) Paris 2023"
+}
