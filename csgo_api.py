@@ -2,18 +2,22 @@
 Поиск предметов CS2 по названию (в т.ч. на русском) через открытую
 статическую базу ByMykel/CSGO-API (https://github.com/ByMykel/CSGO-API).
 
-Это НЕ Steam API — данные хостятся на GitHub Pages, поэтому не подвержены
-блокировке датацентровых IP (Render и т.п.), с которой сталкивается сам
-Steam Market. Данные собираются из игровых файлов (items_game.txt) и
-обновляются периодически, так что самые свежие кейсы могут появиться
-в базе с задержкой в несколько дней.
+Это НЕ Steam API — данные хостятся на GitHub (raw.githubusercontent.com),
+поэтому не подвержены блокировке датацентровых IP (Render и т.п.), с
+которой сталкивается сам Steam Market. Данные собираются из игровых
+файлов (items_game.txt) и обновляются периодически, так что самые
+свежие кейсы могут появиться в базе с задержкой в несколько дней.
+
+Важно: хостинг на GitHub Pages (bymykel.github.io / bymykel.com) отдаёт
+только 2 языка (en, zh-CN) — там нет ru. Полный набор из 28 языков,
+включая ru, лежит на raw.githubusercontent.com, поэтому используем его.
 """
 
 import time
 
 import aiohttp
 
-CSGO_API_BASE = "https://bymykel.github.io/CSGO-API/api"
+CSGO_API_BASE = "https://raw.githubusercontent.com/ByMykel/CSGO-API/main/public/api"
 _CACHE_TTL = 6 * 3600  # обновляем раз в 6 часов, база меняется редко
 
 # language -> (timestamp_загрузки, список_предметов)
@@ -73,3 +77,4 @@ async def search_items(query: str, language: str = "ru", count: int = 10) -> lis
         if len(out) >= count:
             break
     return out
+    
