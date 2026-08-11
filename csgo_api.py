@@ -1,6 +1,6 @@
 """
-Поиск предметов CS2 по названию (в т.ч. на русском) через открытую
-статическую базу ByMykel/CSGO-API (https://github.com/ByMykel/CSGO-API).
+Поиск предметов CS2 по названию через открытую статическую базу
+ByMykel/CSGO-API (https://github.com/ByMykel/CSGO-API).
 
 Это НЕ Steam API — данные хостятся на GitHub (raw.githubusercontent.com),
 поэтому не подвержены блокировке датацентровых IP (Render и т.п.), с
@@ -8,9 +8,10 @@
 файлов (items_game.txt) и обновляются периодически, так что самые
 свежие кейсы могут появиться в базе с задержкой в несколько дней.
 
-Важно: хостинг на GitHub Pages (bymykel.github.io / bymykel.com) отдаёт
-только 2 языка (en, zh-CN) — там нет ru. Полный набор из 28 языков,
-включая ru, лежит на raw.githubusercontent.com, поэтому используем его.
+Важно: в опубликованном виде (что на bymykel.github.io/bymykel.com,
+что на raw.githubusercontent.com) реально выложено только 2 языка —
+en и zh-CN. Русского (ru) там нет, поэтому ищем по английским
+названиям (например "AK-47 | Slate", а не "AK-47 | Сланец").
 """
 
 import time
@@ -24,7 +25,7 @@ _CACHE_TTL = 6 * 3600  # обновляем раз в 6 часов, база м�
 _cache: dict[str, tuple[float, list[dict]]] = {}
 
 
-async def _load_items(language: str = "ru") -> list[dict]:
+async def _load_items(language: str = "en") -> list[dict]:
     now = time.time()
     cached = _cache.get(language)
     if cached and now - cached[0] < _CACHE_TTL:
@@ -42,10 +43,11 @@ async def _load_items(language: str = "ru") -> list[dict]:
     return data
 
 
-async def search_items(query: str, language: str = "ru", count: int = 10) -> list[dict]:
+async def search_items(query: str, language: str = "en", count: int = 10) -> list[dict]:
     """
-    Ищет предметы по названию в статической базе (не Steam!). Возвращает
-    список {"name": <локализованное название>, "hash_name": <market_hash_name>},
+    Ищет предметы по названию (на английском — см. примечание в шапке
+    файла) в статической базе (не Steam!). Возвращает список
+    {"name": <английское название>, "hash_name": <market_hash_name>},
     отсортированный от более точных совпадений к менее точным.
     """
     items = await _load_items(language)
