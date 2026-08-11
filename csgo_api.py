@@ -37,7 +37,9 @@ async def _load_items(language: str = "en") -> list[dict]:
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
         async with session.get(url) as resp:
             resp.raise_for_status()
-            data = await resp.json()
+            # raw.githubusercontent.com отдаёт JSON с Content-Type: text/plain,
+            # поэтому просим aiohttp не проверять mimetype строго
+            data = await resp.json(content_type=None)
 
     _cache[language] = (now, data)
     return data
@@ -79,3 +81,4 @@ async def search_items(query: str, language: str = "en", count: int = 10) -> lis
         if len(out) >= count:
             break
     return out
+    
