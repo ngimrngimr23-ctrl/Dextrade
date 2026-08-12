@@ -17,6 +17,7 @@ class Offer:
     stickers_value: float
     markup_pct: float
     stickers: list[str]
+    inspect_link: str | None = None
 
 
 def _floor_price(listings: list[Listing]) -> float:
@@ -56,8 +57,10 @@ def find_offers(
         # стоимостью стикеров, а не с полной ценой лота
         overpay = listing.price - floor_price
 
-        markup = overpay - stickers_value
-        markup_pct = (markup / stickers_value) * 100 if stickers_value else float("inf")
+        # markup_pct = какую долю реальной стоимости стикеров ты фактически
+        # платишь сверху. 0% — стикеры достались бесплатно, 100% — платишь
+        # ровно их полную стоимость (уже не выгодно), больше 100% — переплата.
+        markup_pct = (overpay / stickers_value) * 100 if stickers_value else float("inf")
 
         if markup_pct <= max_markup_pct:
             offers.append(
@@ -68,6 +71,7 @@ def find_offers(
                     stickers_value=stickers_value,
                     markup_pct=markup_pct,
                     stickers=listing.stickers,
+                    inspect_link=listing.inspect_link,
                 )
             )
 
