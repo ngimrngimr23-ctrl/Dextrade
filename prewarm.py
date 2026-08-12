@@ -19,7 +19,7 @@ import time
 
 from pricing import CACHE_TTL_SECONDS, _load_overrides, _fetch_one_price
 from sticker_catalog import get_catalog
-from storage import get_price, set_price, all_known_keys
+from storage import get_prices_batch, set_price, all_known_keys
 
 import aiohttp
 
@@ -37,11 +37,13 @@ async def _prewarm_once():
         log.info("prewarm: нечего обновлять")
         return
 
-    stale_keys = []
-    for key in keys:
-        cached = await get_price(key)
-        if not cached or (now - cached["updated_at"]) > (CACHE_TTL_SECONDS - REFRESH_MARGIN_SECONDS):
-            stale_keys.append(key)
+    cached_map = await get_prices_batch(keys)
+    stale_keys = [
+        key
+        for key in keys
+        if not cached_map.get(key)
+        or (now - cached_map[key]["updated_at"]) > (CACHE_TTL_SECONDS - REFRESH_MARGIN_SECONDS)
+    ]
 
     if not stale_keys:
         log.info("prewarm: все %d стикер(ов) ещё свежие", len(keys))

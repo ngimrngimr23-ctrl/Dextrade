@@ -28,11 +28,12 @@ import logging
 import re
 import time
 from pathlib import Path
+from typing import Optional
 
 import aiohttp
 
 from sticker_catalog import get_catalog
-from storage import get_price, set_price
+from storage import get_prices_batch, set_prices_batch
 
 log = logging.getLogger("steam_bot.pricing")
 
@@ -390,8 +391,13 @@ async def get_sticker_prices(sticker_keys: set[str]) -> dict[str, float]:
     result: dict[str, float] = {}
     to_fetch = []
 
-    for key in sticker_keys:
-        cached = await get_price(key)
+    # Одним запросом (MGET) проверяем кэш сразу по всем ключам, вместо
+    # отдельного HTTP-похода в Upstash на каждый стикер по очереди —
+    # на лоте с десятками стикеров это раньше было главной причиной паузы.
+    keys_list = list(sticker_keys)
+    cached_map = await get_prices_batch(keys_list)
+    for key in keys_list:
+        cached = cached_map.get(key)
         if cached and (now - cached["updated_at"]) < CACHE_TTL_SECONDS:
             result[key] = cached["price"]
         else:
@@ -403,15 +409,18 @@ async def get_sticker_prices(sticker_keys: set[str]) -> dict[str, float]:
     # Ручной прайс-лист проверяем сразу, без сети — это настоящие Steam-цены,
     # присланные пользователем вручную (собраны с телефона, не банятся).
     still_to_fetch = []
+    manual_hits: list[tuple[str, Optional[str], float, int]] = []
     for key in to_fetch:
         name_or_query, is_exact = _resolve_market_hash_name(key, overrides, catalog)
         if is_exact and name_or_query in manual_prices:
             price = manual_prices[name_or_query]
-            await set_price(key, name_or_query, price, CACHE_TTL_SECONDS)
+            manual_hits.append((key, name_or_query, price, CACHE_TTL_SECONDS))
             result[key] = price
         else:
             still_to_fetch.append(key)
 
+    if manual_hits:
+        await set_prices_batch(manual_hits)
     if manual_prices and len(still_to_fetch) < len(to_fetch):
         log.info("get_sticker_prices: %s ключей закрыто ручным прайс-листом", len(to_fetch) - len(still_to_fetch))
 
@@ -427,15 +436,19 @@ async def get_sticker_prices(sticker_keys: set[str]) -> dict[str, float]:
         if not ct_prices:
             log.warning("get_sticker_prices: прайс-лист csgotrader.app пуст/недоступен, все ключи уйдут сразу на Steam-фолбэк")
 
+        ct_hits: list[tuple[str, Optional[str], float, int]] = []
         for key in to_fetch:
             name_or_query, is_exact = _resolve_market_hash_name(key, overrides, catalog)
 
             ct_price = ct_prices.get(name_or_query) if is_exact else None
             if ct_price is not None:
-                await set_price(key, name_or_query, ct_price, CACHE_TTL_SECONDS)
+                ct_hits.append((key, name_or_query, ct_price, CACHE_TTL_SECONDS))
                 result[key] = ct_price
             else:
                 steam_fallback_needed.append((key, name_or_query, is_exact))
+
+        if ct_hits:
+            await set_prices_batch(ct_hits)
 
         if steam_fallback_needed:
             log.info("get_sticker_prices: %s ключей не нашлись в прайс-листе csgotrader.app, идут на Steam-фолбэк", len(steam_fallback_needed))
@@ -455,14 +468,17 @@ async def get_sticker_prices(sticker_keys: set[str]) -> dict[str, float]:
                 )
                 rate_limited_count += len(steam_fallback_needed)
             else:
+                steam_hits: list[tuple[str, Optional[str], float, int]] = []
                 for key, name_or_query, is_exact in steam_fallback_needed:
                     matched_name, price, ok = await _fetch_from_steam(session, key, name_or_query, is_exact)
                     if ok:
-                        await set_price(key, matched_name, price, CACHE_TTL_SECONDS)
+                        steam_hits.append((key, matched_name, price, CACHE_TTL_SECONDS))
                         result[key] = price
                     else:
                         rate_limited_count += 1
                     await asyncio.sleep(REQUEST_DELAY if is_exact else SEARCH_REQUEST_DELAY)
+                if steam_hits:
+                    await set_prices_batch(steam_hits)
 
     if rate_limited_count:
         log.warning(
