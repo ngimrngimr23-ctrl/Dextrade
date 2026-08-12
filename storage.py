@@ -102,3 +102,56 @@ async def all_known_keys() -> list[str]:
             pass
 
     return list(_local_load().keys())
+
+
+# ---------------------------------------------------------------------------
+# Дефолты /setdefaults по chat_id. Раньше жили только в памяти процесса и
+# слетали на каждом рестарте/редеплое бота — теперь через то же хранилище,
+# что и цены стикеров, переживают рестарты.
+# ---------------------------------------------------------------------------
+
+DEFAULTS_KEY_PREFIX = "chatdefaults:"
+LOCAL_DEFAULTS_PATH = Path(__file__).parent / "chat_defaults_local.json"
+
+
+def _local_defaults_load() -> dict:
+    if LOCAL_DEFAULTS_PATH.exists():
+        try:
+            return json.loads(LOCAL_DEFAULTS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _local_defaults_save(data: dict) -> None:
+    LOCAL_DEFAULTS_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+async def get_chat_defaults(chat_id: int) -> Optional[dict]:
+    """Возвращает {'min_value':..., 'max_markup':...} или None, если не задавались."""
+    if REDIS_ENABLED:
+        try:
+            raw = await _redis_cmd("GET", DEFAULTS_KEY_PREFIX + str(chat_id))
+            return json.loads(raw) if raw else None
+        except Exception:
+            pass
+
+    return _local_defaults_load().get(str(chat_id))
+
+
+async def set_chat_defaults(chat_id: int, min_value: float, max_markup: float) -> None:
+    entry = {"min_value": min_value, "max_markup": max_markup}
+    value = json.dumps(entry, ensure_ascii=False)
+
+    if REDIS_ENABLED:
+        try:
+            # без TTL — это осознанная настройка пользователя, не кэш
+            await _redis_cmd("SET", DEFAULTS_KEY_PREFIX + str(chat_id), value)
+            return
+        except Exception:
+            pass
+
+    data = _local_defaults_load()
+    data[str(chat_id)] = entry
+    _local_defaults_save(data)
+    
