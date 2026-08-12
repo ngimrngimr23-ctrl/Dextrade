@@ -3,14 +3,22 @@
 ByMykel/CSGO-API (статический JSON, обновляется мейнтейнерами вручную/по CI,
 никаких рейт-лимитов и логина не требует).
 
-Формат их данных (поле "image" у каждого стикера) — это ровно тот же путь,
-что мы уже достаём регэкспом steam_client.STICKER_RE из иконок в листингах:
+Ключ строим из поля "original.image_inventory" — оно есть у каждого стикера
+(и в stickers.json, и в sticker_slabs.json) и выглядит как:
 
-    https://cdn.steamstatic.com/apps/730/icons/econ/stickers/emskatowice2014/titan_1355_37.<hash>.png
-                                                              ^^^^^^^^^^^^^^^ ^^^^^^^^^^^^^^
-                                                              collection      code
+    "econ/stickers/emskatowice2014/titan_1355_37"
+                    ^^^^^^^^^^^^^^^ ^^^^^^^^^^^^^^
+                    collection      code
 
-Поэтому парсим их image тем же регэкспом и получаем словарь:
+Это ровно тот же collection/code, что steam_client.STICKER_RE достаёт
+регэкспом из иконок в листингах — только без хэша и без завязки на конкретный
+CDN. ВАЖНО: поле "image" (сама картинка) с 2026 у обычных стикеров указывает
+на репозиторий ByMykel/counter-strike-image-tracker с урезанным именем файла
+(без code/хэша вообще) — регэксп по нему почти всегда промахивается, поэтому
+"image" используется только как последний fallback, если "original" вдруг
+отсутствует.
+
+Получаем словарь:
     "emskatowice2014:titan_1355_37" -> "Sticker | Titan | Katowice 2014"
 
 Это ТОЧНОЕ имя, никакого угадывания. Старая эвристика в pricing.py остаётся
@@ -38,12 +46,25 @@ SOURCE_URLS = [
 ]
 
 
-def _extract_key(image_url: str) -> str | None:
-    m = STICKER_RE.search(image_url)
-    if not m:
-        return None
-    collection, code = m.groups()
-    return f"{collection}:{code}"
+def _extract_key(item: dict) -> str | None:
+    # Основной путь: original.image_inventory вида "econ/stickers/<collection>/<code>".
+    inv_path = (item.get("original") or {}).get("image_inventory")
+    if inv_path:
+        parts = inv_path.split("/")
+        if len(parts) >= 2:
+            collection, code = parts[-2], parts[-1]
+            return f"{collection}:{code}"
+
+    # Fallback на случай, если original когда-нибудь пропадёт из данных —
+    # старый регэксп по URL картинки (работает не для всех записей, см. докстринг).
+    image = item.get("image")
+    if image:
+        m = STICKER_RE.search(image)
+        if m:
+            collection, code = m.groups()
+            return f"{collection}:{code}"
+
+    return None
 
 
 async def _download_catalog() -> dict[str, str]:
@@ -65,17 +86,23 @@ async def _download_catalog() -> dict[str, str]:
                 continue
 
             added = 0
+            skipped_no_name = 0
             for item in items:
-                image = item.get("image")
                 name = item.get("market_hash_name")
-                if not image or not name:
+                if not name:
+                    # часть базовых/промо-стикеров не продаётся на маркете вообще —
+                    # market_hash_name у них null, это нормально, не баг
+                    skipped_no_name += 1
                     continue
-                key = _extract_key(image)
+                key = _extract_key(item)
                 if key:
                     catalog[key] = name
                     added += 1
 
-            log.info("sticker_catalog: %s записей из %s", added, url)
+            log.info(
+                "sticker_catalog: %s записей из %s (пропущено без market_hash_name: %s)",
+                added, url, skipped_no_name,
+            )
 
     log.info("sticker_catalog: итого в каталоге %s ключей", len(catalog))
     return catalog
