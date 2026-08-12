@@ -25,6 +25,7 @@ REQUEST_DELAY = 1.5  # пауза между запросами к Steam, что
 class Listing:
     price: float
     stickers: list[str] = field(default_factory=list)  # человекочитаемые имена стикеров
+    inspect_link: str | None = None  # steam://...csgo_econ_action_preview... — конкретно этот экземпляр
 
 
 def market_hash_name_from_url(url: str) -> str:
@@ -53,6 +54,12 @@ PRICE_RE = re.compile(r'\$([\d,]+\.\d+)')
 
 # Стикеры зашиты в src картинки: .../stickers/<collection>/<code>.<hash>.png
 STICKER_RE = re.compile(r'stickers/([^/]+)/([a-zA-Z0-9_\-]+)\.[a-f0-9]{20,}\.png')
+
+# Инспект-ссылка конкретного экземпляра предмета (float/паттерн/стикеры именно
+# этого лота). Это НЕ ссылка на покупку — Steam не даёт публичных ссылок на
+# покупку конкретного лота — но это единственный способ однозначно привязать
+# ссылку к конкретному офферу, а не к предмету вообще.
+INSPECT_RE = re.compile(r'''href=["'](steam://[^"']*csgo_econ_action_preview[^"']*)["']''')
 
 
 def _sticker_code_to_display(collection: str, code: str) -> str:
@@ -133,6 +140,10 @@ def _parse_listings_html(html: str) -> list[Listing]:
             for coll, code in STICKER_RE.findall(b)
         ][:5]  # максимум 5 слотов на оружии
 
-        out.append(Listing(price=price, stickers=stickers))
+        inspect_m = INSPECT_RE.search(b)
+        inspect_link = inspect_m.group(1) if inspect_m else None
+
+        out.append(Listing(price=price, stickers=stickers, inspect_link=inspect_link))
 
     return out
+    
