@@ -7,9 +7,15 @@ Steam отдаёт данные через публичный (не требую
         ?query=&start=<N>&count=100&country=US&language=english&currency=1
 
 За один запрос отдаёт максимум 100 лотов, поэтому листаем через start.
+
+Render банит IP датацентра, поэтому запросы к Steam уходят через Cloudflare
+Worker-прокси (см. cloudflare-worker/), если задана переменная окружения
+STEAM_PROXY_URL (например https://dextrade-steam-proxy.<sub>.workers.dev).
+Без неё бот по-прежнему стучится в Steam напрямую — как раньше.
 """
 
 import asyncio
+import os
 import re
 import urllib.parse
 from dataclasses import dataclass, field
@@ -19,6 +25,8 @@ import aiohttp
 APP_ID = 730  # CS2 / CS:GO
 RENDER_COUNT = 100  # максимум, который отдаёт Steam за раз
 REQUEST_DELAY = 1.5  # пауза между запросами к Steam, чтобы не словить 429
+
+STEAM_PROXY_URL = os.environ.get("STEAM_PROXY_URL", "").rstrip("/")
 
 
 @dataclass
@@ -47,6 +55,20 @@ def render_url(market_hash_name: str, start: int) -> str:
         f"https://steamcommunity.com/market/listings/{APP_ID}/{encoded}/render/"
         f"?query=&start={start}&count={RENDER_COUNT}&country=US&language=english&currency=1"
     )
+
+
+def _fetch_url(steam_url: str) -> str:
+    """
+    Если задан STEAM_PROXY_URL — идём в Steam через Cloudflare Worker (не
+    забаненный IP), передавая настоящий steam_url как query-параметр.
+    Иначе (по умолчанию) — прямой запрос, как раньше.
+    render_url() всегда возвращает исходную steam-ссылку — она же уходит в
+    сообщения бота (open in browser и т.п.), прокси используется только
+    для самого HTTP-запроса.
+    """
+    if not STEAM_PROXY_URL:
+        return steam_url
+    return f"{STEAM_PROXY_URL}/proxy?url={urllib.parse.quote(steam_url, safe='')}"
 
 
 # Регэксп ищет цену первого блока (это как раз "их" цена продажи с учётом комиссии)
@@ -81,8 +103,8 @@ async def fetch_all_listings(market_hash_name: str) -> list[Listing]:
         start = 0
         total_count = None
         while total_count is None or start < total_count:
-            url = render_url(market_hash_name, start)
-            async with session.get(url) as resp:
+            steam_url = render_url(market_hash_name, start)
+            async with session.get(_fetch_url(steam_url)) as resp:
                 if resp.status == 429:
                     # Rate limit — ждём и пробуем ещё раз тот же start
                     await asyncio.sleep(10)
@@ -146,4 +168,4 @@ def _parse_listings_html(html: str) -> list[Listing]:
         out.append(Listing(price=price, stickers=stickers, inspect_link=inspect_link))
 
     return out
-    
+
