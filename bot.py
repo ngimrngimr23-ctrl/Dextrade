@@ -7,15 +7,16 @@ Telegram-бот.
 Пример:
     /scan https://steamcommunity.com/market/listings/730/AK-47%20%7C%20Slate%20%28Field-Tested%29 5 7
 
-Если Steam блокирует запросы бота напрямую (частая история для облачных
-IP типа Render) — есть запасной путь через ручную передачу JSON:
-
-    /scanfile <ссылка на предмет> [мин$] [макс%]
-
 Бот пришлёт ссылку на страницу JSON — открываете её в своём браузере
 (с домашнего IP Steam не блокирует), сохраняете как .json (Ctrl+S) и
 присылаете файл боту. Он спарсит, попросит следующую страницу, если
-лотов больше 100, и в конце сам посчитает офферы — как /scan.
+лотов больше 100, и в конце сам посчитает офферы.
+
+Если когда-нибудь понадобится попытка прямого автоматического запроса
+к Steam (без ручной передачи файла — но Steam банит облачные IP, так
+что обычно не работает без рабочего прокси):
+
+    /scanfile <ссылка на предмет> [мин$] [макс%]
 
 Если не указать числа — по умолчанию 5 баксов и 7%.
 
@@ -177,8 +178,8 @@ async def _proceed_scan(update: Update, market_hash_name: str, min_value: float,
         else:
             await update.message.reply_text(
                 f"Не смог получить листинги: {e}\n\n"
-                f"Если Steam блокирует запросы бота (частая история для облачных IP) — "
-                f"попробуй /scanfile вместо /scan, там ты сам качаешь JSON из браузера."
+                f"Steam блокирует запросы бота (частая история для облачных IP) — "
+                f"попробуй /scan вместо /scanfile, там ты сам качаешь JSON из браузера."
             )
         return
     await _run_analysis(update, listings, min_value, max_markup, market_hash_name)
@@ -195,13 +196,19 @@ async def _proceed_scanfile(update: Update, market_hash_name: str, min_value: fl
         "total_count": None,
     }
     first_url = render_url(market_hash_name, 0)
+    second_url = render_url(market_hash_name, RENDER_COUNT)
     await update.message.reply_text(
         f"Ок, собираю «{market_hash_name}» по файлам.\n\n"
+        f"Steam всегда отдаёт максимум {RENDER_COUNT} лотов за раз, даже если попросить "
+        f"больше — так что вот сразу 2 страницы (первые {RENDER_COUNT * 2} лотов), "
+        f"чтобы не бегать за каждой по одной:\n\n"
         f"1. Открой в браузере:\n{first_url}\n"
         f"2. Сохрани страницу как .json (Ctrl+S) или PDF\n"
-        f"3. Пришли файл сюда — результат посчитаю сразу же, "
-        f"без ожидания остальных страниц. Можно прислать ещё страницы позже, "
-        f"когда будет время — офферы каждый раз пересчитаются заново."
+        f"3. Пришли файл сюда — результат посчитаю сразу же\n\n"
+        f"И вторая страница:\n{second_url}\n"
+        f"(сохрани и пришли так же, можно сразу оба файла подряд)\n\n"
+        f"Дальше можно прислать ещё страниц позже, когда будет время — "
+        f"офферы каждый раз пересчитаются заново."
     )
 
 
@@ -302,11 +309,11 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     min_value = parsed_min if parsed_min is not None else def_min
     max_markup = parsed_max if parsed_max is not None else def_max
 
-    market_hash_name = await _resolve_market_hash_name(update, query_or_url, "scan", min_value, max_markup)
+    market_hash_name = await _resolve_market_hash_name(update, query_or_url, "scanfile", min_value, max_markup)
     if market_hash_name is None:
         return  # либо ошибка уже сообщена, либо ждём выбора номера
 
-    await _proceed_scan(update, market_hash_name, min_value, max_markup)
+    await _proceed_scanfile(update, market_hash_name, min_value, max_markup)
 
 
 async def setdefaults(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -359,11 +366,11 @@ async def scanfile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     min_value = parsed_min if parsed_min is not None else def_min
     max_markup = parsed_max if parsed_max is not None else def_max
 
-    market_hash_name = await _resolve_market_hash_name(update, query_or_url, "scanfile", min_value, max_markup)
+    market_hash_name = await _resolve_market_hash_name(update, query_or_url, "scan", min_value, max_markup)
     if market_hash_name is None:
         return  # либо ошибка уже сообщена, либо ждём выбора номера
 
-    await _proceed_scanfile(update, market_hash_name, min_value, max_markup)
+    await _proceed_scan(update, market_hash_name, min_value, max_markup)
 
 
 async def pricefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -523,7 +530,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     session = _file_sessions.get(chat_id)
     if session is None:
-        # файл прислан без /scanfile — заводим сессию сама на лету, доставая
+        # файл прислан без /scan — заводим сессию сама на лету, доставая
         # название предмета прямо из присланного HTML (нужно только для
         # ссылки на следующую страницу; параметры фильтра — по умолчанию)
         name_m = re.search(r'market_listing_item_name"[^>]*>([^<]+)<', html)
@@ -542,7 +549,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Файл принят без команды, начинаю сбор «{market_hash_name or 'предмет'}» "
             f"с параметрами по умолчанию (мин$ стикеров={def_min:.0f}, макс наценка={def_max:.0f}%).\n"
             f"Сменить дефолты: /setdefaults <мин$> <макс%>. "
-            f"Или задать разово: /scanfile <ссылка> [мин$] [макс%]."
+            f"Или задать разово: /scan <ссылка> [мин$] [макс%]."
         )
 
     session["listings"].extend(new_listings)
@@ -562,29 +569,33 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del _file_sessions[chat_id]
     elif session["market_hash_name"]:
         next_url = render_url(session["market_hash_name"], session["next_start"])
-        await update.message.reply_text(
-            f"Собрано {got} из {total_count}. Когда будет время — вот следующая страница:\n{next_url}\n"
-            f"(необязательно сразу — можно прислать в любой момент)."
-        )
+        second_start = session["next_start"] + RENDER_COUNT
+        lines = [f"Собрано {got} из {total_count}. Когда будет время — вот следующая страница:\n{next_url}"]
+        if second_start < total_count:
+            second_url = render_url(session["market_hash_name"], second_start)
+            lines.append(f"\nИ ещё одна следом, чтобы не бегать по одной:\n{second_url}")
+        lines.append("\n(необязательно сразу — можно прислать в любой момент).")
+        await update.message.reply_text("".join(lines))
     else:
         await update.message.reply_text(
             f"Собрано {got} из {total_count}, но не смог понять название предмета из файла, "
-            f"чтобы дать ссылку на следующую страницу. Начни через /scanfile <ссылка>."
+            f"чтобы дать ссылку на следующую страницу. Начни через /scan <ссылка>."
         )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     def_min, def_max = await _get_defaults(chat_id)
-    scanfile_line = (
-        "Если Steam блокирует бота напрямую — есть /scanfile (ручная передача JSON-файлов), "
-        "можно также просто прислать файл без команды.\n\n"
-    )
     await update.message.reply_text(
         "Привет! Пришли:\n"
         "/scan <ссылка или название предмета> [мин$ стикеров] [макс наценка%]\n"
-        "Название — на английском: /scan AK-47 | Slate\n\n"
-        + scanfile_line +
+        "Название — на английском, с | или без: /scan AK-47 | Slate или /scan AK-47 Slate\n\n"
+        "Бот пришлёт ссылку на JSON — открой её в своём браузере, сохрани "
+        "(Ctrl+S) и пришли файл сюда, можно и без команды, просто скинуть файл. "
+        "Дальше бот сам всё посчитает.\n\n"
+        "/scanfile — попытка прямого автоматического запроса к Steam без "
+        "ручной передачи файла (обычно не работает — Steam блокирует облачные "
+        "IP), используй только если знаешь, что делаешь.\n\n"
         "/pricefile — загрузить прайс-лист цен на стикеры вручную (Steam market/search JSON), "
         "/clearprices — очистить его перед обновлением.\n\n"
         f"/setdefaults <мин$> <макс%> — поменять значения по умолчанию "

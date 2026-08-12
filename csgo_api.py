@@ -14,6 +14,7 @@ en и zh-CN. Русского (ru) там нет, поэтому ищем по �
 названиям (например "AK-47 | Slate", а не "AK-47 | Сланец").
 """
 
+import re
 import time
 
 import aiohttp
@@ -23,6 +24,14 @@ _CACHE_TTL = 6 * 3600  # обновляем раз в 6 часов, база м�
 
 # language -> (timestamp_загрузки, список_предметов)
 _cache: dict[str, tuple[float, list[dict]]] = {}
+
+
+def _normalize(s: str) -> str:
+    """
+    Убирает '|' и схлопывает пробелы, чтобы "AK-47 | Safari Mesh" и
+    "AK-47 Safari Mesh" (без разделителя) матчились одинаково.
+    """
+    return re.sub(r"\s+", " ", s.lower().replace("|", " ")).strip()
 
 
 async def _load_items(language: str = "en") -> list[dict]:
@@ -48,12 +57,14 @@ async def _load_items(language: str = "en") -> list[dict]:
 async def search_items(query: str, language: str = "en", count: int = 10) -> list[dict]:
     """
     Ищет предметы по названию (на английском — см. примечание в шапке
-    файла) в статической базе (не Steam!). Возвращает список
+    файла) в статической базе (не Steam!). Понимает запрос как с '|',
+    так и без него ("AK-47 | Safari Mesh" и "AK-47 Safari Mesh" —
+    одно и то же). Возвращает список
     {"name": <английское название>, "hash_name": <market_hash_name>},
     отсортированный от более точных совпадений к менее точным.
     """
     items = await _load_items(language)
-    q = query.strip().lower()
+    q = _normalize(query)
     if not q:
         return []
 
@@ -63,10 +74,10 @@ async def search_items(query: str, language: str = "en", count: int = 10) -> lis
         hash_name = item.get("market_hash_name")
         if not hash_name:
             continue
-        name_lower = name.lower()
-        if q in name_lower:
+        name_norm = _normalize(name)
+        if q in name_norm:
             # точное совпадение всей строки и совпадения покороче — выше приоритет
-            score = 0 if name_lower == q else len(name_lower)
+            score = 0 if name_norm == q else len(name_norm)
             scored.append((score, name, hash_name))
 
     scored.sort(key=lambda t: t[0])
@@ -81,4 +92,4 @@ async def search_items(query: str, language: str = "en", count: int = 10) -> lis
         if len(out) >= count:
             break
     return out
-    
+
