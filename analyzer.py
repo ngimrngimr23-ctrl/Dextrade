@@ -1,6 +1,7 @@
 """
 Логика отбора: сколько стоит набор стикеров на лоте и укладывается ли
-цена лота в "цена стикеров + не более N% наценки".
+цена лота в "минимальная цена голого скина + стоимость стикеров + не более
+N% наценки сверху".
 """
 
 from dataclasses import dataclass
@@ -11,9 +12,26 @@ from steam_client import Listing
 @dataclass
 class Offer:
     price: float
+    floor_price: float
+    overpay: float
     stickers_value: float
     markup_pct: float
     stickers: list[str]
+
+
+def _floor_price(listings: list[Listing]) -> float:
+    """
+    Базовая цена голого скина — минимальная цена среди лотов без стикеров,
+    если такие есть в собранной выборке. Если нет ни одного лота без
+    стикеров (бывает на редких предметах), откатываемся на минимальную
+    цену вообще среди всех собранных лотов — это менее точно (сам минимум
+    может уже включать чьи-то стикеры), но лучше, чем считать пол нулевым.
+    """
+    bare = [l.price for l in listings if not l.stickers]
+    if bare:
+        return min(bare)
+    all_prices = [l.price for l in listings]
+    return min(all_prices) if all_prices else 0.0
 
 
 def find_offers(
@@ -22,6 +40,8 @@ def find_offers(
     min_stickers_value: float = 5.0,
     max_markup_pct: float = 7.0,
 ) -> list[Offer]:
+    floor_price = _floor_price(listings)
+
     offers = []
     for listing in listings:
         if not listing.stickers:
@@ -31,13 +51,20 @@ def find_offers(
         if stickers_value < min_stickers_value:
             continue
 
-        markup = listing.price - stickers_value
+        # насколько этот лот дороже голого скина — это и есть "цена, которую
+        # продавец просит за стикеры" по факту; сравниваем её с реальной
+        # стоимостью стикеров, а не с полной ценой лота
+        overpay = listing.price - floor_price
+
+        markup = overpay - stickers_value
         markup_pct = (markup / stickers_value) * 100 if stickers_value else float("inf")
 
         if markup_pct <= max_markup_pct:
             offers.append(
                 Offer(
                     price=listing.price,
+                    floor_price=floor_price,
+                    overpay=overpay,
                     stickers_value=stickers_value,
                     markup_pct=markup_pct,
                     stickers=listing.stickers,
@@ -46,3 +73,4 @@ def find_offers(
 
     offers.sort(key=lambda o: o.markup_pct)
     return offers
+    
