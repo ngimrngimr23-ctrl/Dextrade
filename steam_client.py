@@ -2,16 +2,7 @@
 Работа со Steam Community Market: получение всех листингов по предмету
 и разбор цены + стикеров на каждом лоте.
 
-Steam отдаёт данные через публичный (не требующий логина) эндпоинт:
-    https://steamcommunity.com/market/listings/730/<market_hash_name>/render/
-        ?query=&start=<N>&count=100&country=US&language=english&currency=1&format=json
-
-За один запрос отдаёт максимум 100 лотов, поэтому листаем через start.
-
-Render банит IP датацентра, поэтому запросы к Steam уходят через Cloudflare
-Worker-прокси (см. cloudflare-worker/), если задана переменная окружения
-STEAM_PROXY_URL (например https://dextrade-steam-proxy.<sub>.workers.dev).
-Без неё бот по-прежнему стучится в Steam напрямую — как раньше.
+Запросы к Steam при наличии STEAM_PROXY_URL идут через Cloudflare Worker.
 """
 
 import asyncio
@@ -23,11 +14,14 @@ from dataclasses import dataclass, field
 import aiohttp
 
 
-APP_ID = 730  # CS2 / CS:GO
-RENDER_COUNT = 100  # максимум, который отдаёт Steam за раз
-REQUEST_DELAY = 1.5  # пауза между запросами к Steam, чтобы не словить 429
+APP_ID = 730
+RENDER_COUNT = 100
+REQUEST_DELAY = 1.5
 
-STEAM_PROXY_URL = os.environ.get("STEAM_PROXY_URL", "").rstrip("/")
+STEAM_PROXY_URL = os.environ.get(
+    "STEAM_PROXY_URL",
+    ""
+).rstrip("/")
 
 
 @dataclass
@@ -39,28 +33,34 @@ class Listing:
 
 def market_hash_name_from_url(url: str) -> str:
     """
-    Из ссылки на лот/список лотов вида
-    https://steamcommunity.com/market/listings/730/AK-47%20%7C%20Slate%20%28Field-Tested%29
-    достаём market_hash_name в исходном (не url-encoded) виде.
+    Из ссылки:
+    https://steamcommunity.com/market/listings/730/<name>
+    получает market_hash_name.
     """
+
     parsed = urllib.parse.urlparse(url)
     parts = parsed.path.rstrip("/").split("/")
 
-    # .../market/listings/730/<name>
     name_encoded = parts[-1]
 
     return urllib.parse.unquote(name_encoded)
 
 
-def render_url(market_hash_name: str, start: int) -> str:
+def render_url(
+    market_hash_name: str,
+    start: int
+) -> str:
     """
-    Формируем Steam Market /render URL.
+    Формирует Steam Market /render URL.
 
-    ВАЖНО:
-    format=json заставляет Steam вернуть JSON с results_html,
-    total_count и т.д., а не HTML-страницу Steam.
+    norender=1 заставляет Steam вернуть JSON
+    вместо HTML-страницы.
     """
-    encoded = urllib.parse.quote(market_hash_name, safe="")
+
+    encoded = urllib.parse.quote(
+        market_hash_name,
+        safe=""
+    )
 
     return (
         f"https://steamcommunity.com/market/listings/"
@@ -71,20 +71,27 @@ def render_url(market_hash_name: str, start: int) -> str:
         f"&country=US"
         f"&language=english"
         f"&currency=1"
-        f"&format=json"
+        f"&norender=1"
     )
 
 
-def _fetch_url(steam_url: str) -> str:
+def _fetch_url(
+    steam_url: str
+) -> str:
     """
-    Если задан STEAM_PROXY_URL — идём в Steam через Cloudflare Worker,
-    передавая настоящий steam_url как query-параметр.
+    Если задан STEAM_PROXY_URL,
+    отправляет запрос через Cloudflare Worker.
 
-    Иначе — прямой запрос в Steam.
+    Например:
 
-    render_url() всегда возвращает исходную Steam-ссылку.
-    Прокси используется только для HTTP-запроса.
+    STEAM_PROXY_URL=
+    https://dextrade-steam-proxy.imrannnogerov.workers.dev
+
+    превращается в:
+
+    https://dextrade-steam-proxy.imrannnogerov.workers.dev/proxy?url=...
     """
+
     if not STEAM_PROXY_URL:
         return steam_url
 
@@ -94,42 +101,31 @@ def _fetch_url(steam_url: str) -> str:
     )
 
 
-# Цена первого блока.
-# Это цена продажи с учётом комиссии Steam.
-PRICE_RE = re.compile(r"\$([\d,]+\.\d+)")
+PRICE_RE = re.compile(
+    r"\$([\d,]+\.\d+)"
+)
 
 
-# Стикеры зашиты в src картинки:
-# .../stickers/<collection>/<code>.<hash>.png
 STICKER_RE = re.compile(
     r"stickers/([^/]+)/([a-zA-Z0-9_\-]+)\.[a-f0-9]{20,}\.png"
 )
 
 
-# Инспект-ссылка конкретного экземпляра предмета.
 INSPECT_RE = re.compile(
     r'''href=["'](steam://[^"']*csgo_econ_action_preview[^"']*)["']'''
 )
 
 
-def _sticker_code_to_display(collection: str, code: str) -> str:
-    """
-    Грубое человекочитаемое представление кода стикера
-    для дальнейшего поиска цены.
-
-    Это НЕ точное имя в Steam Market.
-    В pricing.py делается поиск по нескольким вариантам названия.
-    """
+def _sticker_code_to_display(
+    collection: str,
+    code: str
+) -> str:
     return f"{collection}:{code}"
 
 
 async def fetch_all_listings(
     market_hash_name: str
 ) -> list[Listing]:
-    """
-    Тянем все страницы листингов для предмета
-    и парсим цену + стикеры каждого лота.
-    """
 
     listings: list[Listing] = []
 
@@ -137,6 +133,7 @@ async def fetch_all_listings(
         headers={
             "User-Agent":
                 "Mozilla/5.0",
+
             "Accept":
                 "application/json, text/plain, */*"
         }
@@ -145,7 +142,10 @@ async def fetch_all_listings(
         start = 0
         total_count = None
 
-        while total_count is None or start < total_count:
+        while (
+            total_count is None
+            or start < total_count
+        ):
 
             steam_url = render_url(
                 market_hash_name,
@@ -161,8 +161,6 @@ async def fetch_all_listings(
             ) as resp:
 
                 if resp.status == 429:
-                    # Rate limit — ждём и пробуем
-                    # тот же start ещё раз.
                     await asyncio.sleep(10)
                     continue
 
@@ -175,10 +173,10 @@ async def fetch_all_listings(
                     )
                 )
 
-                if "application/json" not in content_type.lower():
-                    # Steam вместо JSON отдал HTML.
-                    # Показываем начало ответа,
-                    # чтобы понять причину.
+                if (
+                    "application/json"
+                    not in content_type.lower()
+                ):
                     body = await resp.text()
 
                     snippet = (
@@ -221,15 +219,6 @@ async def fetch_all_listings(
 def _parse_listings_html(
     html: str
 ) -> list[Listing]:
-    """
-    results_html — HTML-фрагмент со всеми
-    строками таблицы листингов.
-
-    Режем по границам строк и вытаскиваем
-    цену + стикеры каждой отдельно,
-    чтобы стикеры одного лота
-    не утекали в соседний.
-    """
 
     blocks = re.split(
         r'class="market_listing_row market_recent_listing_row',
@@ -240,8 +229,6 @@ def _parse_listings_html(
 
     for block in blocks:
 
-        # Обрезаем хвостовой мусор /
-        # следующий служебный блок.
         cut = len(block)
 
         for marker in (
@@ -258,18 +245,18 @@ def _parse_listings_html(
 
         b = block[:cut]
 
-        # Цена
         price_m = PRICE_RE.search(b)
 
         if not price_m:
             continue
 
         price = float(
-            price_m.group(1)
-            .replace(",", "")
+            price_m.group(1).replace(
+                ",",
+                ""
+            )
         )
 
-        # Стикеры
         stickers = [
             _sticker_code_to_display(
                 coll,
@@ -279,7 +266,6 @@ def _parse_listings_html(
             in STICKER_RE.findall(b)
         ][:5]
 
-        # Inspect link
         inspect_m = INSPECT_RE.search(b)
 
         inspect_link = (
