@@ -4,7 +4,7 @@
 
 Steam отдаёт данные через публичный (не требующий логина) эндпоинт:
     https://steamcommunity.com/market/listings/730/<market_hash_name>/render/
-        ?query=&start=<N>&count=100&country=US&language=english&currency=1
+        ?query=&start=<N>&count=100&country=US&language=english&currency=1&format=json
 
 За один запрос отдаёт максимум 100 лотов, поэтому листаем через start.
 
@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 import aiohttp
 
+
 APP_ID = 730  # CS2 / CS:GO
 RENDER_COUNT = 100  # максимум, который отдаёт Steam за раз
 REQUEST_DELAY = 1.5  # пауза между запросами к Steam, чтобы не словить 429
@@ -32,8 +33,8 @@ STEAM_PROXY_URL = os.environ.get("STEAM_PROXY_URL", "").rstrip("/")
 @dataclass
 class Listing:
     price: float
-    stickers: list[str] = field(default_factory=list)  # человекочитаемые имена стикеров
-    inspect_link: str | None = None  # steam://...csgo_econ_action_preview... — конкретно этот экземпляр
+    stickers: list[str] = field(default_factory=list)
+    inspect_link: str | None = None
 
 
 def market_hash_name_from_url(url: str) -> str:
@@ -44,128 +45,255 @@ def market_hash_name_from_url(url: str) -> str:
     """
     parsed = urllib.parse.urlparse(url)
     parts = parsed.path.rstrip("/").split("/")
-    # .../market/listings/730/<n>
+
+    # .../market/listings/730/<name>
     name_encoded = parts[-1]
+
     return urllib.parse.unquote(name_encoded)
 
 
 def render_url(market_hash_name: str, start: int) -> str:
+    """
+    Формируем Steam Market /render URL.
+
+    ВАЖНО:
+    format=json заставляет Steam вернуть JSON с results_html,
+    total_count и т.д., а не HTML-страницу Steam.
+    """
     encoded = urllib.parse.quote(market_hash_name, safe="")
+
     return (
-        f"https://steamcommunity.com/market/listings/{APP_ID}/{encoded}/render/"
-        f"?query=&start={start}&count={RENDER_COUNT}&country=US&language=english&currency=1"
+        f"https://steamcommunity.com/market/listings/"
+        f"{APP_ID}/{encoded}/render/"
+        f"?query="
+        f"&start={start}"
+        f"&count={RENDER_COUNT}"
+        f"&country=US"
+        f"&language=english"
+        f"&currency=1"
+        f"&format=json"
     )
 
 
 def _fetch_url(steam_url: str) -> str:
     """
-    Если задан STEAM_PROXY_URL — идём в Steam через Cloudflare Worker (не
-    забаненный IP), передавая настоящий steam_url как query-параметр.
-    Иначе (по умолчанию) — прямой запрос, как раньше.
-    render_url() всегда возвращает исходную steam-ссылку — она же уходит в
-    сообщения бота (open in browser и т.п.), прокси используется только
-    для самого HTTP-запроса.
+    Если задан STEAM_PROXY_URL — идём в Steam через Cloudflare Worker,
+    передавая настоящий steam_url как query-параметр.
+
+    Иначе — прямой запрос в Steam.
+
+    render_url() всегда возвращает исходную Steam-ссылку.
+    Прокси используется только для HTTP-запроса.
     """
     if not STEAM_PROXY_URL:
         return steam_url
-    return f"{STEAM_PROXY_URL}/proxy?url={urllib.parse.quote(steam_url, safe='')}"
+
+    return (
+        f"{STEAM_PROXY_URL}/proxy"
+        f"?url={urllib.parse.quote(steam_url, safe='')}"
+    )
 
 
-# Регэксп ищет цену первого блока (это как раз "их" цена продажи с учётом комиссии)
-PRICE_RE = re.compile(r'\$([\d,]+\.\d+)')
+# Цена первого блока.
+# Это цена продажи с учётом комиссии Steam.
+PRICE_RE = re.compile(r"\$([\d,]+\.\d+)")
 
-# Стикеры зашиты в src картинки: .../stickers/<collection>/<code>.<hash>.png
-STICKER_RE = re.compile(r'stickers/([^/]+)/([a-zA-Z0-9_\-]+)\.[a-f0-9]{20,}\.png')
 
-# Инспект-ссылка конкретного экземпляра предмета (float/паттерн/стикеры именно
-# этого лота). Это НЕ ссылка на покупку — Steam не даёт публичных ссылок на
-# покупку конкретного лота — но это единственный способ однозначно привязать
-# ссылку к конкретному офферу, а не к предмету вообще.
-INSPECT_RE = re.compile(r'''href=["'](steam://[^"']*csgo_econ_action_preview[^"']*)["']''')
+# Стикеры зашиты в src картинки:
+# .../stickers/<collection>/<code>.<hash>.png
+STICKER_RE = re.compile(
+    r"stickers/([^/]+)/([a-zA-Z0-9_\-]+)\.[a-f0-9]{20,}\.png"
+)
+
+
+# Инспект-ссылка конкретного экземпляра предмета.
+INSPECT_RE = re.compile(
+    r'''href=["'](steam://[^"']*csgo_econ_action_preview[^"']*)["']'''
+)
 
 
 def _sticker_code_to_display(collection: str, code: str) -> str:
     """
-    Грубое человекочитаемое представление кода стикера для дальнейшего поиска цены.
-    Это НЕ точное имя в Steam Market (Steam использует "Sticker | Name (Finish) | Event"),
-    поэтому в pricing.py делаем поиск по нескольким вариантам названия.
-    Здесь просто нормализуем то, что можем достать из имени файла.
+    Грубое человекочитаемое представление кода стикера
+    для дальнейшего поиска цены.
+
+    Это НЕ точное имя в Steam Market.
+    В pricing.py делается поиск по нескольким вариантам названия.
     """
     return f"{collection}:{code}"
 
 
-async def fetch_all_listings(market_hash_name: str) -> list[Listing]:
-    """Тянем все страницы листингов для предмета и парсим цену + стикеры каждого лота."""
+async def fetch_all_listings(
+    market_hash_name: str
+) -> list[Listing]:
+    """
+    Тянем все страницы листингов для предмета
+    и парсим цену + стикеры каждого лота.
+    """
+
     listings: list[Listing] = []
+
     async with aiohttp.ClientSession(
-        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/plain, */*"}
+        headers={
+            "User-Agent":
+                "Mozilla/5.0",
+            "Accept":
+                "application/json, text/plain, */*"
+        }
     ) as session:
+
         start = 0
         total_count = None
+
         while total_count is None or start < total_count:
-            steam_url = render_url(market_hash_name, start)
-            async with session.get(_fetch_url(steam_url)) as resp:
+
+            steam_url = render_url(
+                market_hash_name,
+                start
+            )
+
+            request_url = _fetch_url(
+                steam_url
+            )
+
+            async with session.get(
+                request_url
+            ) as resp:
+
                 if resp.status == 429:
-                    # Rate limit — ждём и пробуем ещё раз тот же start
+                    # Rate limit — ждём и пробуем
+                    # тот же start ещё раз.
                     await asyncio.sleep(10)
                     continue
+
                 resp.raise_for_status()
 
-                content_type = resp.headers.get("Content-Type", "")
-                if "application/json" not in content_type:
-                    # Steam вместо JSON отдал HTML — обычно это анти-бот/гео-заглушка
-                    # или блокировка датацентрового IP. Показываем начало страницы,
-                    # чтобы понять причину, вместо невнятной ошибки декодирования.
+                content_type = (
+                    resp.headers.get(
+                        "Content-Type",
+                        ""
+                    )
+                )
+
+                if "application/json" not in content_type.lower():
+                    # Steam вместо JSON отдал HTML.
+                    # Показываем начало ответа,
+                    # чтобы понять причину.
                     body = await resp.text()
-                    snippet = body[:300].replace("\n", " ").strip()
+
+                    snippet = (
+                        body[:500]
+                        .replace("\n", " ")
+                        .strip()
+                    )
+
                     raise RuntimeError(
-                        f"Steam вернул не JSON, а {content_type!r}. "
+                        "Steam вернул не JSON, "
+                        f"а {content_type!r}. "
                         f"Начало ответа: {snippet!r}"
                     )
 
                 data = await resp.json()
 
-            total_count = data.get("total_count", 0)
-            html = data.get("results_html", "")
-            listings.extend(_parse_listings_html(html))
+            total_count = data.get(
+                "total_count",
+                0
+            )
+
+            html = data.get(
+                "results_html",
+                ""
+            )
+
+            listings.extend(
+                _parse_listings_html(html)
+            )
 
             start += RENDER_COUNT
-            await asyncio.sleep(REQUEST_DELAY)
+
+            await asyncio.sleep(
+                REQUEST_DELAY
+            )
 
     return listings
 
 
-def _parse_listings_html(html: str) -> list[Listing]:
+def _parse_listings_html(
+    html: str
+) -> list[Listing]:
     """
-    results_html — это HTML-фрагмент со всеми строками таблицы листингов.
-    Режем по границам строк и вытаскиваем цену + стикеры каждой отдельно,
-    чтобы стикеры одного лота не утекали в соседний.
+    results_html — HTML-фрагмент со всеми
+    строками таблицы листингов.
+
+    Режем по границам строк и вытаскиваем
+    цену + стикеры каждой отдельно,
+    чтобы стикеры одного лота
+    не утекали в соседний.
     """
-    blocks = re.split(r'class="market_listing_row market_recent_listing_row', html)[1:]
+
+    blocks = re.split(
+        r'class="market_listing_row market_recent_listing_row',
+        html
+    )[1:]
+
     out = []
+
     for block in blocks:
-        # обрезаем на случай хвостового мусора/следующего листинга
+
+        # Обрезаем хвостовой мусор /
+        # следующий служебный блок.
         cut = len(block)
-        for marker in ('"assets":{', '"listinginfo":{'):
+
+        for marker in (
+            '"assets":{',
+            '"listinginfo":{'
+        ):
             idx = block.find(marker)
+
             if idx != -1:
-                cut = min(cut, idx)
+                cut = min(
+                    cut,
+                    idx
+                )
+
         b = block[:cut]
 
+        # Цена
         price_m = PRICE_RE.search(b)
+
         if not price_m:
             continue
-        price = float(price_m.group(1).replace(",", ""))
 
+        price = float(
+            price_m.group(1)
+            .replace(",", "")
+        )
+
+        # Стикеры
         stickers = [
-            _sticker_code_to_display(coll, code)
-            for coll, code in STICKER_RE.findall(b)
-        ][:5]  # максимум 5 слотов на оружии
+            _sticker_code_to_display(
+                coll,
+                code
+            )
+            for coll, code
+            in STICKER_RE.findall(b)
+        ][:5]
 
+        # Inspect link
         inspect_m = INSPECT_RE.search(b)
-        inspect_link = inspect_m.group(1) if inspect_m else None
 
-        out.append(Listing(price=price, stickers=stickers, inspect_link=inspect_link))
+        inspect_link = (
+            inspect_m.group(1)
+            if inspect_m
+            else None
+        )
+
+        out.append(
+            Listing(
+                price=price,
+                stickers=stickers,
+                inspect_link=inspect_link
+            )
+        )
 
     return out
-
