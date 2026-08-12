@@ -53,7 +53,7 @@ def render_url(market_hash_name: str, start: int) -> str:
     encoded = urllib.parse.quote(market_hash_name, safe="")
     return (
         f"https://steamcommunity.com/market/listings/{APP_ID}/{encoded}/render/"
-        f"?query=&start={start}&count={RENDER_COUNT}&country=US&language=english&currency=1"
+        f"?query=&start={start}&count={RENDER_COUNT}&country=US&language=english&currency=1&format=json"
     )
 
 
