@@ -92,6 +92,72 @@ async def set_price(key: str, matched_name: Optional[str], price: float, ttl_sec
     _local_save(data)
 
 
+async def _redis_pipeline(commands: list[list]) -> list:
+    """Несколько команд Upstash REST одним HTTP-запросом. Возвращает список {'result':...}/{'error':...} по порядку команд."""
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{REDIS_URL}/pipeline",
+            headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
+            json=commands,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            return await resp.json()
+
+
+async def get_prices_batch(keys: list[str]) -> dict[str, Optional[dict]]:
+    """
+    То же самое, что get_price(), но сразу для нескольких ключей одним
+    запросом (Redis MGET) вместо отдельного HTTP-соединения на каждый —
+    на десятках стикеров с одного лота такое батчирование убирает
+    заметную паузу при проверке кэша.
+    """
+    if not keys:
+        return {}
+
+    if REDIS_ENABLED:
+        try:
+            full_keys = [KEY_PREFIX + k for k in keys]
+            raws = await _redis_cmd("MGET", *full_keys)
+            return {key: (json.loads(raw) if raw else None) for key, raw in zip(keys, raws)}
+        except Exception:
+            pass  # Upstash недоступен — работаем через локальный файл как fallback
+
+    local = _local_load()
+    return {key: local.get(key) for key in keys}
+
+
+async def set_prices_batch(entries: list[tuple[str, Optional[str], float, int]]) -> None:
+    """
+    То же самое, что set_price(), но сразу для нескольких ключей одним
+    pipeline-запросом вместо SET+SADD по одному на каждый ключ.
+    entries: (key, matched_name, price, ttl_seconds).
+    """
+    if not entries:
+        return
+
+    if REDIS_ENABLED:
+        try:
+            commands = []
+            for key, matched_name, price, ttl_seconds in entries:
+                value = json.dumps(
+                    {"matched_name": matched_name, "price": price, "updated_at": time.time()},
+                    ensure_ascii=False,
+                )
+                commands.append(["SET", KEY_PREFIX + key, value, "EX", str(ttl_seconds)])
+                commands.append(["SADD", INDEX_KEY, key])
+            results = await _redis_pipeline(commands)
+            if any(isinstance(r, dict) and "error" in r for r in results):
+                raise RuntimeError(f"pipeline вернул ошибку хотя бы по одной команде: {results}")
+            return
+        except Exception:
+            pass  # тоже падаем на локальный файл, чтобы данные не потерялись
+
+    data = _local_load()
+    for key, matched_name, price, ttl_seconds in entries:
+        data[key] = {"matched_name": matched_name, "price": price, "updated_at": time.time()}
+    _local_save(data)
+
+
 async def all_known_keys() -> list[str]:
     """Все ключи стикеров, которые бот когда-либо оценивал — нужно для фонового prewarm."""
     if REDIS_ENABLED:
