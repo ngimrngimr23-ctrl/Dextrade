@@ -270,11 +270,17 @@ async def _run_analysis(
     lines = [header]
 
     for o in offers[:20]:
-        stickers_html = html_module.escape(", ".join(o.stickers))
+        # каждое название стикера — в своём <code>, чтобы по тапу копировалось
+        # только оно; цена стикера — обычным текстом рядом, чтобы не попадала
+        # в копируемый текст
+        stickers_html = ", ".join(
+            f"<code>{html_module.escape(s)}</code> (${sticker_prices.get(s, 0.0):.2f})"
+            for s in o.stickers
+        )
         block = (
             f"${o.price:.2f} | переплата над голым скином ${o.overpay:.2f} | "
             f"стикеры ≈${o.stickers_value:.2f} | наценка {o.markup_pct:.1f}%\n"
-            f"  <code>{stickers_html}</code>"
+            f"  {stickers_html}"
         )
         if o.inspect_link:
             block += f'\n  <a href="{html_module.escape(o.inspect_link)}">Инспект этого лота</a>'
