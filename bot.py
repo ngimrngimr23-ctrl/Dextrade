@@ -430,6 +430,18 @@ async def scanfile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 _SPECIAL_VARIANT_WORDS = ("stattrak", "souvenir")
 
+# Полное название или сокращение степени износа -> каноническое название в
+# скобках, как в market_hash_name. Нужно для "хвостовой" степени в /watchadd:
+# если последним элементом через запятую указать степень (полностью или
+# сокращённо), она применится ко всем предметам списка без своей степени.
+_WEAR_ALIASES = {
+    "factory new": "Factory New", "fn": "Factory New",
+    "minimal wear": "Minimal Wear", "mw": "Minimal Wear",
+    "field-tested": "Field-Tested", "field tested": "Field-Tested", "ft": "Field-Tested",
+    "well-worn": "Well-Worn", "well worn": "Well-Worn", "ww": "Well-Worn",
+    "battle-scarred": "Battle-Scarred", "battle scarred": "Battle-Scarred", "bs": "Battle-Scarred",
+}
+
 
 async def _resolve_for_watchlist(raw: str) -> tuple[list[str], str | None]:
     """
@@ -474,22 +486,35 @@ async def _resolve_for_watchlist(raw: str) -> tuple[list[str], str | None]:
 async def watchadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /watchadd <предмет1>, <предмет2>, ... — добавить один или сразу несколько
-    предметов в вотчлист (ссылка или название, через запятую).
+    предметов в вотчлист (ссылка или название, через запятую). Последним
+    элементом можно отдельно указать степень износа (FN/MW/FT/WW/BS или
+    полностью) — применится ко всем предметам списка без своей степени.
     """
     chat_id = update.effective_chat.id
     if not context.args:
         await update.message.reply_text(
             "Формат: /watchadd <предмет1>, <предмет2>, ...\n"
             "Можно ссылку или название (на английском), через запятую для нескольких сразу.\n"
-            "Пример: /watchadd AK-47 | Slate (Field-Tested), M4A4 | Asiimov (Field-Tested)"
+            "Пример: /watchadd AK-47 | Slate (Field-Tested), M4A4 | Asiimov (Field-Tested)\n\n"
+            "Степень износа можно не расписывать на каждый предмет, а указать один раз "
+            "последним элементом — подойдёт и сокращение (FN/MW/FT/WW/BS):\n"
+            "/watchadd AK-47 | Redline, AWP | Redline, Field-Tested"
         )
         return
 
     parts = [p.strip() for p in " ".join(context.args).split(",") if p.strip()]
+
+    global_wear = None
+    if len(parts) > 1 and parts[-1].lower() in _WEAR_ALIASES:
+        global_wear = _WEAR_ALIASES[parts[-1].lower()]
+        parts = parts[:-1]
+
     current = await get_watchlist(chat_id)
 
     added, warnings, skipped = [], [], []
     for part in parts:
+        if global_wear and "(" not in part:
+            part = f"{part} ({global_wear})"
         names, warning = await _resolve_for_watchlist(part)
         if not names:
             skipped.append(warning)
@@ -508,6 +533,8 @@ async def watchadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _schedule_watchlist_job(context.application.job_queue, chat_id, await _get_watch_interval(chat_id))
 
     lines = []
+    if global_wear:
+        lines.append(f"Степень износа «{global_wear}» применена ко всем предметам списка без своей степени.")
     if added:
         lines.append("Добавлено:\n" + "\n".join(f"• {a}" for a in added))
     if warnings:
