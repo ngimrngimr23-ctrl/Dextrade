@@ -428,32 +428,47 @@ async def scanfile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _proceed_scan(update, market_hash_name, min_value, max_markup)
 
 
-async def _resolve_for_watchlist(raw: str) -> tuple[str | None, str | None]:
+_SPECIAL_VARIANT_WORDS = ("stattrak", "souvenir")
+
+
+async def _resolve_for_watchlist(raw: str) -> tuple[list[str], str | None]:
     """
-    Резолвит один предмет для /watchadd без интерактивного уточнения (батч-режим
-    не может ждать выбор номера на каждый неоднозначный вариант). При нескольких
-    подходящих вариантах берёт первый (самое короткое/точное совпадение — так
-    сортирует csgo_api.search_items) и предупреждает об этом.
-    Возвращает (market_hash_name, warning) — market_hash_name is None при ошибке.
+    Резолвит один пункт /watchadd в список market_hash_name (без интерактивного
+    уточнения — батч-режим не может ждать выбор номера на каждый вариант).
+
+    Ссылка -> ровно один результат (степень износа уже в самой ссылке).
+    Название СО степенью износа в скобках, напр. "AK-47 | Slate (Field-Tested)"
+    -> точное совпадение, один результат.
+    Название БЕЗ степени износа, напр. "AK-47 | Redline" -> сразу ВСЕ найденные
+    степени износа этого скина (кроме StatTrak/Souvenir, если их не просили
+    явно) — не нужно перечислять их вручную по одной.
+
+    Возвращает (список_market_hash_name, warning) — список пуст при ошибке.
     """
     if raw.startswith("http://") or raw.startswith("https://"):
         try:
-            return market_hash_name_from_url(raw), None
+            return [market_hash_name_from_url(raw)], None
         except Exception:
-            return None, f"«{raw}»: не смог разобрать ссылку"
+            return [], f"«{raw}»: не смог разобрать ссылку"
 
     try:
-        results = await search_csgo_items(raw)
+        results = await search_csgo_items(raw, count=10)
     except Exception as e:
-        return None, f"«{raw}»: ошибка поиска ({e})"
+        return [], f"«{raw}»: ошибка поиска ({e})"
 
     if not results:
-        return None, f"«{raw}»: не нашёл в базе предметов"
+        return [], f"«{raw}»: не нашёл в базе предметов"
 
-    name = results[0]["hash_name"]
-    if len(results) > 1:
-        return name, f"«{raw}»: было несколько вариантов, взял «{name}» — уточни степень износа, если не тот"
-    return name, None
+    if "(" in raw:  # степень износа уже указана явно — точное совпадение, без разброса
+        return [results[0]["hash_name"]], None
+
+    wants_special = any(w in raw.lower() for w in _SPECIAL_VARIANT_WORDS)
+    if not wants_special:
+        filtered = [r for r in results if not any(w in r["hash_name"].lower() for w in _SPECIAL_VARIANT_WORDS)]
+        if filtered:
+            results = filtered
+
+    return [r["hash_name"] for r in results], None
 
 
 async def watchadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -475,17 +490,18 @@ async def watchadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     added, warnings, skipped = [], [], []
     for part in parts:
-        name, warning = await _resolve_for_watchlist(part)
-        if name is None:
+        names, warning = await _resolve_for_watchlist(part)
+        if not names:
             skipped.append(warning)
             continue
         if warning:
             warnings.append(warning)
-        if name in current:
-            skipped.append(f"«{name}»: уже в списке")
-            continue
-        current.append(name)
-        added.append(name)
+        for name in names:
+            if name in current:
+                skipped.append(f"«{name}»: уже в списке")
+                continue
+            current.append(name)
+            added.append(name)
 
     await set_watchlist(chat_id, current)
     if context.application.job_queue and not context.application.job_queue.get_jobs_by_name(f"{WATCHLIST_JOB_PREFIX}{chat_id}"):
