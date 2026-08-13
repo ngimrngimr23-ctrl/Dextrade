@@ -39,6 +39,7 @@ log = logging.getLogger("steam_bot.steam_client")
 APP_ID = 730  # CS2 / CS:GO
 RENDER_COUNT = 100  # максимум, который отдаёт Steam за раз
 REQUEST_DELAY = 1.5  # пауза между запросами к Steam, чтобы не словить 429
+DEFAULT_MAX_LISTINGS = 300  # автосканы (/scanfile, вотчлист) по умолчанию смотрят только столько самых дешёвых лотов
 
 STEAM_PROXY_URL = os.environ.get("STEAM_PROXY_URL", "").rstrip("/")
 
@@ -206,8 +207,15 @@ def _ajax_headers(market_hash_name: str) -> dict:
 _BETA_PAGE_MARKERS = ("/ssr/", "DesktopUI", "<!DOCTYPE html")
 
 
-async def fetch_all_listings(market_hash_name: str) -> list[Listing]:
-    """Тянем все страницы листингов для предмета и парсим цену + стикеры каждого лота."""
+async def fetch_all_listings(market_hash_name: str, max_listings: int | None = DEFAULT_MAX_LISTINGS) -> list[Listing]:
+    """
+    Тянем страницы листингов для предмета и парсим цену + стикеры каждого лота.
+
+    Steam отдаёт лоты отсортированными от дешёвых к дорогим, поэтому первые
+    max_listings уже покрывают все реалистичные офферы — дальше идут лоты
+    дороже, которые почти никогда не выгодны. max_listings=None — собрать
+    вообще всё (может быть много страниц на популярных предметах).
+    """
     listings: list[Listing] = []
     cookie = steam_cookie_header()
 
@@ -232,6 +240,8 @@ async def fetch_all_listings(market_hash_name: str) -> list[Listing]:
         start = 0
         total_count = None
         while total_count is None or start < total_count:
+            if max_listings is not None and start >= max_listings:
+                break
             steam_url = render_url(market_hash_name, start)
             final_url, params = _build_request(steam_url)
             async with session.get(final_url, params=params, headers=_with_cookie(_ajax_headers(market_hash_name))) as resp:
