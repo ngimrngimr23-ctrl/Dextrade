@@ -109,13 +109,22 @@ async def _get_watch_interval(chat_id: int) -> float:
     return minutes if minutes is not None else DEFAULT_WATCH_INTERVAL_MINUTES
 
 
-def _schedule_watchlist_job(job_queue, chat_id: int, interval_minutes: float) -> None:
+def _schedule_watchlist_job(job_queue, chat_id: int, interval_minutes: float, delay_seconds: float | None = None) -> None:
+    """
+    Ставит СЛЕДУЮЩИЙ прогон вотчлиста одноразовой джобой (run_once), не
+    периодической (run_repeating). watchlist_scan_job сам перепланирует
+    следующий запуск через interval_minutes ПОСЛЕ своего завершения — так
+    прогоны никогда не накладываются друг на друга, даже если сканирование
+    всего списка не укладывается в заданный интервал (было видно в логах:
+    "maximum number of running instances reached" на run_repeating).
+    delay_seconds — необязательная задержка первого запуска, отличная от
+    самого интервала (не используется сейчас, но на будущее).
+    """
     for job in job_queue.get_jobs_by_name(f"{WATCHLIST_JOB_PREFIX}{chat_id}"):
         job.schedule_removal()
-    job_queue.run_repeating(
+    job_queue.run_once(
         watchlist_scan_job,
-        interval=interval_minutes * 60,
-        first=interval_minutes * 60,
+        when=delay_seconds if delay_seconds is not None else interval_minutes * 60,
         data={"chat_id": chat_id},
         name=f"{WATCHLIST_JOB_PREFIX}{chat_id}",
     )
@@ -779,7 +788,16 @@ async def _run_watchlist_scan(bot, chat_id: int) -> bool | None:
 
 async def watchlist_scan_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.data["chat_id"]
-    await _run_watchlist_scan(context.bot, chat_id)
+    try:
+        await _run_watchlist_scan(context.bot, chat_id)
+    finally:
+        # Планируем следующий прогон только теперь, ПОСЛЕ завершения текущего —
+        # так интервал = "N минут после окончания предыдущего", а не "каждые N
+        # минут по часам", и прогоны никогда не накладываются друг на друга,
+        # сколько бы времени ни занял список. Перечитываем интервал из
+        # хранилища на случай, если его поменяли командой, пока шёл этот прогон.
+        interval = await _get_watch_interval(chat_id)
+        _schedule_watchlist_job(context.job_queue, chat_id, interval)
 
 
 async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
