@@ -47,6 +47,8 @@ from steam_client import (
     _parse_listings_html,
     RENDER_COUNT,
     STEAM_PROXY_URL,
+    SteamRateLimited,
+    steam_cooldown_remaining,
 )
 from csgo_api import search_items as search_csgo_items
 from pricing import get_sticker_prices, ingest_manual_prices, clear_manual_prices, manual_prices_count
@@ -63,6 +65,8 @@ from storage import (
     set_watchlist,
     get_watch_interval_minutes,
     set_watch_interval_minutes,
+    get_watch_paused,
+    set_watch_paused,
     all_watchlist_chat_ids,
 )
 
@@ -741,9 +745,15 @@ async def watchinterval(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _watchlist_scan_item(bot, chat_id: int, market_hash_name: str, min_value: float, max_markup: float) -> bool:
-    """Возвращает True, если нашлись офферы и сообщение реально ушло в чат."""
+    """
+    Возвращает True, если нашлись офферы и сообщение реально ушло в чат.
+    SteamRateLimited пробрасывается наверх — прогон должен остановиться целиком,
+    а не продолжать долбить Steam остальными предметами во время бана.
+    """
     try:
         listings = await fetch_all_listings(market_hash_name)
+    except SteamRateLimited:
+        raise
     except Exception as e:
         log.warning("watchlist: %s (chat_id=%s): %s", market_hash_name, chat_id, e)
         return False
@@ -778,9 +788,18 @@ async def _run_watchlist_scan(bot, chat_id: int) -> bool | None:
         min_value, max_markup = await _get_defaults(chat_id)
         found_any = False
         for market_hash_name in items:
-            found = await _watchlist_scan_item(bot, chat_id, market_hash_name, min_value, max_markup)
+            try:
+                found = await _watchlist_scan_item(bot, chat_id, market_hash_name, min_value, max_markup)
+            except SteamRateLimited as e:
+                # Влетели в рейт-лимит Steam. Останавливаем весь прогон: каждая
+                # следующая попытка во время бана только продлевает его.
+                log.warning("watchlist: прогон chat_id=%s остановлен из-за рейт-лимита: %s", chat_id, e)
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⏸ Автоскан остановлен на «{market_hash_name}»: {e}",
+                )
+                return found_any
             found_any = found_any or found
-            await asyncio.sleep(WATCHLIST_ITEM_DELAY_SECONDS)
         return found_any
     finally:
         _watchlist_running.discard(chat_id)
@@ -789,6 +808,15 @@ async def _run_watchlist_scan(bot, chat_id: int) -> bool | None:
 async def watchlist_scan_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.data["chat_id"]
     try:
+        if await get_watch_paused(chat_id):
+            log.info("watchlist: chat_id=%s на паузе (/watchpause), пропускаю прогон", chat_id)
+            return
+        cooldown = steam_cooldown_remaining()
+        if cooldown > 0:
+            log.info(
+                "watchlist: chat_id=%s пропускает прогон — кулдаун Steam ещё %.0f мин", chat_id, cooldown / 60
+            )
+            return
         await _run_watchlist_scan(context.bot, chat_id)
     finally:
         # Планируем следующий прогон только теперь, ПОСЛЕ завершения текущего —
@@ -800,6 +828,34 @@ async def watchlist_scan_job(context: ContextTypes.DEFAULT_TYPE):
         _schedule_watchlist_job(context.job_queue, chat_id, interval)
 
 
+async def watchpause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/watchpause — остановить автоскан вотчлиста (список при этом сохраняется)."""
+    chat_id = update.effective_chat.id
+    await set_watch_paused(chat_id, True)
+    for job in context.application.job_queue.get_jobs_by_name(f"{WATCHLIST_JOB_PREFIX}{chat_id}"):
+        job.schedule_removal()
+    items = await get_watchlist(chat_id)
+    await update.message.reply_text(
+        f"⏸ Автоскан вотчлиста остановлен. Список ({len(items)} шт.) сохранён — "
+        f"его можно смотреть /watchlist и чистить /watchdel.\n"
+        f"Возобновить: /watchresume. Разовый скан вручную по-прежнему работает: /scanall."
+    )
+
+
+async def watchresume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/watchresume — снова включить автоскан вотчлиста по расписанию."""
+    chat_id = update.effective_chat.id
+    await set_watch_paused(chat_id, False)
+    interval = await _get_watch_interval(chat_id)
+    _schedule_watchlist_job(context.application.job_queue, chat_id, interval)
+    items = await get_watchlist(chat_id)
+    text = f"▶️ Автоскан вотчлиста возобновлён: {len(items)} предмет(ов), каждые {interval:g} мин."
+    cooldown = steam_cooldown_remaining()
+    if cooldown > 0:
+        text += f"\n\n⚠️ Но Steam сейчас на кулдауне после 429 — первые {cooldown / 60:.0f} мин прогоны будут пропускаться."
+    await update.message.reply_text(text)
+
+
 async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/scanall — сканировать весь вотчлист прямо сейчас, не дожидаясь расписания."""
     chat_id = update.effective_chat.id
@@ -809,6 +865,13 @@ async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if chat_id in _watchlist_running:
         await update.message.reply_text("Скан вотчлиста уже идёт, дождись его окончания.")
+        return
+    cooldown = steam_cooldown_remaining()
+    if cooldown > 0:
+        await update.message.reply_text(
+            f"Steam на кулдауне после 429 (это временный бан IP, который продлевается от новых "
+            f"попыток) — ещё {cooldown / 60:.0f} мин. Попробуй после этого."
+        )
         return
 
     await update.message.reply_text(f"Начинаю скан {len(items)} предмет(ов) из вотчлиста…")
@@ -1048,7 +1111,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/watchlist — показать вотчлист\n"
         "/watchinterval <мин> — как часто сканировать вотчлист (по умолчанию "
         f"{DEFAULT_WATCH_INTERVAL_MINUTES:g} мин); бот сам пришлёт сообщение, только если найдёт офферы.\n"
-        "/scanall — сканировать весь вотчлист прямо сейчас, не дожидаясь расписания.\n\n"
+        "/scanall — сканировать весь вотчлист прямо сейчас, не дожидаясь расписания.\n"
+        "/watchpause — остановить автоскан (список сохраняется), /watchresume — возобновить.\n\n"
         f"/setdefaults <мин$> <макс%> — поменять значения по умолчанию "
         f"(сейчас: {def_min:.0f}$ / {def_max:.0f}%).\n"
         f"/setstreakmarkup <%> — отдельный порог наценки для лотов с {STREAK_THRESHOLD}+ "
@@ -1068,6 +1132,11 @@ async def _on_startup(app: Application):
     for chat_id in chat_ids:
         items = await get_watchlist(chat_id)
         if not items:
+            continue
+        if await get_watch_paused(chat_id):
+            # /watchpause переживает редеплой: не воскрешаем джобу для чата,
+            # который сам её остановил.
+            log.info("watchlist: chat_id=%s на паузе, джобу не восстанавливаю", chat_id)
             continue
         interval = await _get_watch_interval(chat_id)
         _schedule_watchlist_job(app.job_queue, chat_id, interval)
@@ -1122,6 +1191,8 @@ def main():
     app.add_handler(CommandHandler("watchdel", watchdel))
     app.add_handler(CommandHandler("watchlist", watchlist_cmd))
     app.add_handler(CommandHandler("watchinterval", watchinterval))
+    app.add_handler(CommandHandler("watchpause", watchpause))
+    app.add_handler(CommandHandler("watchresume", watchresume))
     app.add_handler(CommandHandler("scanall", scanall))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_selection))

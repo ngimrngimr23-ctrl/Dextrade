@@ -28,6 +28,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 import urllib.parse
 from dataclasses import dataclass, field
 
@@ -38,9 +39,18 @@ log = logging.getLogger("steam_bot.steam_client")
 
 APP_ID = 730  # CS2 / CS:GO
 RENDER_COUNT = 100  # максимум, который отдаёт Steam за раз
-REQUEST_DELAY = 1.5  # пауза между запросами к Steam, чтобы не словить 429
-DEFAULT_MAX_LISTINGS = 300  # автосканы (/scanfile, вотчлист) по умолчанию смотрят только столько самых дешёвых лотов
-MAX_RENDER_RETRIES_429 = 5  # после стольких 429 подряд НА ОДНОЙ странице — сдаёмся с понятной ошибкой, не висим вечно
+DEFAULT_MAX_LISTINGS = 100  # автосканы (/scanfile, вотчлист) смотрят столько самых дешёвых лотов = ровно 1 запрос на предмет
+
+# --- Рейт-лимит Steam ---------------------------------------------------
+# По опыту сообщества безопасный темп — не чаще 1 запроса в ~4 секунды с
+# одного IP. Ключевое: 429 у Steam это НЕ "подожди секунду", а временный
+# бан IP (по отзывам — вплоть до нескольких часов), который ПРОДЛЕВАЕТСЯ
+# каждой новой попыткой во время бана. Поэтому ретраить 429 нельзя — этим
+# бот только закапывает себя глубже. Вместо ретраев: сразу сдаёмся и
+# ставим глобальный кулдаун, в течение которого к Steam не ходим вообще.
+MIN_REQUEST_INTERVAL = 4.0  # секунд между ЛЮБЫМИ двумя запросами к Steam (глобально на весь процесс)
+COOLDOWN_AFTER_429_SECONDS = 30 * 60  # получили 429 -> не трогаем Steam столько времени
+COOLDOWN_MAX_SECONDS = 6 * 60 * 60  # потолок при повторных 429 подряд (бан может быть длинным)
 
 STEAM_PROXY_URL = os.environ.get("STEAM_PROXY_URL", "").rstrip("/")
 
@@ -51,6 +61,66 @@ STEAM_PROXY_URL = os.environ.get("STEAM_PROXY_URL", "").rstrip("/")
 STEAM_LOGIN_SECURE = os.environ.get("STEAM_LOGIN_SECURE", "")
 STEAM_SESSION_ID = os.environ.get("STEAM_SESSION_ID", "")
 STEAM_BROWSER_ID = os.environ.get("STEAM_BROWSER_ID", "")
+
+
+class SteamRateLimited(RuntimeError):
+    """Steam ответил 429 либо мы сами на кулдауне после недавнего 429."""
+
+
+# Глобальные (на весь процесс) троттлинг и кулдаун: их разделяют И сбор
+# листингов, И запросы цен стикеров из pricing.py — иначе один компонент
+# съедает лимит и подставляет другой.
+_request_lock = asyncio.Lock()
+_last_request_at = 0.0
+_cooldown_until = 0.0
+_consecutive_429 = 0
+
+
+def steam_cooldown_remaining() -> float:
+    """Сколько секунд ещё нельзя трогать Steam (0, если можно)."""
+    return max(0.0, _cooldown_until - time.monotonic())
+
+
+def note_steam_429() -> float:
+    """
+    Зафиксировать 429: ставит глобальный кулдаун (растёт вдвое при 429
+    подряд, чтобы не долбиться в уже забаненный IP). Возвращает длину кулдауна.
+    """
+    global _cooldown_until, _consecutive_429
+    _consecutive_429 += 1
+    seconds = min(COOLDOWN_AFTER_429_SECONDS * (2 ** (_consecutive_429 - 1)), COOLDOWN_MAX_SECONDS)
+    _cooldown_until = max(_cooldown_until, time.monotonic() + seconds)
+    log.warning(
+        "Steam вернул 429 (%s-й подряд) — кулдаун на %.0f мин, к Steam не ходим до истечения",
+        _consecutive_429, seconds / 60,
+    )
+    return seconds
+
+
+def note_steam_ok() -> None:
+    """Успешный ответ — сбрасываем счётчик 429 подряд."""
+    global _consecutive_429
+    _consecutive_429 = 0
+
+
+def raise_if_cooling_down() -> None:
+    remaining = steam_cooldown_remaining()
+    if remaining > 0:
+        raise SteamRateLimited(
+            f"Steam недавно ответил 429 (это временный бан IP, который продлевается "
+            f"от новых попыток), поэтому запросы к нему приостановлены ещё на "
+            f"{remaining / 60:.0f} мин. Попробуй после этого."
+        )
+
+
+async def throttle_steam_request() -> None:
+    """Держит паузу MIN_REQUEST_INTERVAL между любыми двумя запросами к Steam."""
+    global _last_request_at
+    async with _request_lock:
+        wait = MIN_REQUEST_INTERVAL - (time.monotonic() - _last_request_at)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _last_request_at = time.monotonic()
 
 
 def steam_cookie_header() -> str:
@@ -163,21 +233,6 @@ _UA_HINTS = {
 }
 
 
-def _nav_headers() -> dict:
-    """Заголовки Chrome при обычной навигации по ссылке (прогрев сессии)."""
-    return {
-        "User-Agent": _UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
-        **_UA_HINTS,
-    }
-
-
 def _ajax_headers(market_hash_name: str) -> dict:
     """
     Заголовки AJAX-запроса к легаси-эндпоинту /render/ — именно так его дёргает
@@ -228,45 +283,33 @@ async def fetch_all_listings(market_hash_name: str, max_listings: int | None = D
         market_hash_name, STEAM_PROXY_URL or "нет (прямой запрос)", "есть" if cookie else "нет",
     )
 
-    async with aiohttp.ClientSession() as session:
-        # "Прогрев" сессии обычной навигацией на страницу предмета, как это
-        # сделал бы браузер, прежде чем фронтенд дёрнет /render/ через AJAX.
-        warmup_url, warmup_params = _build_request(item_page_url(market_hash_name))
-        try:
-            async with session.get(warmup_url, params=warmup_params, headers=_with_cookie(_nav_headers())) as warmup_resp:
-                await warmup_resp.read()
-        except Exception:
-            log.warning("fetch_all_listings: не удалось прогреть сессию, продолжаю без прогрева", exc_info=True)
+    raise_if_cooling_down()
 
+    async with aiohttp.ClientSession() as session:
+        # Прогревочного захода на страницу предмета здесь больше нет: он был
+        # добавлен под гипотезу "первый запрос холодной сессии отдаёт HTML",
+        # которая не подтвердилась (настоящей причиной был bMarketOptOut=1).
+        # А лишний запрос на каждый предмет — прямой путь к 429.
         start = 0
         total_count = None
-        retries_429 = 0
         while total_count is None or start < total_count:
             if max_listings is not None and start >= max_listings:
                 break
             steam_url = render_url(market_hash_name, start)
             final_url, params = _build_request(steam_url)
+            await throttle_steam_request()
             async with session.get(final_url, params=params, headers=_with_cookie(_ajax_headers(market_hash_name))) as resp:
                 if resp.status == 429:
-                    # Rate limit — ждём и пробуем ещё раз тот же start. Раньше
-                    # тут не было ни лога, ни предела попыток: если Steam
-                    # стабильно отвечал 429, бот молча зависал в этом цикле
-                    # НАВСЕГДА — снаружи выглядело как "бот не отвечает", хотя
-                    # реально просто крутился здесь без единой строчки в лог.
-                    retries_429 += 1
-                    log.warning(
-                        "fetch_all_listings: start=%s -> HTTP 429 (попытка %s/%s), жду 10 сек",
-                        start, retries_429, MAX_RENDER_RETRIES_429,
+                    # НЕ ретраим: у Steam 429 — это временный бан IP, который
+                    # продлевается каждой новой попыткой. Ставим глобальный
+                    # кулдаун и сразу выходим, чтобы не закапываться глубже.
+                    seconds = note_steam_429()
+                    raise SteamRateLimited(
+                        f"Steam ответил 429 (Too Many Requests) — это временный бан IP, "
+                        f"который продлевается от новых попыток, поэтому не ретраю. "
+                        f"Запросы к Steam приостановлены на {seconds / 60:.0f} мин."
                     )
-                    if retries_429 >= MAX_RENDER_RETRIES_429:
-                        raise RuntimeError(
-                            f"Steam стабильно отвечает 429 (Too Many Requests) на start={start} "
-                            f"после {MAX_RENDER_RETRIES_429} попыток — похоже, реальный рейт-лимит, "
-                            f"не разовый сбой. Попробуй ещё раз чуть позже."
-                        )
-                    await asyncio.sleep(10)
-                    continue
-                retries_429 = 0  # сбрасываем счётчик после любой успешной страницы
+                note_steam_ok()
                 resp.raise_for_status()
 
                 content_type = resp.headers.get("Content-Type", "")
@@ -303,7 +346,7 @@ async def fetch_all_listings(market_hash_name: str, max_listings: int | None = D
             listings.extend(_parse_listings_html(html))
 
             start += RENDER_COUNT
-            await asyncio.sleep(REQUEST_DELAY)
+            # паузы между страницами держит throttle_steam_request() выше
 
     return listings
 
