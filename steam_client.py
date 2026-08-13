@@ -40,6 +40,7 @@ APP_ID = 730  # CS2 / CS:GO
 RENDER_COUNT = 100  # максимум, который отдаёт Steam за раз
 REQUEST_DELAY = 1.5  # пауза между запросами к Steam, чтобы не словить 429
 DEFAULT_MAX_LISTINGS = 300  # автосканы (/scanfile, вотчлист) по умолчанию смотрят только столько самых дешёвых лотов
+MAX_RENDER_RETRIES_429 = 5  # после стольких 429 подряд НА ОДНОЙ странице — сдаёмся с понятной ошибкой, не висим вечно
 
 STEAM_PROXY_URL = os.environ.get("STEAM_PROXY_URL", "").rstrip("/")
 
@@ -239,6 +240,7 @@ async def fetch_all_listings(market_hash_name: str, max_listings: int | None = D
 
         start = 0
         total_count = None
+        retries_429 = 0
         while total_count is None or start < total_count:
             if max_listings is not None and start >= max_listings:
                 break
@@ -246,9 +248,25 @@ async def fetch_all_listings(market_hash_name: str, max_listings: int | None = D
             final_url, params = _build_request(steam_url)
             async with session.get(final_url, params=params, headers=_with_cookie(_ajax_headers(market_hash_name))) as resp:
                 if resp.status == 429:
-                    # Rate limit — ждём и пробуем ещё раз тот же start
+                    # Rate limit — ждём и пробуем ещё раз тот же start. Раньше
+                    # тут не было ни лога, ни предела попыток: если Steam
+                    # стабильно отвечал 429, бот молча зависал в этом цикле
+                    # НАВСЕГДА — снаружи выглядело как "бот не отвечает", хотя
+                    # реально просто крутился здесь без единой строчки в лог.
+                    retries_429 += 1
+                    log.warning(
+                        "fetch_all_listings: start=%s -> HTTP 429 (попытка %s/%s), жду 10 сек",
+                        start, retries_429, MAX_RENDER_RETRIES_429,
+                    )
+                    if retries_429 >= MAX_RENDER_RETRIES_429:
+                        raise RuntimeError(
+                            f"Steam стабильно отвечает 429 (Too Many Requests) на start={start} "
+                            f"после {MAX_RENDER_RETRIES_429} попыток — похоже, реальный рейт-лимит, "
+                            f"не разовый сбой. Попробуй ещё раз чуть позже."
+                        )
                     await asyncio.sleep(10)
                     continue
+                retries_429 = 0  # сбрасываем счётчик после любой успешной страницы
                 resp.raise_for_status()
 
                 content_type = resp.headers.get("Content-Type", "")
