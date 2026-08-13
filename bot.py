@@ -26,6 +26,7 @@ Telegram-бот.
     python bot.py
 """
 
+import asyncio
 import html as html_module
 import json
 import logging
@@ -51,7 +52,15 @@ from csgo_api import search_items as search_csgo_items
 from pricing import get_sticker_prices, ingest_manual_prices, clear_manual_prices, manual_prices_count
 from analyzer import find_offers
 from prewarm import prewarm_loop
-from storage import get_chat_defaults, set_chat_defaults
+from storage import (
+    get_chat_defaults,
+    set_chat_defaults,
+    get_watchlist,
+    set_watchlist,
+    get_watch_interval_minutes,
+    set_watch_interval_minutes,
+    all_watchlist_chat_ids,
+)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("steam_bot")
@@ -77,6 +86,35 @@ _pending_search: dict[int, dict] = {}
 # ingest_manual_prices, а не в обычный парсинг листингов, пока не пришлют
 # /scan или /scanfile (это выключает режим автоматически).
 _pricefile_mode: set[int] = set()
+
+# Вотчлист /watchadd: список предметов сканируется по расписанию джобой
+# watchlist_scan_job, результат шлётся в чат только если нашлись офферы
+# (без "ничего не подошло" на каждый тик — иначе бот спамил бы постоянно).
+DEFAULT_WATCH_INTERVAL_MINUTES = 60.0
+MIN_WATCH_INTERVAL_MINUTES = 15.0  # сканирование каждого предмета — десятки запросов к Steam, короче нет смысла
+WATCHLIST_JOB_PREFIX = "watchlist_scan_"
+WATCHLIST_ITEM_DELAY_SECONDS = 3  # пауза между предметами внутри одного тика, чтобы не долбить Steam пачкой сразу
+
+# chat_id -> идёт прогон вотчлиста прямо сейчас — защита от наложения тиков,
+# если сканирование всех предметов не укладывается в заданный интервал.
+_watchlist_running: set[int] = set()
+
+
+async def _get_watch_interval(chat_id: int) -> float:
+    minutes = await get_watch_interval_minutes(chat_id)
+    return minutes if minutes is not None else DEFAULT_WATCH_INTERVAL_MINUTES
+
+
+def _schedule_watchlist_job(job_queue, chat_id: int, interval_minutes: float) -> None:
+    for job in job_queue.get_jobs_by_name(f"{WATCHLIST_JOB_PREFIX}{chat_id}"):
+        job.schedule_removal()
+    job_queue.run_repeating(
+        watchlist_scan_job,
+        interval=interval_minutes * 60,
+        first=interval_minutes * 60,
+        data={"chat_id": chat_id},
+        name=f"{WATCHLIST_JOB_PREFIX}{chat_id}",
+    )
 
 
 async def _get_defaults(chat_id: int) -> tuple[float, float]:
@@ -242,22 +280,16 @@ async def handle_text_selection(update: Update, context: ContextTypes.DEFAULT_TY
         await _proceed_scanfile(update, market_hash_name, min_value, max_markup)
 
 
-async def _run_analysis(
-    update: Update, listings, min_value: float, max_markup: float, market_hash_name: str | None = None
-):
-    await update.message.reply_text(f"Собрано {len(listings)} лотов. Смотрю цены на стикеры…")
-
+async def _compute_offers(listings, min_value: float, max_markup: float):
+    """Общая логика для /scan, /scanfile и автоскана вотчлиста: цены стикеров -> офферы."""
     all_sticker_keys = {s for l in listings for s in l.stickers}
     sticker_prices = await get_sticker_prices(all_sticker_keys) if all_sticker_keys else {}
-
     offers = find_offers(listings, sticker_prices, min_value, max_markup)
+    return offers, sticker_prices
 
-    if not offers:
-        await update.message.reply_text(
-            f"Ничего не подошло под критерии (стикеры от ${min_value:.2f}, наценка ≤{max_markup:.0f}%)."
-        )
-        return
 
+def _format_offers_chunks(offers, sticker_prices, market_hash_name: str | None) -> list[str]:
+    """Готовые куски текста (HTML) под лимит Telegram ~4096 символов — шлются по одному reply_text/send_message."""
     header = f"Найдено {len(offers)} офферов (цена голого скина ≈${offers[0].floor_price:.2f})"
     if market_hash_name:
         item_url = render_url(market_hash_name, 0).split("/render/")[0]
@@ -285,15 +317,34 @@ async def _run_analysis(
         lines.append(block)
 
     # Telegram режет сообщения по ~4096 символов — шлём частями, если офферов много
+    chunks = []
     chunk = ""
     for line in lines:
         candidate = (chunk + "\n\n" + line) if chunk else line
         if len(candidate) > 3800:
-            await update.message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
+            chunks.append(chunk)
             chunk = line
         else:
             chunk = candidate
     if chunk:
+        chunks.append(chunk)
+    return chunks
+
+
+async def _run_analysis(
+    update: Update, listings, min_value: float, max_markup: float, market_hash_name: str | None = None
+):
+    await update.message.reply_text(f"Собрано {len(listings)} лотов. Смотрю цены на стикеры…")
+
+    offers, sticker_prices = await _compute_offers(listings, min_value, max_markup)
+
+    if not offers:
+        await update.message.reply_text(
+            f"Ничего не подошло под критерии (стикеры от ${min_value:.2f}, наценка ≤{max_markup:.0f}%)."
+        )
+        return
+
+    for chunk in _format_offers_chunks(offers, sticker_prices, market_hash_name):
         await update.message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
 
 
@@ -375,6 +426,203 @@ async def scanfile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return  # либо ошибка уже сообщена, либо ждём выбора номера
 
     await _proceed_scan(update, market_hash_name, min_value, max_markup)
+
+
+async def _resolve_for_watchlist(raw: str) -> tuple[str | None, str | None]:
+    """
+    Резолвит один предмет для /watchadd без интерактивного уточнения (батч-режим
+    не может ждать выбор номера на каждый неоднозначный вариант). При нескольких
+    подходящих вариантах берёт первый (самое короткое/точное совпадение — так
+    сортирует csgo_api.search_items) и предупреждает об этом.
+    Возвращает (market_hash_name, warning) — market_hash_name is None при ошибке.
+    """
+    if raw.startswith("http://") or raw.startswith("https://"):
+        try:
+            return market_hash_name_from_url(raw), None
+        except Exception:
+            return None, f"«{raw}»: не смог разобрать ссылку"
+
+    try:
+        results = await search_csgo_items(raw)
+    except Exception as e:
+        return None, f"«{raw}»: ошибка поиска ({e})"
+
+    if not results:
+        return None, f"«{raw}»: не нашёл в базе предметов"
+
+    name = results[0]["hash_name"]
+    if len(results) > 1:
+        return name, f"«{raw}»: было несколько вариантов, взял «{name}» — уточни степень износа, если не тот"
+    return name, None
+
+
+async def watchadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /watchadd <предмет1>, <предмет2>, ... — добавить один или сразу несколько
+    предметов в вотчлист (ссылка или название, через запятую).
+    """
+    chat_id = update.effective_chat.id
+    if not context.args:
+        await update.message.reply_text(
+            "Формат: /watchadd <предмет1>, <предмет2>, ...\n"
+            "Можно ссылку или название (на английском), через запятую для нескольких сразу.\n"
+            "Пример: /watchadd AK-47 | Slate (Field-Tested), M4A4 | Asiimov (Field-Tested)"
+        )
+        return
+
+    parts = [p.strip() for p in " ".join(context.args).split(",") if p.strip()]
+    current = await get_watchlist(chat_id)
+
+    added, warnings, skipped = [], [], []
+    for part in parts:
+        name, warning = await _resolve_for_watchlist(part)
+        if name is None:
+            skipped.append(warning)
+            continue
+        if warning:
+            warnings.append(warning)
+        if name in current:
+            skipped.append(f"«{name}»: уже в списке")
+            continue
+        current.append(name)
+        added.append(name)
+
+    await set_watchlist(chat_id, current)
+    if context.application.job_queue and not context.application.job_queue.get_jobs_by_name(f"{WATCHLIST_JOB_PREFIX}{chat_id}"):
+        _schedule_watchlist_job(context.application.job_queue, chat_id, await _get_watch_interval(chat_id))
+
+    lines = []
+    if added:
+        lines.append("Добавлено:\n" + "\n".join(f"• {a}" for a in added))
+    if warnings:
+        lines.append("Уточни, если не то:\n" + "\n".join(f"• {w}" for w in warnings))
+    if skipped:
+        lines.append("Пропущено:\n" + "\n".join(f"• {s}" for s in skipped))
+    interval = await _get_watch_interval(chat_id)
+    lines.append(f"Всего в списке: {len(current)}. Автоскан каждые {interval:g} мин (/watchinterval, чтобы поменять).")
+    await update.message.reply_text("\n\n".join(lines))
+
+
+async def watchdel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/watchdel <номер из /watchlist или точное название> — убрать предмет из вотчлиста."""
+    chat_id = update.effective_chat.id
+    current = await get_watchlist(chat_id)
+
+    if not context.args:
+        await update.message.reply_text(
+            "Формат: /watchdel <номер из /watchlist или точное название>\n"
+            "Пример: /watchdel 2"
+        )
+        return
+    if not current:
+        await update.message.reply_text("Вотчлист пуст.")
+        return
+
+    arg = " ".join(context.args).strip()
+    if arg.isdigit():
+        idx = int(arg) - 1
+        if not (0 <= idx < len(current)):
+            await update.message.reply_text(f"Номер должен быть от 1 до {len(current)}.")
+            return
+        removed = current.pop(idx)
+    else:
+        match = next((x for x in current if x.lower() == arg.lower()), None)
+        if match is None:
+            await update.message.reply_text(f"«{arg}» не найден в списке. Точное название смотри в /watchlist.")
+            return
+        current.remove(match)
+        removed = match
+
+    await set_watchlist(chat_id, current)
+    await update.message.reply_text(f"Удалено: {removed}\nОсталось в списке: {len(current)}.")
+
+
+async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/watchlist — показать текущий вотчлист и интервал автоскана."""
+    chat_id = update.effective_chat.id
+    items = await get_watchlist(chat_id)
+    interval = await _get_watch_interval(chat_id)
+
+    if not items:
+        await update.message.reply_text(
+            "Вотчлист пуст. Добавь предметы: /watchadd <предмет1>, <предмет2>, ...\n"
+            f"Интервал автоскана сейчас: {interval:g} мин (/watchinterval <мин>, чтобы поменять)."
+        )
+        return
+
+    lines = [f"📋 Вотчлист ({len(items)}), автоскан каждые {interval:g} мин:"]
+    for i, name in enumerate(items, start=1):
+        lines.append(f"{i}. {name}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def watchinterval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /watchinterval        — показать текущий интервал автоскана вотчлиста (в минутах)
+    /watchinterval <мин>  — сменить интервал
+    """
+    chat_id = update.effective_chat.id
+    if not context.args:
+        interval = await _get_watch_interval(chat_id)
+        await update.message.reply_text(
+            f"Текущий интервал автоскана вотчлиста: {interval:g} мин.\n"
+            f"Чтобы поменять: /watchinterval <мин>, напр. /watchinterval 60"
+        )
+        return
+
+    try:
+        minutes = float(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Интервал должен быть числом в минутах, напр. 30 или 60.")
+        return
+    if minutes < MIN_WATCH_INTERVAL_MINUTES:
+        await update.message.reply_text(
+            f"Минимальный интервал — {MIN_WATCH_INTERVAL_MINUTES:g} мин. Сканирование каждого предмета — "
+            f"это десятки запросов к Steam, чаще просто не успеет прогнать весь список."
+        )
+        return
+
+    await set_watch_interval_minutes(chat_id, minutes)
+    if context.application.job_queue:
+        _schedule_watchlist_job(context.application.job_queue, chat_id, minutes)
+    await update.message.reply_text(f"Интервал автоскана вотчлиста: теперь каждые {minutes:g} мин.")
+
+
+async def _watchlist_scan_item(bot, chat_id: int, market_hash_name: str, min_value: float, max_markup: float):
+    try:
+        listings = await fetch_all_listings(market_hash_name)
+    except Exception as e:
+        log.warning("watchlist: %s (chat_id=%s): %s", market_hash_name, chat_id, e)
+        return
+
+    offers, sticker_prices = await _compute_offers(listings, min_value, max_markup)
+    if not offers:
+        return  # автоскан молчит, если нечего показать — иначе спамил бы каждый тик
+
+    chunks = _format_offers_chunks(offers, sticker_prices, market_hash_name)
+    chunks[0] = f"🔔 Автоскан: {html_module.escape(market_hash_name)}\n\n{chunks[0]}"
+    for chunk in chunks:
+        await bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML", disable_web_page_preview=True)
+
+
+async def watchlist_scan_job(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.data["chat_id"]
+    if chat_id in _watchlist_running:
+        log.info("watchlist: пропускаю тик для chat_id=%s — предыдущий прогон ещё идёт", chat_id)
+        return
+
+    items = await get_watchlist(chat_id)
+    if not items:
+        return
+
+    _watchlist_running.add(chat_id)
+    try:
+        min_value, max_markup = await _get_defaults(chat_id)
+        for market_hash_name in items:
+            await _watchlist_scan_item(context.bot, chat_id, market_hash_name, min_value, max_markup)
+            await asyncio.sleep(WATCHLIST_ITEM_DELAY_SECONDS)
+    finally:
+        _watchlist_running.discard(chat_id)
 
 
 async def pricefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -602,14 +850,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "IP), используй только если знаешь, что делаешь.\n\n"
         "/pricefile — загрузить прайс-лист цен на стикеры вручную (Steam market/search JSON), "
         "/clearprices — очистить его перед обновлением.\n\n"
+        "/watchadd <предмет1>, <предмет2>, ... — добавить предметы в вотчлист на автоскан\n"
+        "/watchdel <номер или название> — убрать предмет из вотчлиста\n"
+        "/watchlist — показать вотчлист\n"
+        "/watchinterval <мин> — как часто сканировать вотчлист (по умолчанию "
+        f"{DEFAULT_WATCH_INTERVAL_MINUTES:g} мин); бот сам пришлёт сообщение, только если найдёт офферы.\n\n"
         f"/setdefaults <мин$> <макс%> — поменять значения по умолчанию "
         f"(сейчас: {def_min:.0f}$ / {def_max:.0f}%)."
     )
 
 
 async def _on_startup(app: Application):
-    import asyncio
     asyncio.create_task(prewarm_loop())
+
+    # Восстанавливаем джобы автоскана вотчлиста после рестарта/редеплоя —
+    # без этого расписание жило бы только в памяти процесса и слетало каждый раз.
+    chat_ids = await all_watchlist_chat_ids()
+    restored = 0
+    for chat_id in chat_ids:
+        items = await get_watchlist(chat_id)
+        if not items:
+            continue
+        interval = await _get_watch_interval(chat_id)
+        _schedule_watchlist_job(app.job_queue, chat_id, interval)
+        restored += 1
+    log.info("watchlist: восстановлены джобы автоскана для %d чат(ов)", restored)
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -653,6 +918,10 @@ def main():
     app.add_handler(CommandHandler("setdefaults", setdefaults))
     app.add_handler(CommandHandler("pricefile", pricefile))
     app.add_handler(CommandHandler("clearprices", clearprices))
+    app.add_handler(CommandHandler("watchadd", watchadd))
+    app.add_handler(CommandHandler("watchdel", watchdel))
+    app.add_handler(CommandHandler("watchlist", watchlist_cmd))
+    app.add_handler(CommandHandler("watchinterval", watchinterval))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_selection))
     app.run_polling()
