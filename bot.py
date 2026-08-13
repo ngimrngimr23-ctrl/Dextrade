@@ -588,41 +588,73 @@ async def watchinterval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Интервал автоскана вотчлиста: теперь каждые {minutes:g} мин.")
 
 
-async def _watchlist_scan_item(bot, chat_id: int, market_hash_name: str, min_value: float, max_markup: float):
+async def _watchlist_scan_item(bot, chat_id: int, market_hash_name: str, min_value: float, max_markup: float) -> bool:
+    """Возвращает True, если нашлись офферы и сообщение реально ушло в чат."""
     try:
         listings = await fetch_all_listings(market_hash_name)
     except Exception as e:
         log.warning("watchlist: %s (chat_id=%s): %s", market_hash_name, chat_id, e)
-        return
+        return False
 
     offers, sticker_prices = await _compute_offers(listings, min_value, max_markup)
     if not offers:
-        return  # автоскан молчит, если нечего показать — иначе спамил бы каждый тик
+        return False  # автоскан молчит, если нечего показать — иначе спамил бы каждый тик
 
     chunks = _format_offers_chunks(offers, sticker_prices, market_hash_name)
-    chunks[0] = f"🔔 Автоскан: {html_module.escape(market_hash_name)}\n\n{chunks[0]}"
+    chunks[0] = f"🔔 {html_module.escape(market_hash_name)}\n\n{chunks[0]}"
     for chunk in chunks:
         await bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML", disable_web_page_preview=True)
+    return True
 
 
-async def watchlist_scan_job(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = context.job.data["chat_id"]
+async def _run_watchlist_scan(bot, chat_id: int) -> bool | None:
+    """
+    Прогоняет весь вотчлист чата разом — общая логика для джобы по расписанию
+    и команды /scanall. Возвращает True/False (нашлось ли хоть что-то) или
+    None, если прогон не запустился (пустой список / уже идёт другой прогон).
+    """
     if chat_id in _watchlist_running:
-        log.info("watchlist: пропускаю тик для chat_id=%s — предыдущий прогон ещё идёт", chat_id)
-        return
+        log.info("watchlist: прогон для chat_id=%s уже идёт, пропускаю повторный запуск", chat_id)
+        return None
 
     items = await get_watchlist(chat_id)
     if not items:
-        return
+        return None
 
     _watchlist_running.add(chat_id)
     try:
         min_value, max_markup = await _get_defaults(chat_id)
+        found_any = False
         for market_hash_name in items:
-            await _watchlist_scan_item(context.bot, chat_id, market_hash_name, min_value, max_markup)
+            found = await _watchlist_scan_item(bot, chat_id, market_hash_name, min_value, max_markup)
+            found_any = found_any or found
             await asyncio.sleep(WATCHLIST_ITEM_DELAY_SECONDS)
+        return found_any
     finally:
         _watchlist_running.discard(chat_id)
+
+
+async def watchlist_scan_job(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.data["chat_id"]
+    await _run_watchlist_scan(context.bot, chat_id)
+
+
+async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/scanall — сканировать весь вотчлист прямо сейчас, не дожидаясь расписания."""
+    chat_id = update.effective_chat.id
+    items = await get_watchlist(chat_id)
+    if not items:
+        await update.message.reply_text("Вотчлист пуст. Добавь предметы: /watchadd <предмет1>, <предмет2>, ...")
+        return
+    if chat_id in _watchlist_running:
+        await update.message.reply_text("Скан вотчлиста уже идёт, дождись его окончания.")
+        return
+
+    await update.message.reply_text(f"Начинаю скан {len(items)} предмет(ов) из вотчлиста…")
+    found_any = await _run_watchlist_scan(context.bot, chat_id)
+    await update.message.reply_text(
+        "Готово." if found_any else "Готово, но ничего подходящего не нашлось ни по одному предмету."
+    )
 
 
 async def pricefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -854,7 +886,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/watchdel <номер или название> — убрать предмет из вотчлиста\n"
         "/watchlist — показать вотчлист\n"
         "/watchinterval <мин> — как часто сканировать вотчлист (по умолчанию "
-        f"{DEFAULT_WATCH_INTERVAL_MINUTES:g} мин); бот сам пришлёт сообщение, только если найдёт офферы.\n\n"
+        f"{DEFAULT_WATCH_INTERVAL_MINUTES:g} мин); бот сам пришлёт сообщение, только если найдёт офферы.\n"
+        "/scanall — сканировать весь вотчлист прямо сейчас, не дожидаясь расписания.\n\n"
         f"/setdefaults <мин$> <макс%> — поменять значения по умолчанию "
         f"(сейчас: {def_min:.0f}$ / {def_max:.0f}%)."
     )
@@ -922,6 +955,7 @@ def main():
     app.add_handler(CommandHandler("watchdel", watchdel))
     app.add_handler(CommandHandler("watchlist", watchlist_cmd))
     app.add_handler(CommandHandler("watchinterval", watchinterval))
+    app.add_handler(CommandHandler("scanall", scanall))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_selection))
     app.run_polling()
