@@ -51,16 +51,23 @@ STEAM_SESSION_ID = os.environ.get("STEAM_SESSION_ID", "")
 STEAM_BROWSER_ID = os.environ.get("STEAM_BROWSER_ID", "")
 
 
-def steam_cookie_header() -> str | None:
-    """Собирает Cookie-заголовок из заданных куков Steam-сессии, либо None, если ни один не задан."""
-    parts = []
+def steam_cookie_header() -> str:
+    """
+    Собирает Cookie-заголовок для запросов к Steam.
+
+    bMarketOptOut=1 — не секретная, не привязанная к аккаунту кука "выход из
+    бета-теста торговой площадки" (проверено вручную: без неё легаси-эндпоинт
+    /render/ отдаёт HTML новой торговой площадки вместо JSON, даже у анонимной
+    сессии без логина). Шлём её всегда, безусловно.
+    """
+    parts = ["bMarketOptOut=1"]
     if STEAM_LOGIN_SECURE:
         parts.append(f"steamLoginSecure={STEAM_LOGIN_SECURE}")
     if STEAM_SESSION_ID:
         parts.append(f"sessionid={STEAM_SESSION_ID}")
     if STEAM_BROWSER_ID:
         parts.append(f"browserid={STEAM_BROWSER_ID}")
-    return "; ".join(parts) if parts else None
+    return "; ".join(parts)
 
 
 @dataclass
