@@ -50,11 +50,15 @@ from steam_client import (
 )
 from csgo_api import search_items as search_csgo_items
 from pricing import get_sticker_prices, ingest_manual_prices, clear_manual_prices, manual_prices_count
-from analyzer import find_offers
+from analyzer import find_offers, STREAK_THRESHOLD
 from prewarm import prewarm_loop
 from storage import (
     get_chat_defaults,
     set_chat_defaults,
+    get_streak_markup,
+    set_streak_markup,
+    get_price_filter,
+    set_price_filter,
     get_watchlist,
     set_watchlist,
     get_watch_interval_minutes,
@@ -280,11 +284,16 @@ async def handle_text_selection(update: Update, context: ContextTypes.DEFAULT_TY
         await _proceed_scanfile(update, market_hash_name, min_value, max_markup)
 
 
-async def _compute_offers(listings, min_value: float, max_markup: float):
+async def _compute_offers(chat_id: int, listings, min_value: float, max_markup: float):
     """Общая логика для /scan, /scanfile и автоскана вотчлиста: цены стикеров -> офферы."""
     all_sticker_keys = {s for l in listings for s in l.stickers}
     sticker_prices = await get_sticker_prices(all_sticker_keys) if all_sticker_keys else {}
-    offers = find_offers(listings, sticker_prices, min_value, max_markup)
+    streak_markup = await get_streak_markup(chat_id)
+    min_price, max_price = await get_price_filter(chat_id)
+    offers = find_offers(
+        listings, sticker_prices, min_value, max_markup,
+        streak_max_markup_pct=streak_markup, min_price=min_price, max_price=max_price,
+    )
     return offers, sticker_prices
 
 
@@ -306,9 +315,10 @@ def _format_offers_chunks(offers, sticker_prices, market_hash_name: str | None) 
         # (как раньше); цены стикеров — отдельной строкой ниже, вне <code>
         stickers_html = html_module.escape(", ".join(o.stickers))
         prices_str = ", ".join(f"${sticker_prices.get(s, 0.0):.2f}" for s in o.stickers)
+        streak_tag = f" 🔥 стрик x{o.streak}" if o.streak >= STREAK_THRESHOLD else ""
         block = (
             f"${o.price:.2f} | переплата над голым скином ${o.overpay:.2f} | "
-            f"стикеры ≈${o.stickers_value:.2f} | наценка {o.markup_pct:.1f}%\n"
+            f"стикеры ≈${o.stickers_value:.2f} | наценка {o.markup_pct:.1f}%{streak_tag}\n"
             f"  <code>{stickers_html}</code>\n"
             f"  цены: {prices_str}"
         )
@@ -336,7 +346,7 @@ async def _run_analysis(
 ):
     await update.message.reply_text(f"Собрано {len(listings)} лотов. Смотрю цены на стикеры…")
 
-    offers, sticker_prices = await _compute_offers(listings, min_value, max_markup)
+    offers, sticker_prices = await _compute_offers(update.effective_chat.id, listings, min_value, max_markup)
 
     if not offers:
         await update.message.reply_text(
@@ -402,6 +412,96 @@ async def setdefaults(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Ок, теперь по умолчанию: мин$ стикеров={min_value:.2f}, макс наценка={max_markup:.0f}%.\n"
         f"Действует для /scan и /scanfile без явных чисел, а также для файлов, "
         f"присланных без команды."
+    )
+
+
+async def setstreakmarkup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /setstreakmarkup        — показать текущий порог наценки для стрик-лотов
+    /setstreakmarkup <%>    — задать отдельный порог наценки для стрик-лотов
+                               (от 4 подряд идущих одинаковых стикеров на оружии)
+    """
+    chat_id = update.effective_chat.id
+    args = context.args
+
+    if not args:
+        cur = await get_streak_markup(chat_id)
+        _, def_max = await _get_defaults(chat_id)
+        if cur is None:
+            await update.message.reply_text(
+                f"Отдельный порог для стрик-лотов (от {STREAK_THRESHOLD} подряд одинаковых стикеров) "
+                f"не задан — для них действует обычная наценка ({def_max:.0f}%, см. /setdefaults).\n\n"
+                f"Формат: /setstreakmarkup <%>\nПример: /setstreakmarkup 15"
+            )
+        else:
+            await update.message.reply_text(
+                f"Порог наценки для стрик-лотов сейчас: {cur:.0f}%.\n"
+                f"Формат: /setstreakmarkup <%>, чтобы поменять."
+            )
+        return
+
+    try:
+        pct = float(args[0])
+    except ValueError:
+        await update.message.reply_text("Наценка должна быть числом, напр. 15 или 20.")
+        return
+
+    await set_streak_markup(chat_id, pct)
+    await update.message.reply_text(
+        f"Ок, для стрик-лотов (от {STREAK_THRESHOLD} подряд одинаковых стикеров на оружии) "
+        f"теперь отдельный порог наценки: {pct:.0f}%. Для всего остального действует обычный (/setdefaults)."
+    )
+
+
+async def setpricefilter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /setpricefilter             — показать текущий фильтр цены лота
+    /setpricefilter <мин> <макс> — задать диапазон итоговой цены лота (со стикерами)
+    /setpricefilter off         — убрать фильтр
+    """
+    chat_id = update.effective_chat.id
+    args = context.args
+
+    if not args:
+        min_price, max_price = await get_price_filter(chat_id)
+        if min_price is None and max_price is None:
+            await update.message.reply_text(
+                "Фильтр цены лота не задан — показываются офферы любой цены.\n\n"
+                "Формат: /setpricefilter <мин$> <макс$>\nПример: /setpricefilter 10 200\n"
+                "/setpricefilter off — убрать фильтр"
+            )
+        else:
+            lo = f"${min_price:.2f}" if min_price is not None else "без ограничения"
+            hi = f"${max_price:.2f}" if max_price is not None else "без ограничения"
+            await update.message.reply_text(f"Текущий фильтр цены лота: от {lo} до {hi}.")
+        return
+
+    if args[0].lower() == "off":
+        await set_price_filter(chat_id, None, None)
+        await update.message.reply_text("Фильтр цены лота убран — показываются офферы любой цены.")
+        return
+
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Нужны оба значения. Формат: /setpricefilter <мин$> <макс$>, или /setpricefilter off"
+        )
+        return
+
+    try:
+        min_price = float(args[0])
+        max_price = float(args[1])
+    except ValueError:
+        await update.message.reply_text("Оба значения должны быть числами. Пример: /setpricefilter 10 200")
+        return
+
+    if min_price > max_price:
+        await update.message.reply_text("Минимум не может быть больше максимума.")
+        return
+
+    await set_price_filter(chat_id, min_price, max_price)
+    await update.message.reply_text(
+        f"Ок, теперь показываются офферы с итоговой ценой лота (со стикерами) "
+        f"от ${min_price:.2f} до ${max_price:.2f}."
     )
 
 
@@ -639,7 +739,7 @@ async def _watchlist_scan_item(bot, chat_id: int, market_hash_name: str, min_val
         log.warning("watchlist: %s (chat_id=%s): %s", market_hash_name, chat_id, e)
         return False
 
-    offers, sticker_prices = await _compute_offers(listings, min_value, max_markup)
+    offers, sticker_prices = await _compute_offers(chat_id, listings, min_value, max_markup)
     if not offers:
         return False  # автоскан молчит, если нечего показать — иначе спамил бы каждый тик
 
@@ -932,7 +1032,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{DEFAULT_WATCH_INTERVAL_MINUTES:g} мин); бот сам пришлёт сообщение, только если найдёт офферы.\n"
         "/scanall — сканировать весь вотчлист прямо сейчас, не дожидаясь расписания.\n\n"
         f"/setdefaults <мин$> <макс%> — поменять значения по умолчанию "
-        f"(сейчас: {def_min:.0f}$ / {def_max:.0f}%)."
+        f"(сейчас: {def_min:.0f}$ / {def_max:.0f}%).\n"
+        f"/setstreakmarkup <%> — отдельный порог наценки для лотов с {STREAK_THRESHOLD}+ "
+        f"подряд одинаковыми стикерами (\"стрик\").\n"
+        f"/setpricefilter <мин$> <макс$> — показывать только лоты в этом диапазоне цены "
+        f"(со стикерами); /setpricefilter off — убрать фильтр."
     )
 
 
@@ -992,6 +1096,8 @@ def main():
     app.add_handler(CommandHandler("scan", scan))
     app.add_handler(CommandHandler("scanfile", scanfile))
     app.add_handler(CommandHandler("setdefaults", setdefaults))
+    app.add_handler(CommandHandler("setstreakmarkup", setstreakmarkup))
+    app.add_handler(CommandHandler("setpricefilter", setpricefilter))
     app.add_handler(CommandHandler("pricefile", pricefile))
     app.add_handler(CommandHandler("clearprices", clearprices))
     app.add_handler(CommandHandler("watchadd", watchadd))

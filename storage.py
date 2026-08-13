@@ -193,21 +193,24 @@ def _local_defaults_save(data: dict) -> None:
     LOCAL_DEFAULTS_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
-async def get_chat_defaults(chat_id: int) -> Optional[dict]:
-    """Возвращает {'min_value':..., 'max_markup':...} или None, если не задавались."""
+async def _get_chat_settings(chat_id: int) -> dict:
+    """
+    Все настройки чата разом (мин$ стикеров, макс наценка, наценка для
+    стрик-лотов, фильтр цены лота) — один JSON-блок на chat_id, чтобы не
+    плодить отдельные Redis-ключи под каждую новую настройку.
+    """
     if REDIS_ENABLED:
         try:
             raw = await _redis_cmd("GET", DEFAULTS_KEY_PREFIX + str(chat_id))
-            return json.loads(raw) if raw else None
+            return json.loads(raw) if raw else {}
         except Exception:
             pass
 
-    return _local_defaults_load().get(str(chat_id))
+    return _local_defaults_load().get(str(chat_id), {})
 
 
-async def set_chat_defaults(chat_id: int, min_value: float, max_markup: float) -> None:
-    entry = {"min_value": min_value, "max_markup": max_markup}
-    value = json.dumps(entry, ensure_ascii=False)
+async def _save_chat_settings(chat_id: int, settings: dict) -> None:
+    value = json.dumps(settings, ensure_ascii=False)
 
     if REDIS_ENABLED:
         try:
@@ -218,8 +221,45 @@ async def set_chat_defaults(chat_id: int, min_value: float, max_markup: float) -
             pass
 
     data = _local_defaults_load()
-    data[str(chat_id)] = entry
+    data[str(chat_id)] = settings
     _local_defaults_save(data)
+
+
+async def get_chat_defaults(chat_id: int) -> Optional[dict]:
+    """Возвращает {'min_value':..., 'max_markup':...} (и что там ещё задано) или None, если /setdefaults ещё не вызывали."""
+    settings = await _get_chat_settings(chat_id)
+    return settings if "min_value" in settings else None
+
+
+async def set_chat_defaults(chat_id: int, min_value: float, max_markup: float) -> None:
+    settings = await _get_chat_settings(chat_id)
+    settings["min_value"] = min_value
+    settings["max_markup"] = max_markup
+    await _save_chat_settings(chat_id, settings)
+
+
+async def get_streak_markup(chat_id: int) -> Optional[float]:
+    """Отдельный порог наценки (%) для стрик-лотов (4-5 подряд одинаковых стикеров), либо None, если не задан."""
+    return (await _get_chat_settings(chat_id)).get("streak_markup")
+
+
+async def set_streak_markup(chat_id: int, pct: float) -> None:
+    settings = await _get_chat_settings(chat_id)
+    settings["streak_markup"] = pct
+    await _save_chat_settings(chat_id, settings)
+
+
+async def get_price_filter(chat_id: int) -> tuple[Optional[float], Optional[float]]:
+    """(мин, макс) цена лота (с учётом стикеров) — любой из них может быть None, если не задан."""
+    settings = await _get_chat_settings(chat_id)
+    return settings.get("min_price"), settings.get("max_price")
+
+
+async def set_price_filter(chat_id: int, min_price: Optional[float], max_price: Optional[float]) -> None:
+    settings = await _get_chat_settings(chat_id)
+    settings["min_price"] = min_price
+    settings["max_price"] = max_price
+    await _save_chat_settings(chat_id, settings)
 
 
 # ---------------------------------------------------------------------------
