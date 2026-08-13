@@ -25,12 +25,15 @@ Cookie на steamcommunity.com (правь cloudflare-worker/ отдельно �
 """
 
 import asyncio
+import logging
 import os
 import re
 import urllib.parse
 from dataclasses import dataclass, field
 
 import aiohttp
+
+log = logging.getLogger("steam_bot.steam_client")
 
 APP_ID = 730  # CS2 / CS:GO
 RENDER_COUNT = 100  # максимум, который отдаёт Steam за раз
@@ -168,6 +171,19 @@ async def fetch_all_listings(market_hash_name: str) -> list[Listing]:
     if cookie:
         headers["Cookie"] = cookie
     async with aiohttp.ClientSession(headers=headers) as session:
+        # "Прогрев" сессии: сначала заходим на обычную страницу предмета (без
+        # /render/), и только потом — на сам /render/. Проверено вручную: самый
+        # первый запрос в "холодной" сессии (без истории) Steam обслуживает
+        # HTML-страницей сайта вместо JSON, а после одного обычного захода на
+        # сайт в той же сессии та же /render/-ссылка отдаёт JSON нормально.
+        item_url = f"https://steamcommunity.com/market/listings/{APP_ID}/{urllib.parse.quote(market_hash_name, safe='')}"
+        warmup_url, warmup_params = _build_request(item_url)
+        try:
+            async with session.get(warmup_url, params=warmup_params) as warmup_resp:
+                await warmup_resp.read()
+        except Exception:
+            log.warning("fetch_all_listings: не удалось прогреть сессию, продолжаю без прогрева", exc_info=True)
+
         start = 0
         total_count = None
         while total_count is None or start < total_count:
