@@ -693,6 +693,18 @@ async def watchdel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Удалено: {removed}\nОсталось в списке: {len(current)}.")
 
 
+async def watchclear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/watchclear — полностью очистить вотчлист (интервал и пауза не трогаются)."""
+    chat_id = update.effective_chat.id
+    current = await get_watchlist(chat_id)
+    if not current:
+        await update.message.reply_text("Вотчлист уже пуст.")
+        return
+
+    await set_watchlist(chat_id, [])
+    await update.message.reply_text(f"Вотчлист очищен — удалено {len(current)} предмет(ов).")
+
+
 async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/watchlist — показать текущий вотчлист и интервал автоскана."""
     chat_id = update.effective_chat.id
@@ -1108,6 +1120,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/clearprices — очистить его перед обновлением.\n\n"
         "/watchadd <предмет1>, <предмет2>, ... — добавить предметы в вотчлист на автоскан\n"
         "/watchdel <номер или название> — убрать предмет из вотчлиста\n"
+        "/watchclear — полностью очистить вотчлист\n"
         "/watchlist — показать вотчлист\n"
         "/watchinterval <мин> — как часто сканировать вотчлист (по умолчанию "
         f"{DEFAULT_WATCH_INTERVAL_MINUTES:g} мин); бот сам пришлёт сообщение, только если найдёт офферы.\n"
@@ -1189,6 +1202,7 @@ def main():
     app.add_handler(CommandHandler("clearprices", clearprices))
     app.add_handler(CommandHandler("watchadd", watchadd))
     app.add_handler(CommandHandler("watchdel", watchdel))
+    app.add_handler(CommandHandler("watchclear", watchclear))
     app.add_handler(CommandHandler("watchlist", watchlist_cmd))
     app.add_handler(CommandHandler("watchinterval", watchinterval))
     app.add_handler(CommandHandler("watchpause", watchpause))
