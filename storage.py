@@ -220,4 +220,86 @@ async def set_chat_defaults(chat_id: int, min_value: float, max_markup: float) -
     data = _local_defaults_load()
     data[str(chat_id)] = entry
     _local_defaults_save(data)
-    
+
+
+# ---------------------------------------------------------------------------
+# Вотчлист /watchadd: список предметов на автоскан по расписанию + интервал,
+# по chat_id. Тот же паттерн хранения (Upstash + локальный fallback), что и
+# остальное состояние — переживает рестарт/редеплой на Render.
+# ---------------------------------------------------------------------------
+
+WATCHLIST_KEY_PREFIX = "watchlist:"
+WATCHLIST_CHATS_INDEX_KEY = "watchlist_chats_index"  # Redis SET всех chat_id с вотчлистом — для восстановления джобов после рестарта
+LOCAL_WATCHLIST_PATH = Path(__file__).parent / "watchlist_local.json"
+
+
+def _local_watchlist_load() -> dict:
+    if LOCAL_WATCHLIST_PATH.exists():
+        try:
+            return json.loads(LOCAL_WATCHLIST_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _local_watchlist_save(data: dict) -> None:
+    LOCAL_WATCHLIST_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+async def _get_watchlist_entry(chat_id: int) -> dict:
+    if REDIS_ENABLED:
+        try:
+            raw = await _redis_cmd("GET", WATCHLIST_KEY_PREFIX + str(chat_id))
+            return json.loads(raw) if raw else {}
+        except Exception:
+            pass
+    return _local_watchlist_load().get(str(chat_id), {})
+
+
+async def _save_watchlist_entry(chat_id: int, items: list[str], interval_minutes: Optional[float]) -> None:
+    entry = {"items": items, "interval_minutes": interval_minutes}
+    value = json.dumps(entry, ensure_ascii=False)
+
+    if REDIS_ENABLED:
+        try:
+            await _redis_cmd("SET", WATCHLIST_KEY_PREFIX + str(chat_id), value)
+            await _redis_cmd("SADD", WATCHLIST_CHATS_INDEX_KEY, str(chat_id))
+            return
+        except Exception:
+            pass  # тоже падаем на локальный файл, чтобы данные не потерялись
+
+    data = _local_watchlist_load()
+    data[str(chat_id)] = entry
+    _local_watchlist_save(data)
+
+
+async def get_watchlist(chat_id: int) -> list[str]:
+    """Список предметов (market_hash_name) в вотчлисте чата."""
+    return (await _get_watchlist_entry(chat_id)).get("items", [])
+
+
+async def set_watchlist(chat_id: int, items: list[str]) -> None:
+    interval = (await _get_watchlist_entry(chat_id)).get("interval_minutes")
+    await _save_watchlist_entry(chat_id, items, interval)
+
+
+async def get_watch_interval_minutes(chat_id: int) -> Optional[float]:
+    """Интервал автоскана вотчлиста чата в минутах, либо None, если ещё не задавался."""
+    return (await _get_watchlist_entry(chat_id)).get("interval_minutes")
+
+
+async def set_watch_interval_minutes(chat_id: int, minutes: float) -> None:
+    items = (await _get_watchlist_entry(chat_id)).get("items", [])
+    await _save_watchlist_entry(chat_id, items, minutes)
+
+
+async def all_watchlist_chat_ids() -> list[int]:
+    """Все chat_id, у которых когда-либо был непустой вотчлист — для восстановления джобов после рестарта бота."""
+    if REDIS_ENABLED:
+        try:
+            result = await _redis_cmd("SMEMBERS", WATCHLIST_CHATS_INDEX_KEY)
+            return [int(x) for x in (result or [])]
+        except Exception:
+            pass
+    return [int(x) for x in _local_watchlist_load().keys()]
+
