@@ -34,6 +34,7 @@ import aiohttp
 
 from sticker_catalog import get_catalog
 from storage import get_prices_batch, set_prices_batch
+from steam_client import steam_cookie_header
 
 log = logging.getLogger("steam_bot.pricing")
 
@@ -243,10 +244,22 @@ class RateLimited(Exception):
     """Внутренний маркер: после MAX_RETRIES_429 попыток всё ещё 429."""
 
 
+def _steam_request_headers() -> dict:
+    """
+    Cookie реальной Steam-сессии (если задана, см. steam_client.py) — только
+    для запросов на steamcommunity.com. Session, в которой выполняются эти
+    запросы, общая с запросами к csgotrader.app, поэтому куки добавляются
+    точечно per-request, а не в headers самой ClientSession, чтобы не утекали
+    на чужой домен.
+    """
+    cookie = steam_cookie_header()
+    return {"Cookie": cookie} if cookie else {}
+
+
 async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict, label: str):
     delay = RETRY_BASE_DELAY
     for attempt in range(1, MAX_RETRIES_429 + 1):
-        async with session.get(url, params=params) as resp:
+        async with session.get(url, params=params, headers=_steam_request_headers()) as resp:
             if resp.status == 429:
                 log.warning(
                     "%s: HTTP 429 (попытка %s/%s) для запроса %r",
@@ -354,7 +367,7 @@ async def _diagnose_steam_rate_limit(session: aiohttp.ClientSession) -> bool:
     url = "https://steamcommunity.com/market/priceoverview/"
     params = {"appid": 730, "currency": 1, "market_hash_name": DIAGNOSTIC_PROBE_NAME}
     try:
-        async with session.get(url, params=params) as resp:
+        async with session.get(url, params=params, headers=_steam_request_headers()) as resp:
             if resp.status == 429:
                 log.warning("ДИАГНОСТИКА: Steam priceoverview 429 — IP всё ещё забанен, Steam-фолбэк пропускается в этом прогоне")
                 return True

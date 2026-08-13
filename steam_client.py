@@ -12,6 +12,16 @@ Render банит IP датацентра, поэтому запросы к Stea
 Worker-прокси (см. cloudflare-worker/), если задана переменная окружения
 STEAM_PROXY_URL (например https://dextrade-steam-proxy.<sub>.workers.dev).
 Без неё бот по-прежнему стучится в Steam напрямую — как раньше.
+
+Опционально: куки реальной Steam-сессии (STEAM_LOGIN_SECURE и т.п., см.
+steam_cookie_header()) — авторизованные запросы получают заметно более
+мягкий рейт-лимит, чем анонимные (так делают открытые Steam-market боты
+на GitHub, напр. woctezuma/steam-market). ВАЖНО: куки добавляются в
+заголовок запроса, который уходит к STEAM_PROXY_URL, если он задан, — то
+есть попадают к твоему Cloudflare Worker, а не напрямую в Steam. Чтобы
+куки реально дошли до Steam, Worker должен сам переслать заголовок
+Cookie на steamcommunity.com (правь cloudflare-worker/ отдельно — этот
+файл проксирует только чистую логику, не код воркера).
 """
 
 import asyncio
@@ -27,6 +37,26 @@ RENDER_COUNT = 100  # максимум, который отдаёт Steam за �
 REQUEST_DELAY = 1.5  # пауза между запросами к Steam, чтобы не словить 429
 
 STEAM_PROXY_URL = os.environ.get("STEAM_PROXY_URL", "").rstrip("/")
+
+# Куки реальной Steam-сессии — все опциональны, бот работает и без них
+# (просто более анонимно и, судя по опыту, более подвержено рейт-лимитам).
+# Достать: залогиниться в steamcommunity.com в браузере -> DevTools ->
+# Application/Storage -> Cookies -> steamcommunity.com.
+STEAM_LOGIN_SECURE = os.environ.get("STEAM_LOGIN_SECURE", "")
+STEAM_SESSION_ID = os.environ.get("STEAM_SESSION_ID", "")
+STEAM_BROWSER_ID = os.environ.get("STEAM_BROWSER_ID", "")
+
+
+def steam_cookie_header() -> str | None:
+    """Собирает Cookie-заголовок из заданных куков Steam-сессии, либо None, если ни один не задан."""
+    parts = []
+    if STEAM_LOGIN_SECURE:
+        parts.append(f"steamLoginSecure={STEAM_LOGIN_SECURE}")
+    if STEAM_SESSION_ID:
+        parts.append(f"sessionid={STEAM_SESSION_ID}")
+    if STEAM_BROWSER_ID:
+        parts.append(f"browserid={STEAM_BROWSER_ID}")
+    return "; ".join(parts) if parts else None
 
 
 @dataclass
@@ -104,9 +134,11 @@ def _sticker_code_to_display(collection: str, code: str) -> str:
 async def fetch_all_listings(market_hash_name: str) -> list[Listing]:
     """Тянем все страницы листингов для предмета и парсим цену + стикеры каждого лота."""
     listings: list[Listing] = []
-    async with aiohttp.ClientSession(
-        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/plain, */*"}
-    ) as session:
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/plain, */*"}
+    cookie = steam_cookie_header()
+    if cookie:
+        headers["Cookie"] = cookie
+    async with aiohttp.ClientSession(headers=headers) as session:
         start = 0
         total_count = None
         while total_count is None or start < total_count:
