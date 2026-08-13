@@ -37,7 +37,7 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from steam_client import (
@@ -1135,7 +1135,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+BOT_COMMANDS = [
+    BotCommand("start", "Помощь и список команд"),
+    BotCommand("scan", "Проверить один предмет по ссылке Steam Market"),
+    BotCommand("scanfile", "Проверить предмет по названию (без ссылки)"),
+    BotCommand("watchadd", "Добавить предмет(ы) в вотчлист"),
+    BotCommand("watchdel", "Убрать предмет из вотчлиста"),
+    BotCommand("watchclear", "Полностью очистить вотчлист"),
+    BotCommand("watchlist", "Показать вотчлист и интервал автоскана"),
+    BotCommand("watchinterval", "Настроить интервал автоскана"),
+    BotCommand("watchpause", "Остановить автоскан вотчлиста"),
+    BotCommand("watchresume", "Возобновить автоскан вотчлиста"),
+    BotCommand("scanall", "Сканировать весь вотчлист прямо сейчас"),
+    BotCommand("setdefaults", "Настроить мин. стоимость стикеров и наценку"),
+    BotCommand("setstreakmarkup", "Наценка для стрик-лотов (4-5 одинаковых стикеров)"),
+    BotCommand("setpricefilter", "Фильтр по итоговой цене лота"),
+    BotCommand("pricefile", "Загрузить свои цены на стикеры файлом"),
+    BotCommand("clearprices", "Очистить загруженные цены на стикеры"),
+]
+
+
 async def _on_startup(app: Application):
+    await app.bot.set_my_commands(BOT_COMMANDS)
+
     asyncio.create_task(prewarm_loop())
 
     # Восстанавливаем джобы автоскана вотчлиста после рестарта/редеплоя —
