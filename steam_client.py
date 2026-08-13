@@ -32,6 +32,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 
 import aiohttp
+import yarl
 
 log = logging.getLogger("steam_bot.steam_client")
 
@@ -107,7 +108,10 @@ def _build_request(steam_url: str) -> tuple[str, dict | None]:
     так aiohttp кодирует его ровно один раз, корректно.
     """
     if not STEAM_PROXY_URL:
-        return steam_url, None
+        # encoded=True — иначе yarl "нормализует" уже закодированный путь и
+        # раскодирует %28/%29 обратно в (), т.е. в Steam уйдёт не байт-в-байт
+        # тот же путь, что открывает браузер.
+        return yarl.URL(steam_url, encoded=True), None
     return f"{STEAM_PROXY_URL}/proxy", {"url": steam_url}
 
 
@@ -134,52 +138,86 @@ def _sticker_code_to_display(collection: str, code: str) -> str:
     return f"{collection}:{code}"
 
 
-def _browser_headers(market_hash_name: str) -> dict:
-    """
-    Заголовки настоящего Chrome, открывающего /render/ прямой навигацией в
-    адресной строке (Sec-Fetch-*, Accept и т.п.) — судя по проверке, ровно
-    так открытая ссылка отдаёт JSON, а голый aiohttp с User-Agent-заглушкой
-    получает вместо JSON HTML-страницу сайта. Referer указывает на страницу
-    самого предмета (без /render/) — реалистично, если бы её открыли по
-    ссылке с этой страницы.
-    """
-    item_page = f"https://steamcommunity.com/market/listings/{APP_ID}/{urllib.parse.quote(market_hash_name, safe='')}"
+def item_page_url(market_hash_name: str) -> str:
+    """Обычная (не /render/) страница предмета на Steam Market."""
+    return f"https://steamcommunity.com/market/listings/{APP_ID}/{urllib.parse.quote(market_hash_name, safe='')}"
+
+
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+_UA_HINTS = {
+    "sec-ch-ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
+
+
+def _nav_headers() -> dict:
+    """Заголовки Chrome при обычной навигации по ссылке (прогрев сессии)."""
     return {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": _UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Referer": item_page,
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Site": "none",
         "Sec-Fetch-User": "?1",
         "Upgrade-Insecure-Requests": "1",
-        "sec-ch-ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
+        **_UA_HINTS,
     }
+
+
+def _ajax_headers(market_hash_name: str) -> dict:
+    """
+    Заголовки AJAX-запроса к легаси-эндпоинту /render/ — именно так его дёргает
+    штатный фронтенд Steam Market (он написан на Prototype.js, отсюда
+    X-Prototype-Version и X-Requested-With).
+
+    Прошлая версия просила 'Accept: text/html,...' — то есть буквально сама
+    просила у Steam HTML вместо JSON; это было ошибкой, здесь исправлено.
+    """
+    return {
+        "User-Agent": _UA,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-Requested-With": "XMLHttpRequest",
+        "X-Prototype-Version": "1.7",
+        "Referer": item_page_url(market_hash_name),
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        **_UA_HINTS,
+    }
+
+
+# Признаки того, что Steam отдал страницу НОВОЙ (бета) торговой площадки вместо
+# JSON легаси-эндпоинта. Бета включается на аккаунт/сессию, и для неё /render/
+# перестаёт быть JSON-эндпоинтом — никакими заголовками/IP/прокси это не лечится,
+# нужно выйти из бета-теста на том аккаунте, чьи куки использует бот.
+_BETA_PAGE_MARKERS = ("/ssr/", "DesktopUI", "<!DOCTYPE html")
 
 
 async def fetch_all_listings(market_hash_name: str) -> list[Listing]:
     """Тянем все страницы листингов для предмета и парсим цену + стикеры каждого лота."""
     listings: list[Listing] = []
-    headers = _browser_headers(market_hash_name)
     cookie = steam_cookie_header()
-    if cookie:
-        headers["Cookie"] = cookie
-    async with aiohttp.ClientSession(headers=headers) as session:
-        # "Прогрев" сессии: сначала заходим на обычную страницу предмета (без
-        # /render/), и только потом — на сам /render/. Проверено вручную: самый
-        # первый запрос в "холодной" сессии (без истории) Steam обслуживает
-        # HTML-страницей сайта вместо JSON, а после одного обычного захода на
-        # сайт в той же сессии та же /render/-ссылка отдаёт JSON нормально.
-        item_url = f"https://steamcommunity.com/market/listings/{APP_ID}/{urllib.parse.quote(market_hash_name, safe='')}"
-        warmup_url, warmup_params = _build_request(item_url)
+
+    def _with_cookie(headers: dict) -> dict:
+        return {**headers, "Cookie": cookie} if cookie else headers
+
+    log.info(
+        "fetch_all_listings: предмет %r, прокси=%s, куки Steam-сессии=%s",
+        market_hash_name, STEAM_PROXY_URL or "нет (прямой запрос)", "есть" if cookie else "нет",
+    )
+
+    async with aiohttp.ClientSession() as session:
+        # "Прогрев" сессии обычной навигацией на страницу предмета, как это
+        # сделал бы браузер, прежде чем фронтенд дёрнет /render/ через AJAX.
+        warmup_url, warmup_params = _build_request(item_page_url(market_hash_name))
         try:
-            async with session.get(warmup_url, params=warmup_params) as warmup_resp:
+            async with session.get(warmup_url, params=warmup_params, headers=_with_cookie(_nav_headers())) as warmup_resp:
                 await warmup_resp.read()
         except Exception:
             log.warning("fetch_all_listings: не удалось прогреть сессию, продолжаю без прогрева", exc_info=True)
@@ -189,7 +227,7 @@ async def fetch_all_listings(market_hash_name: str) -> list[Listing]:
         while total_count is None or start < total_count:
             steam_url = render_url(market_hash_name, start)
             final_url, params = _build_request(steam_url)
-            async with session.get(final_url, params=params) as resp:
+            async with session.get(final_url, params=params, headers=_with_cookie(_ajax_headers(market_hash_name))) as resp:
                 if resp.status == 429:
                     # Rate limit — ждём и пробуем ещё раз тот же start
                     await asyncio.sleep(10)
@@ -197,12 +235,27 @@ async def fetch_all_listings(market_hash_name: str) -> list[Listing]:
                 resp.raise_for_status()
 
                 content_type = resp.headers.get("Content-Type", "")
+                log.info(
+                    "fetch_all_listings: start=%s -> HTTP %s, Content-Type=%r, итоговый URL=%s",
+                    start, resp.status, content_type, resp.url,
+                )
                 if "application/json" not in content_type:
-                    # Steam вместо JSON отдал HTML — обычно это анти-бот/гео-заглушка
-                    # или блокировка датацентрового IP. Показываем начало страницы,
-                    # чтобы понять причину, вместо невнятной ошибки декодирования.
                     body = await resp.text()
                     snippet = body[:300].replace("\n", " ").strip()
+                    if any(marker in body[:2000] for marker in _BETA_PAGE_MARKERS):
+                        # Самый частый и неочевидный случай: аккаунт, чьи куки
+                        # использует бот, включён в бета-тест новой торговой
+                        # площадки. Для беты /render/ перестаёт быть JSON-API и
+                        # отдаёт SSR-страницу — ни заголовки, ни прокси, ни смена
+                        # IP это не исправят, помогает только выход из бета-теста.
+                        raise RuntimeError(
+                            "Steam отдал HTML-страницу новой (бета) торговой площадки вместо JSON. "
+                            "Похоже, аккаунт, чьи куки заданы в STEAM_LOGIN_SECURE, включён в бета-тест "
+                            "Steam Market — для беты легаси-эндпоинт /render/ больше не отдаёт JSON. "
+                            "Зайди в браузере под ЭТИМ аккаунтом, нажми «Выйти из бета-теста торговой "
+                            "площадки», заново экспортируй куки и обнови их на Render. "
+                            f"Начало ответа: {snippet!r}"
+                        )
                     raise RuntimeError(
                         f"Steam вернул не JSON, а {content_type!r}. "
                         f"Начало ответа: {snippet!r}"
