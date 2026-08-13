@@ -34,17 +34,22 @@ import aiohttp
 
 from sticker_catalog import get_catalog
 from storage import get_prices_batch, set_prices_batch
-from steam_client import steam_cookie_header
+from steam_client import (
+    steam_cookie_header,
+    throttle_steam_request,
+    steam_cooldown_remaining,
+    note_steam_429,
+    note_steam_ok,
+)
 
 log = logging.getLogger("steam_bot.pricing")
 
 OVERRIDES_PATH = Path(__file__).parent / "sticker_overrides.json"
 CACHE_TTL_SECONDS = 12 * 60 * 60  # 12 часов — цены на стикеры не скачут ежеминутно
 
-MAX_RETRIES_429 = 3
-RETRY_BASE_DELAY = 8  # секунд, растёт экспоненциально: 8, 16, 32
-REQUEST_DELAY = 1.2  # пауза между запросами к Steam priceoverview
-SEARCH_REQUEST_DELAY = 4.0  # Steam market/search лимитируется жёстче
+# Ретраев и собственных пауз тут больше нет: темп запросов к Steam держит
+# общий троттлинг из steam_client (throttle_steam_request), а на 429 там же
+# ставится глобальный кулдаун вместо повторных попыток.
 
 # --- Ручной прайс-лист от пользователя (Steam market/search/render, категория
 # стикеров, скачано вручную через телефон/браузер — не банится, в отличие от
@@ -241,7 +246,7 @@ async def get_csgotrader_prices(session: aiohttp.ClientSession, force_refresh: b
 # ---------------------------------------------------------------------------
 
 class RateLimited(Exception):
-    """Внутренний маркер: после MAX_RETRIES_429 попыток всё ещё 429."""
+    """Внутренний маркер: Steam ответил 429 либо мы на кулдауне после недавнего 429."""
 
 
 def _steam_request_headers() -> dict:
@@ -257,24 +262,30 @@ def _steam_request_headers() -> dict:
 
 
 async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict, label: str):
-    delay = RETRY_BASE_DELAY
-    for attempt in range(1, MAX_RETRIES_429 + 1):
-        async with session.get(url, params=params, headers=_steam_request_headers()) as resp:
-            if resp.status == 429:
-                log.warning(
-                    "%s: HTTP 429 (попытка %s/%s) для запроса %r",
-                    label, attempt, MAX_RETRIES_429, params.get("query") or params.get("market_hash_name"),
-                )
-                if attempt == MAX_RETRIES_429:
-                    raise RateLimited()
-                await asyncio.sleep(delay)
-                delay *= 2
-                continue
-            if resp.status != 200:
-                log.warning("%s: HTTP %s для запроса %r", label, resp.status, params.get("query") or params.get("market_hash_name"))
-                return None
-            return await resp.json()
-    raise RateLimited()
+    """
+    Один запрос к Steam через общий с steam_client троттлинг/кулдаун.
+
+    Ретраев на 429 больше нет: у Steam это временный бан IP, который
+    ПРОДЛЕВАЕТСЯ каждой новой попыткой — повторы только усугубляли бы бан.
+    Вместо этого ставим глобальный кулдаун (его видит и сбор листингов).
+    """
+    if steam_cooldown_remaining() > 0:
+        raise RateLimited()
+
+    await throttle_steam_request()
+    async with session.get(url, params=params, headers=_steam_request_headers()) as resp:
+        if resp.status == 429:
+            log.warning(
+                "%s: HTTP 429 для запроса %r — ставлю глобальный кулдаун, не ретраю",
+                label, params.get("query") or params.get("market_hash_name"),
+            )
+            note_steam_429()
+            raise RateLimited()
+        note_steam_ok()
+        if resp.status != 200:
+            log.warning("%s: HTTP %s для запроса %r", label, resp.status, params.get("query") or params.get("market_hash_name"))
+            return None
+        return await resp.json()
 
 
 async def _price_overview(session: aiohttp.ClientSession, market_hash_name: str) -> float | None:
@@ -482,14 +493,25 @@ async def get_sticker_prices(sticker_keys: set[str]) -> dict[str, float]:
                 rate_limited_count += len(steam_fallback_needed)
             else:
                 steam_hits: list[tuple[str, Optional[str], float, int]] = []
-                for key, name_or_query, is_exact in steam_fallback_needed:
+                for i, (key, name_or_query, is_exact) in enumerate(steam_fallback_needed):
                     matched_name, price, ok = await _fetch_from_steam(session, key, name_or_query, is_exact)
                     if ok:
                         steam_hits.append((key, matched_name, price, CACHE_TTL_SECONDS))
                         result[key] = price
-                    else:
-                        rate_limited_count += 1
-                    await asyncio.sleep(REQUEST_DELAY if is_exact else SEARCH_REQUEST_DELAY)
+                        continue
+
+                    rate_limited_count += 1
+                    if steam_cooldown_remaining() > 0:
+                        # Влетели в кулдаун — оставшиеся ключи в этом прогоне
+                        # всё равно не получим, нет смысла перебирать их вхолостую.
+                        remaining = len(steam_fallback_needed) - i - 1
+                        rate_limited_count += remaining
+                        log.warning(
+                            "get_sticker_prices: кулдаун Steam — пропускаю оставшиеся %s ключей в этом прогоне",
+                            remaining,
+                        )
+                        break
+                    # паузы между запросами держит throttle_steam_request()
                 if steam_hits:
                     await set_prices_batch(steam_hits)
 

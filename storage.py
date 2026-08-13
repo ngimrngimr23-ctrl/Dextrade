@@ -296,8 +296,10 @@ async def _get_watchlist_entry(chat_id: int) -> dict:
     return _local_watchlist_load().get(str(chat_id), {})
 
 
-async def _save_watchlist_entry(chat_id: int, items: list[str], interval_minutes: Optional[float]) -> None:
-    entry = {"items": items, "interval_minutes": interval_minutes}
+async def _save_watchlist_entry(
+    chat_id: int, items: list[str], interval_minutes: Optional[float], paused: bool = False
+) -> None:
+    entry = {"items": items, "interval_minutes": interval_minutes, "paused": paused}
     value = json.dumps(entry, ensure_ascii=False)
 
     if REDIS_ENABLED:
@@ -319,8 +321,8 @@ async def get_watchlist(chat_id: int) -> list[str]:
 
 
 async def set_watchlist(chat_id: int, items: list[str]) -> None:
-    interval = (await _get_watchlist_entry(chat_id)).get("interval_minutes")
-    await _save_watchlist_entry(chat_id, items, interval)
+    entry = await _get_watchlist_entry(chat_id)
+    await _save_watchlist_entry(chat_id, items, entry.get("interval_minutes"), bool(entry.get("paused")))
 
 
 async def get_watch_interval_minutes(chat_id: int) -> Optional[float]:
@@ -329,8 +331,19 @@ async def get_watch_interval_minutes(chat_id: int) -> Optional[float]:
 
 
 async def set_watch_interval_minutes(chat_id: int, minutes: float) -> None:
-    items = (await _get_watchlist_entry(chat_id)).get("items", [])
-    await _save_watchlist_entry(chat_id, items, minutes)
+    entry = await _get_watchlist_entry(chat_id)
+    await _save_watchlist_entry(chat_id, entry.get("items", []), minutes, bool(entry.get("paused")))
+
+
+async def get_watch_paused(chat_id: int) -> bool:
+    """Приостановлен ли автоскан вотчлиста (/watchpause). Сам список при этом сохраняется."""
+    return bool((await _get_watchlist_entry(chat_id)).get("paused"))
+
+
+async def set_watch_paused(chat_id: int, paused: bool) -> None:
+    entry = await _get_watchlist_entry(chat_id)
+    entry["paused"] = paused
+    await _save_watchlist_entry(chat_id, entry.get("items", []), entry.get("interval_minutes"), paused)
 
 
 async def all_watchlist_chat_ids() -> list[int]:
