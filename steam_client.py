@@ -131,10 +131,39 @@ def _sticker_code_to_display(collection: str, code: str) -> str:
     return f"{collection}:{code}"
 
 
+def _browser_headers(market_hash_name: str) -> dict:
+    """
+    Заголовки настоящего Chrome, открывающего /render/ прямой навигацией в
+    адресной строке (Sec-Fetch-*, Accept и т.п.) — судя по проверке, ровно
+    так открытая ссылка отдаёт JSON, а голый aiohttp с User-Agent-заглушкой
+    получает вместо JSON HTML-страницу сайта. Referer указывает на страницу
+    самого предмета (без /render/) — реалистично, если бы её открыли по
+    ссылке с этой страницы.
+    """
+    item_page = f"https://steamcommunity.com/market/listings/{APP_ID}/{urllib.parse.quote(market_hash_name, safe='')}"
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": item_page,
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "sec-ch-ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+    }
+
+
 async def fetch_all_listings(market_hash_name: str) -> list[Listing]:
     """Тянем все страницы листингов для предмета и парсим цену + стикеры каждого лота."""
     listings: list[Listing] = []
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/plain, */*"}
+    headers = _browser_headers(market_hash_name)
     cookie = steam_cookie_header()
     if cookie:
         headers["Cookie"] = cookie
