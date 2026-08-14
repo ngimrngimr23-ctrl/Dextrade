@@ -19,6 +19,7 @@ import time
 
 from pricing import CACHE_TTL_SECONDS, _load_overrides, _fetch_one_price
 from sticker_catalog import get_catalog
+from steam_client import steam_cooldown_remaining
 from storage import get_prices_batch, set_price, all_known_keys
 
 import aiohttp
@@ -31,6 +32,15 @@ REQUEST_DELAY = 1.5
 
 
 async def _prewarm_once():
+    cooldown = steam_cooldown_remaining()
+    if cooldown > 0:
+        # Steam всё ещё на кулдауне после 429 — раньше пре-варминг всё равно
+        # лез за Steam-фолбэком по каждому непокрытому csgotrader.app ключу,
+        # игнорируя общий кулдаун, и тем самым лишний раз тыкал забаненный IP
+        # каждые LOOP_INTERVAL_SECONDS. Теперь просто ждём, как и вотчлист.
+        log.info("prewarm: пропускаю — кулдаун Steam ещё %.0f мин", cooldown / 60)
+        return
+
     now = time.time()
     keys = await all_known_keys()
     if not keys:

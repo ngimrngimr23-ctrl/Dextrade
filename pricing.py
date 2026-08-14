@@ -61,8 +61,6 @@ CSGOTRADER_PRICES_URL = "https://prices.csgotrader.app/latest/steam.json"
 CSGOTRADER_CACHE_PATH = Path(__file__).parent / "csgotrader_prices_cache.json"
 CSGOTRADER_CACHE_TTL_SECONDS = 3 * 60 * 60  # на их стороне файл обновляется примерно раз в час
 
-DIAGNOSTIC_PROBE_NAME = "Sticker | Katowice 2014 (Holo)"
-
 # collection-код из имени файла -> человекочитаемое название турнира/капсулы
 COLLECTION_TO_EVENT = {
     "paris2023": "Paris 2023",
@@ -360,38 +358,11 @@ async def _fetch_one_price(session: aiohttp.ClientSession, key: str, overrides: 
         if ct_price is not None:
             return name_or_query, ct_price
 
-    if await _diagnose_steam_rate_limit(session):
+    if steam_cooldown_remaining() > 0:
         return name_or_query, 0.0
 
     matched_name, price, _ok = await _fetch_from_steam(session, key, name_or_query, is_exact)
     return matched_name, price
-
-
-async def _diagnose_steam_rate_limit(session: aiohttp.ClientSession) -> bool:
-    """
-    Один быстрый пробный запрос (без ретраев) — проверяет, забанен ли
-    сейчас IP целиком. Возвращает True, если забанен (429 на priceoverview).
-    На основе этого get_sticker_prices решает, стоит ли вообще пытаться
-    достучаться до Steam по остальным ключам в этом прогоне, или сразу
-    считать их "не найдено" и не жечь по 20-30 сек на ретраи впустую.
-    """
-    url = "https://steamcommunity.com/market/priceoverview/"
-    params = {"appid": 730, "currency": 1, "market_hash_name": DIAGNOSTIC_PROBE_NAME}
-    try:
-        async with session.get(url, params=params, headers=_steam_request_headers()) as resp:
-            if resp.status == 429:
-                log.warning("ДИАГНОСТИКА: Steam priceoverview 429 — IP всё ещё забанен, Steam-фолбэк пропускается в этом прогоне")
-                return True
-            if resp.status == 200:
-                data = await resp.json()
-                if not data.get("success"):
-                    log.warning("ДИАГНОСТИКА: priceoverview 200 но success=false для %r", DIAGNOSTIC_PROBE_NAME)
-                    return False
-                log.info("ДИАГНОСТИКА: Steam priceoverview отвечает нормально — фолбэк работает")
-                return False
-    except Exception:
-        log.exception("ДИАГНОСТИКА: не удалось выполнить пробный запрос к priceoverview")
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -476,10 +447,14 @@ async def get_sticker_prices(sticker_keys: set[str]) -> dict[str, float]:
 
         if steam_fallback_needed:
             log.info("get_sticker_prices: %s ключей не нашлись в прайс-листе csgotrader.app, идут на Steam-фолбэк", len(steam_fallback_needed))
-            is_banned = await _diagnose_steam_rate_limit(session)
+            is_banned = steam_cooldown_remaining() > 0
 
             if is_banned:
-                # Один быстрый пробный запрос уже показал 429 — весь IP забанен.
+                # Уже знаем из глобального кулдауна, что IP забанен — не тратим
+                # на это ЕЩЁ ОДИН отдельный пробный запрос к Steam (раньше тут был
+                # именно такой запрос в обход общего троттлинга/кулдауна — он бил по
+                # Steam каждый раз, когда нужен был фолбэк, включая моменты, когда
+                # мы САМИ знали, что забанены, и только продлевал реальный бан).
                 # Гонять по 3 ретрая с экспоненциальным backoff на каждый из
                 # оставшихся ключей бессмысленно (только жжёт 20-30+ минут впустую
                 # на заведомо провальные попытки) — сразу помечаем как "не найдено"
