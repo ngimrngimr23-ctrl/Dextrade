@@ -47,7 +47,6 @@ from steam_client import (
     render_url,
     _parse_listings_html,
     RENDER_COUNT,
-    MIN_REQUEST_INTERVAL,
     STEAM_PROXY_URL,
     SteamRateLimited,
     steam_cooldown_remaining,
@@ -100,17 +99,17 @@ _pricefile_mode: set[int] = set()
 # Вотчлист /watchadd: список предметов сканируется по расписанию джобой
 # watchlist_scan_job, результат шлётся в чат только если нашлись офферы
 # (без "ничего не подошло" на каждый тик — иначе бот спамил бы постоянно).
-# Интервал автоскана вотчлиста больше не настраивается вручную — бот сам
-# подбирает его по длине списка, чтобы прогон гарантированно укладывался в
-# безопасный темп запросов к Steam (MIN_REQUEST_INTERVAL секунд между ЛЮБЫМИ
-# двумя запросами, см. steam_client.py) и не приближал 429. На предмет
-# закладываем больше, чем 1 реальный запрос (лоты почти всегда укладываются
-# в 1 страницу — DEFAULT_MAX_LISTINGS = RENDER_COUNT), с запасом на изредка
-# незакэшированные цены наклеек, и ещё 2x поверх — чтобы сам прогон занимал
-# заметно меньше времени, чем интервал между прогонами.
-WATCH_SECONDS_PER_ITEM = MIN_REQUEST_INTERVAL * 1.5 * 2  # ~12 сек/предмет с запасом
-MIN_WATCH_INTERVAL_MINUTES = 15.0  # меньше нет смысла — прогон даже короткого списка не успеет закончиться
-MAX_WATCH_INTERVAL_MINUTES = 180.0  # верхняя граница, чтобы огромный список не сканировался раз в сутки
+# Интервал автоскана вотчлиста больше не настраивается вручную. Сам прогон
+# списка уже безопасно троттлится изнутри (throttle_steam_request — пауза
+# MIN_REQUEST_INTERVAL секунд между ЛЮБЫМИ двумя запросами к Steam, см.
+# steam_client.py), поэтому не нужно ЕЩЁ РАЗ закладывать это же время в
+# интервал между прогонами — только дублировало бы задержку. Следующий
+# прогон стартует через фиксированную паузу WATCH_GAP_MINUTES ПОСЛЕ
+# завершения предыдущего (см. _schedule_watchlist_job/watchlist_scan_job),
+# так что полный цикл для большого списка и так растягивается за счёт
+# того, что сам прогон дольше — отдельно множить паузу на число предметов
+# не нужно.
+WATCH_GAP_MINUTES = 2.0  # пауза между концом одного прогона и началом следующего
 WATCHLIST_JOB_PREFIX = "watchlist_scan_"
 WATCHLIST_ITEM_DELAY_SECONDS = 3  # пауза между предметами внутри одного тика, чтобы не долбить Steam пачкой сразу
 
@@ -119,21 +118,8 @@ WATCHLIST_ITEM_DELAY_SECONDS = 3  # пауза между предметами �
 _watchlist_running: set[int] = set()
 
 
-def _auto_watch_interval(item_count: int) -> float:
-    """
-    Автоматически подбирает интервал автоскана вотчлиста по количеству
-    предметов в нём — чем длиннее список, тем больше нужно времени, чтобы
-    безопасным темпом пройти его целиком и не словить 429 от Steam.
-    """
-    if item_count <= 0:
-        return MIN_WATCH_INTERVAL_MINUTES
-    minutes = (item_count * WATCH_SECONDS_PER_ITEM) / 60
-    return min(MAX_WATCH_INTERVAL_MINUTES, max(MIN_WATCH_INTERVAL_MINUTES, minutes))
-
-
 async def _get_watch_interval(chat_id: int) -> float:
-    items = await get_watchlist(chat_id)
-    return _auto_watch_interval(len(items))
+    return WATCH_GAP_MINUTES
 
 
 def _schedule_watchlist_job(job_queue, chat_id: int, interval_minutes: float, delay_seconds: float | None = None) -> None:
@@ -678,7 +664,7 @@ async def watchadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if skipped:
         lines.append("Пропущено:\n" + "\n".join(f"• {s}" for s in skipped))
     interval = await _get_watch_interval(chat_id)
-    lines.append(f"Всего в списке: {len(current)}. Автоскан каждые {interval:g} мин (интервал подбирается автоматически по размеру списка).")
+    lines.append(f"Всего в списке: {len(current)}. Следующий прогон — через {interval:g} мин после конца текущего/предыдущего.")
     await update.message.reply_text("\n\n".join(lines))
 
 
@@ -737,11 +723,11 @@ async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not items:
         await update.message.reply_text(
             "Вотчлист пуст. Добавь предметы: /watchadd <предмет1>, <предмет2>, ...\n"
-            f"Интервал автоскана сейчас: {interval:g} мин (подбирается автоматически по размеру списка)."
+            f"Пауза между прогонами: {interval:g} мин после конца предыдущего."
         )
         return
 
-    lines = [f"📋 Вотчлист ({len(items)}), автоскан каждые {interval:g} мин:"]
+    lines = [f"📋 Вотчлист ({len(items)}), следующий прогон — через {interval:g} мин после конца текущего/предыдущего:"]
     for i, name in enumerate(items, start=1):
         lines.append(f"{i}. {name}")
     await update.message.reply_text("\n".join(lines))
@@ -873,7 +859,7 @@ async def watchresume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     interval = await _get_watch_interval(chat_id)
     _schedule_watchlist_job(context.application.job_queue, chat_id, interval)
     items = await get_watchlist(chat_id)
-    text = f"▶️ Автоскан вотчлиста возобновлён: {len(items)} предмет(ов), каждые {interval:g} мин."
+    text = f"▶️ Автоскан вотчлиста возобновлён: {len(items)} предмет(ов), пауза {interval:g} мин между прогонами."
     cooldown = steam_cooldown_remaining()
     if cooldown > 0:
         text += f"\n\n⚠️ Но Steam сейчас на кулдауне после 429 — первые {cooldown / 60:.0f} мин прогоны будут пропускаться."
@@ -1133,10 +1119,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/watchadd <предмет1>, <предмет2>, ... — добавить предметы в вотчлист на автоскан\n"
         "/watchdel <номер или название> — убрать предмет из вотчлиста\n"
         "/watchclear — полностью очистить вотчлист\n"
-        "/watchlist — показать вотчлист и текущий интервал автоскана (подбирается "
-        "автоматически по размеру списка, чтобы не словить бан Steam за частые запросы); "
-        "бот сам пришлёт сообщение, только если найдёт новые офферы (один и тот же лот повторно "
-        "не пришлёт в течение 5 часов).\n"
+        f"/watchlist — показать вотчлист; следующий прогон стартует через {WATCH_GAP_MINUTES:g} мин "
+        "после конца предыдущего (сам прогон списка уже безопасно троттлится по времени, так что "
+        "отдельно ждать дольше для больших списков не нужно); бот пришлёт сообщение, только если "
+        "найдёт новые офферы (один и тот же лот повторно не пришлёт в течение 5 часов).\n"
         "/scanall — сканировать весь вотчлист прямо сейчас, не дожидаясь расписания.\n"
         "/watchpause — остановить автоскан (список сохраняется), /watchresume — возобновить.\n\n"
         f"/setdefaults <мин$> <макс%> — поменять значения по умолчанию "
