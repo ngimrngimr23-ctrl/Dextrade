@@ -70,6 +70,14 @@ class SteamRateLimited(RuntimeError):
 # Глобальные (на весь процесс) троттлинг и кулдаун: их разделяют И сбор
 # листингов, И запросы цен стикеров из pricing.py — иначе один компонент
 # съедает лимит и подставляет другой.
+#
+# _cooldown_until — в epoch-секундах (time.time()), НЕ time.monotonic(): его
+# значение сохраняется в постоянное хранилище (storage.py) и должно остаться
+# осмысленным после рестарта процесса (Render передеплоивает бота на каждый
+# git push, а monotonic() при рестарте обнуляется). Без этого при каждом
+# рестарте бот "забывал" бы про ещё не снятый бан Steam, тут же пробовал
+# снова и продлевал реальный бан. _last_request_at — просто пейсинг внутри
+# одного запуска процесса, ему персистентность не нужна, оставляем monotonic.
 _request_lock = asyncio.Lock()
 _last_request_at = 0.0
 _cooldown_until = 0.0
@@ -78,10 +86,45 @@ _consecutive_429 = 0
 
 def steam_cooldown_remaining() -> float:
     """Сколько секунд ещё нельзя трогать Steam (0, если можно)."""
-    return max(0.0, _cooldown_until - time.monotonic())
+    return max(0.0, _cooldown_until - time.time())
 
 
-def note_steam_429() -> float:
+async def _persist_cooldown() -> None:
+    from storage import set_steam_cooldown  # локальный импорт — storage не обязателен для остального модуля
+
+    try:
+        await set_steam_cooldown(_cooldown_until, _consecutive_429)
+    except Exception:
+        log.exception("не смог сохранить кулдаун Steam в постоянное хранилище")
+
+
+async def load_persisted_cooldown() -> None:
+    """
+    Восстанавливает кулдаун/счётчик 429 подряд после рестарта процесса.
+    Вызывать один раз при старте бота, до первого обращения к Steam.
+    """
+    global _cooldown_until, _consecutive_429
+    from storage import get_steam_cooldown
+
+    try:
+        persisted = await get_steam_cooldown()
+    except Exception:
+        log.exception("не смог загрузить сохранённый кулдаун Steam")
+        return
+
+    if not persisted:
+        return
+    _cooldown_until = persisted.get("cooldown_until", 0.0)
+    _consecutive_429 = persisted.get("consecutive_429", 0)
+    remaining = steam_cooldown_remaining()
+    if remaining > 0:
+        log.warning(
+            "Восстановлен кулдаун Steam после рестарта процесса: ещё %.0f мин (%s-й 429 подряд)",
+            remaining / 60, _consecutive_429,
+        )
+
+
+async def note_steam_429() -> float:
     """
     Зафиксировать 429: ставит глобальный кулдаун (растёт вдвое при 429
     подряд, чтобы не долбиться в уже забаненный IP). Возвращает длину кулдауна.
@@ -89,18 +132,21 @@ def note_steam_429() -> float:
     global _cooldown_until, _consecutive_429
     _consecutive_429 += 1
     seconds = min(COOLDOWN_AFTER_429_SECONDS * (2 ** (_consecutive_429 - 1)), COOLDOWN_MAX_SECONDS)
-    _cooldown_until = max(_cooldown_until, time.monotonic() + seconds)
+    _cooldown_until = max(_cooldown_until, time.time() + seconds)
     log.warning(
         "Steam вернул 429 (%s-й подряд) — кулдаун на %.0f мин, к Steam не ходим до истечения",
         _consecutive_429, seconds / 60,
     )
+    await _persist_cooldown()
     return seconds
 
 
-def note_steam_ok() -> None:
+async def note_steam_ok() -> None:
     """Успешный ответ — сбрасываем счётчик 429 подряд."""
     global _consecutive_429
-    _consecutive_429 = 0
+    if _consecutive_429 != 0:
+        _consecutive_429 = 0
+        await _persist_cooldown()
 
 
 def raise_if_cooling_down() -> None:
@@ -303,13 +349,13 @@ async def fetch_all_listings(market_hash_name: str, max_listings: int | None = D
                     # НЕ ретраим: у Steam 429 — это временный бан IP, который
                     # продлевается каждой новой попыткой. Ставим глобальный
                     # кулдаун и сразу выходим, чтобы не закапываться глубже.
-                    seconds = note_steam_429()
+                    seconds = await note_steam_429()
                     raise SteamRateLimited(
                         f"Steam ответил 429 (Too Many Requests) — это временный бан IP, "
                         f"который продлевается от новых попыток, поэтому не ретраю. "
                         f"Запросы к Steam приостановлены на {seconds / 60:.0f} мин."
                     )
-                note_steam_ok()
+                await note_steam_ok()
                 resp.raise_for_status()
 
                 content_type = resp.headers.get("Content-Type", "")

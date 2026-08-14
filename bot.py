@@ -50,6 +50,7 @@ from steam_client import (
     STEAM_PROXY_URL,
     SteamRateLimited,
     steam_cooldown_remaining,
+    load_persisted_cooldown,
 )
 from csgo_api import search_items as search_csgo_items
 from pricing import get_sticker_prices, ingest_manual_prices, clear_manual_prices, manual_prices_count
@@ -1155,6 +1156,12 @@ BOT_COMMANDS = [
 
 async def _on_startup(app: Application):
     await app.bot.set_my_commands(BOT_COMMANDS)
+
+    # ДО всего остального, что может тронуть Steam (prewarm, автоскан) —
+    # восстанавливаем кулдаун после 429, если рестарт застал его активным.
+    # Без этого бот "забывал" бы про ещё не снятый бан на каждом рестарте
+    # процесса и тут же пробовал снова, продлевая реальный бан.
+    await load_persisted_cooldown()
 
     asyncio.create_task(prewarm_loop())
 
