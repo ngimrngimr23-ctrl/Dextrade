@@ -396,3 +396,48 @@ async def mark_offer_sent(chat_id: int, offer_key: str) -> None:
     data[full_key] = time.time()
     _local_sent_offers_save(data)
 
+
+# ---------------------------------------------------------------------------
+# Глобальный кулдаун Steam после 429 (см. steam_client.py). Раньше жил только
+# в переменных процесса — на каждом рестарте/редеплое Render (в т.ч. от
+# самого редеплоя с фиксом) бот "забывал" про ещё не снятый бан и тут же
+# пробовал снова, получал новый 429 и тем самым продлевал реальный бан на
+# стороне Steam. Храним по тому же паттерну, что и остальное состояние,
+# чтобы кулдаун переживал рестарт процесса.
+# ---------------------------------------------------------------------------
+
+STEAM_COOLDOWN_KEY = "steam_cooldown"
+LOCAL_STEAM_COOLDOWN_PATH = Path(__file__).parent / "steam_cooldown_local.json"
+
+
+async def get_steam_cooldown() -> Optional[dict]:
+    """{'cooldown_until': epoch-секунды (time.time()), 'consecutive_429': int} либо None."""
+    if REDIS_ENABLED:
+        try:
+            raw = await _redis_cmd("GET", STEAM_COOLDOWN_KEY)
+            return json.loads(raw) if raw else None
+        except Exception:
+            pass
+
+    if LOCAL_STEAM_COOLDOWN_PATH.exists():
+        try:
+            return json.loads(LOCAL_STEAM_COOLDOWN_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+    return None
+
+
+async def set_steam_cooldown(cooldown_until: float, consecutive_429: int) -> None:
+    value = json.dumps(
+        {"cooldown_until": cooldown_until, "consecutive_429": consecutive_429}, ensure_ascii=False
+    )
+
+    if REDIS_ENABLED:
+        try:
+            await _redis_cmd("SET", STEAM_COOLDOWN_KEY, value)
+            return
+        except Exception:
+            pass
+
+    LOCAL_STEAM_COOLDOWN_PATH.write_text(value, encoding="utf-8")
+

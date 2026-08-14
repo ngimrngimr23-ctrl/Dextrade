@@ -277,9 +277,9 @@ async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict
                 "%s: HTTP 429 для запроса %r — ставлю глобальный кулдаун, не ретраю",
                 label, params.get("query") or params.get("market_hash_name"),
             )
-            note_steam_429()
+            await note_steam_429()
             raise RateLimited()
-        note_steam_ok()
+        await note_steam_ok()
         if resp.status != 200:
             log.warning("%s: HTTP %s для запроса %r", label, resp.status, params.get("query") or params.get("market_hash_name"))
             return None
