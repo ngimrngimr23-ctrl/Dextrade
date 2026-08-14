@@ -296,10 +296,8 @@ async def _get_watchlist_entry(chat_id: int) -> dict:
     return _local_watchlist_load().get(str(chat_id), {})
 
 
-async def _save_watchlist_entry(
-    chat_id: int, items: list[str], interval_minutes: Optional[float], paused: bool = False
-) -> None:
-    entry = {"items": items, "interval_minutes": interval_minutes, "paused": paused}
+async def _save_watchlist_entry(chat_id: int, items: list[str], paused: bool = False) -> None:
+    entry = {"items": items, "paused": paused}
     value = json.dumps(entry, ensure_ascii=False)
 
     if REDIS_ENABLED:
@@ -322,17 +320,7 @@ async def get_watchlist(chat_id: int) -> list[str]:
 
 async def set_watchlist(chat_id: int, items: list[str]) -> None:
     entry = await _get_watchlist_entry(chat_id)
-    await _save_watchlist_entry(chat_id, items, entry.get("interval_minutes"), bool(entry.get("paused")))
-
-
-async def get_watch_interval_minutes(chat_id: int) -> Optional[float]:
-    """Интервал автоскана вотчлиста чата в минутах, либо None, если ещё не задавался."""
-    return (await _get_watchlist_entry(chat_id)).get("interval_minutes")
-
-
-async def set_watch_interval_minutes(chat_id: int, minutes: float) -> None:
-    entry = await _get_watchlist_entry(chat_id)
-    await _save_watchlist_entry(chat_id, entry.get("items", []), minutes, bool(entry.get("paused")))
+    await _save_watchlist_entry(chat_id, items, bool(entry.get("paused")))
 
 
 async def get_watch_paused(chat_id: int) -> bool:
@@ -343,7 +331,7 @@ async def get_watch_paused(chat_id: int) -> bool:
 async def set_watch_paused(chat_id: int, paused: bool) -> None:
     entry = await _get_watchlist_entry(chat_id)
     entry["paused"] = paused
-    await _save_watchlist_entry(chat_id, entry.get("items", []), entry.get("interval_minutes"), paused)
+    await _save_watchlist_entry(chat_id, entry.get("items", []), paused)
 
 
 async def all_watchlist_chat_ids() -> list[int]:
@@ -355,4 +343,56 @@ async def all_watchlist_chat_ids() -> list[int]:
         except Exception:
             pass
     return [int(x) for x in _local_watchlist_load().keys()]
+
+
+# ---------------------------------------------------------------------------
+# Дедупликация офферов автоскана вотчлиста: не слать один и тот же лот
+# повторно в один чат, если его уже присылали в пределах SENT_OFFER_TTL_SECONDS.
+# ---------------------------------------------------------------------------
+
+SENT_OFFER_KEY_PREFIX = "sentoffer:"
+SENT_OFFER_TTL_SECONDS = 5 * 60 * 60  # 5 часов
+LOCAL_SENT_OFFERS_PATH = Path(__file__).parent / "sent_offers_local.json"
+
+
+def _local_sent_offers_load() -> dict:
+    if LOCAL_SENT_OFFERS_PATH.exists():
+        try:
+            return json.loads(LOCAL_SENT_OFFERS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _local_sent_offers_save(data: dict) -> None:
+    LOCAL_SENT_OFFERS_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+async def was_offer_sent_recently(chat_id: int, offer_key: str) -> bool:
+    """True, если этот же оффер уже отправляли в этот чат за последние SENT_OFFER_TTL_SECONDS."""
+    full_key = f"{SENT_OFFER_KEY_PREFIX}{chat_id}:{offer_key}"
+
+    if REDIS_ENABLED:
+        try:
+            return bool(await _redis_cmd("EXISTS", full_key))
+        except Exception:
+            pass
+
+    sent_at = _local_sent_offers_load().get(full_key)
+    return sent_at is not None and (time.time() - sent_at) < SENT_OFFER_TTL_SECONDS
+
+
+async def mark_offer_sent(chat_id: int, offer_key: str) -> None:
+    full_key = f"{SENT_OFFER_KEY_PREFIX}{chat_id}:{offer_key}"
+
+    if REDIS_ENABLED:
+        try:
+            await _redis_cmd("SET", full_key, "1", "EX", str(SENT_OFFER_TTL_SECONDS))
+            return
+        except Exception:
+            pass
+
+    data = _local_sent_offers_load()
+    data[full_key] = time.time()
+    _local_sent_offers_save(data)
 

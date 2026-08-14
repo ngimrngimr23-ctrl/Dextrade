@@ -27,6 +27,7 @@ Telegram-бот.
 """
 
 import asyncio
+import hashlib
 import html as html_module
 import json
 import logging
@@ -46,13 +47,14 @@ from steam_client import (
     render_url,
     _parse_listings_html,
     RENDER_COUNT,
+    MIN_REQUEST_INTERVAL,
     STEAM_PROXY_URL,
     SteamRateLimited,
     steam_cooldown_remaining,
 )
 from csgo_api import search_items as search_csgo_items
 from pricing import get_sticker_prices, ingest_manual_prices, clear_manual_prices, manual_prices_count
-from analyzer import find_offers, STREAK_THRESHOLD
+from analyzer import find_offers, Offer, STREAK_THRESHOLD
 from prewarm import prewarm_loop
 from storage import (
     get_chat_defaults,
@@ -63,11 +65,11 @@ from storage import (
     set_price_filter,
     get_watchlist,
     set_watchlist,
-    get_watch_interval_minutes,
-    set_watch_interval_minutes,
     get_watch_paused,
     set_watch_paused,
     all_watchlist_chat_ids,
+    was_offer_sent_recently,
+    mark_offer_sent,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -98,8 +100,17 @@ _pricefile_mode: set[int] = set()
 # Вотчлист /watchadd: список предметов сканируется по расписанию джобой
 # watchlist_scan_job, результат шлётся в чат только если нашлись офферы
 # (без "ничего не подошло" на каждый тик — иначе бот спамил бы постоянно).
-DEFAULT_WATCH_INTERVAL_MINUTES = 60.0
-MIN_WATCH_INTERVAL_MINUTES = 15.0  # сканирование каждого предмета — десятки запросов к Steam, короче нет смысла
+# Интервал автоскана вотчлиста больше не настраивается вручную — бот сам
+# подбирает его по длине списка, чтобы прогон гарантированно укладывался в
+# безопасный темп запросов к Steam (MIN_REQUEST_INTERVAL секунд между ЛЮБЫМИ
+# двумя запросами, см. steam_client.py) и не приближал 429. На предмет
+# закладываем больше, чем 1 реальный запрос (лоты почти всегда укладываются
+# в 1 страницу — DEFAULT_MAX_LISTINGS = RENDER_COUNT), с запасом на изредка
+# незакэшированные цены наклеек, и ещё 2x поверх — чтобы сам прогон занимал
+# заметно меньше времени, чем интервал между прогонами.
+WATCH_SECONDS_PER_ITEM = MIN_REQUEST_INTERVAL * 1.5 * 2  # ~12 сек/предмет с запасом
+MIN_WATCH_INTERVAL_MINUTES = 15.0  # меньше нет смысла — прогон даже короткого списка не успеет закончиться
+MAX_WATCH_INTERVAL_MINUTES = 180.0  # верхняя граница, чтобы огромный список не сканировался раз в сутки
 WATCHLIST_JOB_PREFIX = "watchlist_scan_"
 WATCHLIST_ITEM_DELAY_SECONDS = 3  # пауза между предметами внутри одного тика, чтобы не долбить Steam пачкой сразу
 
@@ -108,9 +119,21 @@ WATCHLIST_ITEM_DELAY_SECONDS = 3  # пауза между предметами �
 _watchlist_running: set[int] = set()
 
 
+def _auto_watch_interval(item_count: int) -> float:
+    """
+    Автоматически подбирает интервал автоскана вотчлиста по количеству
+    предметов в нём — чем длиннее список, тем больше нужно времени, чтобы
+    безопасным темпом пройти его целиком и не словить 429 от Steam.
+    """
+    if item_count <= 0:
+        return MIN_WATCH_INTERVAL_MINUTES
+    minutes = (item_count * WATCH_SECONDS_PER_ITEM) / 60
+    return min(MAX_WATCH_INTERVAL_MINUTES, max(MIN_WATCH_INTERVAL_MINUTES, minutes))
+
+
 async def _get_watch_interval(chat_id: int) -> float:
-    minutes = await get_watch_interval_minutes(chat_id)
-    return minutes if minutes is not None else DEFAULT_WATCH_INTERVAL_MINUTES
+    items = await get_watchlist(chat_id)
+    return _auto_watch_interval(len(items))
 
 
 def _schedule_watchlist_job(job_queue, chat_id: int, interval_minutes: float, delay_seconds: float | None = None) -> None:
@@ -655,7 +678,7 @@ async def watchadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if skipped:
         lines.append("Пропущено:\n" + "\n".join(f"• {s}" for s in skipped))
     interval = await _get_watch_interval(chat_id)
-    lines.append(f"Всего в списке: {len(current)}. Автоскан каждые {interval:g} мин (/watchinterval, чтобы поменять).")
+    lines.append(f"Всего в списке: {len(current)}. Автоскан каждые {interval:g} мин (интервал подбирается автоматически по размеру списка).")
     await update.message.reply_text("\n\n".join(lines))
 
 
@@ -714,7 +737,7 @@ async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not items:
         await update.message.reply_text(
             "Вотчлист пуст. Добавь предметы: /watchadd <предмет1>, <предмет2>, ...\n"
-            f"Интервал автоскана сейчас: {interval:g} мин (/watchinterval <мин>, чтобы поменять)."
+            f"Интервал автоскана сейчас: {interval:g} мин (подбирается автоматически по размеру списка)."
         )
         return
 
@@ -724,41 +747,21 @@ async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
-async def watchinterval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _offer_key(market_hash_name: str, offer: Offer) -> str:
     """
-    /watchinterval        — показать текущий интервал автоскана вотчлиста (в минутах)
-    /watchinterval <мин>  — сменить интервал
+    Стабильный ключ конкретного лота — по inspect-ссылке (уникальна для
+    каждого экземпляра предмета в Steam), либо, если её нет, по сочетанию
+    название+цена+стикеры. Нужен, чтобы не слать один и тот же оффер
+    повторно в течение SENT_OFFER_TTL_SECONDS (см. storage.py).
     """
-    chat_id = update.effective_chat.id
-    if not context.args:
-        interval = await _get_watch_interval(chat_id)
-        await update.message.reply_text(
-            f"Текущий интервал автоскана вотчлиста: {interval:g} мин.\n"
-            f"Чтобы поменять: /watchinterval <мин>, напр. /watchinterval 60"
-        )
-        return
-
-    try:
-        minutes = float(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Интервал должен быть числом в минутах, напр. 30 или 60.")
-        return
-    if minutes < MIN_WATCH_INTERVAL_MINUTES:
-        await update.message.reply_text(
-            f"Минимальный интервал — {MIN_WATCH_INTERVAL_MINUTES:g} мин. Сканирование каждого предмета — "
-            f"это десятки запросов к Steam, чаще просто не успеет прогнать весь список."
-        )
-        return
-
-    await set_watch_interval_minutes(chat_id, minutes)
-    if context.application.job_queue:
-        _schedule_watchlist_job(context.application.job_queue, chat_id, minutes)
-    await update.message.reply_text(f"Интервал автоскана вотчлиста: теперь каждые {minutes:g} мин.")
+    basis = offer.inspect_link or f"{market_hash_name}|{offer.price}|{','.join(offer.stickers)}"
+    return hashlib.sha1(basis.encode("utf-8")).hexdigest()
 
 
 async def _watchlist_scan_item(bot, chat_id: int, market_hash_name: str, min_value: float, max_markup: float) -> bool:
     """
-    Возвращает True, если нашлись офферы и сообщение реально ушло в чат.
+    Возвращает True, если нашлись НОВЫЕ офферы (не присылавшиеся этому чату
+    за последние 5 часов) и сообщение реально ушло в чат.
     SteamRateLimited пробрасывается наверх — прогон должен остановиться целиком,
     а не продолжать долбить Steam остальными предметами во время бана.
     """
@@ -774,10 +777,19 @@ async def _watchlist_scan_item(bot, chat_id: int, market_hash_name: str, min_val
     if not offers:
         return False  # автоскан молчит, если нечего показать — иначе спамил бы каждый тик
 
-    chunks = _format_offers_chunks(offers, sticker_prices, market_hash_name)
+    keys = [_offer_key(market_hash_name, o) for o in offers]
+    new_offers = [
+        o for o, key in zip(offers, keys) if not await was_offer_sent_recently(chat_id, key)
+    ]
+    if not new_offers:
+        return False  # всё это уже присылали этому чату за последние 5 часов
+
+    chunks = _format_offers_chunks(new_offers, sticker_prices, market_hash_name)
     chunks[0] = f"🔔 {html_module.escape(market_hash_name)}\n\n{chunks[0]}"
     for chunk in chunks:
         await bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML", disable_web_page_preview=True)
+    for o in new_offers:
+        await mark_offer_sent(chat_id, _offer_key(market_hash_name, o))
     return True
 
 
@@ -1121,9 +1133,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/watchadd <предмет1>, <предмет2>, ... — добавить предметы в вотчлист на автоскан\n"
         "/watchdel <номер или название> — убрать предмет из вотчлиста\n"
         "/watchclear — полностью очистить вотчлист\n"
-        "/watchlist — показать вотчлист\n"
-        "/watchinterval <мин> — как часто сканировать вотчлист (по умолчанию "
-        f"{DEFAULT_WATCH_INTERVAL_MINUTES:g} мин); бот сам пришлёт сообщение, только если найдёт офферы.\n"
+        "/watchlist — показать вотчлист и текущий интервал автоскана (подбирается "
+        "автоматически по размеру списка, чтобы не словить бан Steam за частые запросы); "
+        "бот сам пришлёт сообщение, только если найдёт новые офферы (один и тот же лот повторно "
+        "не пришлёт в течение 5 часов).\n"
         "/scanall — сканировать весь вотчлист прямо сейчас, не дожидаясь расписания.\n"
         "/watchpause — остановить автоскан (список сохраняется), /watchresume — возобновить.\n\n"
         f"/setdefaults <мин$> <макс%> — поменять значения по умолчанию "
@@ -1143,7 +1156,6 @@ BOT_COMMANDS = [
     BotCommand("watchdel", "Убрать предмет из вотчлиста"),
     BotCommand("watchclear", "Полностью очистить вотчлист"),
     BotCommand("watchlist", "Показать вотчлист и интервал автоскана"),
-    BotCommand("watchinterval", "Настроить интервал автоскана"),
     BotCommand("watchpause", "Остановить автоскан вотчлиста"),
     BotCommand("watchresume", "Возобновить автоскан вотчлиста"),
     BotCommand("scanall", "Сканировать весь вотчлист прямо сейчас"),
@@ -1226,7 +1238,6 @@ def main():
     app.add_handler(CommandHandler("watchdel", watchdel))
     app.add_handler(CommandHandler("watchclear", watchclear))
     app.add_handler(CommandHandler("watchlist", watchlist_cmd))
-    app.add_handler(CommandHandler("watchinterval", watchinterval))
     app.add_handler(CommandHandler("watchpause", watchpause))
     app.add_handler(CommandHandler("watchresume", watchresume))
     app.add_handler(CommandHandler("scanall", scanall))
