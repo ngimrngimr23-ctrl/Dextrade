@@ -70,11 +70,21 @@ class SteamRateLimited(RuntimeError):
     """Steam ответил 429 либо мы сами на кулдауне после недавнего 429."""
 
 
-# Глобальные (на весь процесс) троттлинг и кулдаун: их разделяют И сбор
-# листингов, И запросы цен стикеров из pricing.py — иначе один компонент
-# съедает лимит и подставляет другой.
+# Кулдаун/счётчик 429 подряд — РАЗДЕЛЬНО по областям (scope), не один общий
+# на весь процесс. Причина: 2026-08-14/15 дважды подряд (даже после подъёма
+# паузы между запросами и часов отдыха) именно priceoverview/market-search
+# (цена стикера, pricing.py) сразу ловил 429, тогда как /render/ (листинги,
+# от которых зависит весь вотчлист/сканы) — ни разу. Похоже, у Steam это два
+# независимых лимита, разной жёсткости. Раньше 429 на ЛЮБОМ из них ставил
+# ОДИН общий кулдаун — бан на некритичной цене стикера останавливал заодно и
+# критичный сбор листингов. Теперь у каждой области свой кулдаун:
+#   "listings" — /render/ (steam_client.fetch_all_listings)
+#   "pricing"  — priceoverview/market-search (pricing.py, только фоновый
+#                prewarm.py их трогает — см. комментарий в pricing.py)
+# throttle_steam_request() (пауза между запросами) — по-прежнему общий на обе
+# области: пейсинг сам по себе не был причиной банов, разделять его незачем.
 #
-# _cooldown_until — в epoch-секундах (time.time()), НЕ time.monotonic(): его
+# cooldown_until — в epoch-секундах (time.time()), НЕ time.monotonic(): его
 # значение сохраняется в постоянное хранилище (storage.py) и должно остаться
 # осмысленным после рестарта процесса (Render передеплоивает бота на каждый
 # git push, а monotonic() при рестарте обнуляется). Без этого при каждом
@@ -83,77 +93,83 @@ class SteamRateLimited(RuntimeError):
 # одного запуска процесса, ему персистентность не нужна, оставляем monotonic.
 _request_lock = asyncio.Lock()
 _last_request_at = 0.0
-_cooldown_until = 0.0
-_consecutive_429 = 0
+_cooldowns: dict[str, dict] = {}  # scope -> {"cooldown_until": float, "consecutive_429": int}
 
 
-def steam_cooldown_remaining() -> float:
-    """Сколько секунд ещё нельзя трогать Steam (0, если можно)."""
-    return max(0.0, _cooldown_until - time.time())
+def _cooldown_state(scope: str) -> dict:
+    return _cooldowns.setdefault(scope, {"cooldown_until": 0.0, "consecutive_429": 0})
 
 
-async def _persist_cooldown() -> None:
+def steam_cooldown_remaining(scope: str = "listings") -> float:
+    """Сколько секунд ещё нельзя трогать Steam в этой области (0, если можно)."""
+    return max(0.0, _cooldown_state(scope)["cooldown_until"] - time.time())
+
+
+async def _persist_cooldown(scope: str) -> None:
     from storage import set_steam_cooldown  # локальный импорт — storage не обязателен для остального модуля
 
+    state = _cooldown_state(scope)
     try:
-        await set_steam_cooldown(_cooldown_until, _consecutive_429)
+        await set_steam_cooldown(scope, state["cooldown_until"], state["consecutive_429"])
     except Exception:
-        log.exception("не смог сохранить кулдаун Steam в постоянное хранилище")
+        log.exception("не смог сохранить кулдаун Steam (%s) в постоянное хранилище", scope)
 
 
 async def load_persisted_cooldown() -> None:
     """
-    Восстанавливает кулдаун/счётчик 429 подряд после рестарта процесса.
-    Вызывать один раз при старте бота, до первого обращения к Steam.
+    Восстанавливает кулдаун/счётчик 429 подряд (по каждой области) после
+    рестарта процесса. Вызывать один раз при старте бота, до первого
+    обращения к Steam.
     """
-    global _cooldown_until, _consecutive_429
     from storage import get_steam_cooldown
 
-    try:
-        persisted = await get_steam_cooldown()
-    except Exception:
-        log.exception("не смог загрузить сохранённый кулдаун Steam")
-        return
+    for scope in ("listings", "pricing"):
+        try:
+            persisted = await get_steam_cooldown(scope)
+        except Exception:
+            log.exception("не смог загрузить сохранённый кулдаун Steam (%s)", scope)
+            continue
+        if not persisted:
+            continue
+        state = _cooldown_state(scope)
+        state["cooldown_until"] = persisted.get("cooldown_until", 0.0)
+        state["consecutive_429"] = persisted.get("consecutive_429", 0)
+        remaining = steam_cooldown_remaining(scope)
+        if remaining > 0:
+            log.warning(
+                "Восстановлен кулдаун Steam (%s) после рестарта процесса: ещё %.0f мин (%s-й 429 подряд)",
+                scope, remaining / 60, state["consecutive_429"],
+            )
 
-    if not persisted:
-        return
-    _cooldown_until = persisted.get("cooldown_until", 0.0)
-    _consecutive_429 = persisted.get("consecutive_429", 0)
-    remaining = steam_cooldown_remaining()
-    if remaining > 0:
-        log.warning(
-            "Восстановлен кулдаун Steam после рестарта процесса: ещё %.0f мин (%s-й 429 подряд)",
-            remaining / 60, _consecutive_429,
-        )
 
-
-async def note_steam_429() -> float:
+async def note_steam_429(scope: str = "listings") -> float:
     """
-    Зафиксировать 429: ставит глобальный кулдаун (растёт вдвое при 429
-    подряд, чтобы не долбиться в уже забаненный IP). Возвращает длину кулдауна.
+    Зафиксировать 429 в указанной области: ставит кулдаун только для неё
+    (растёт вдвое при 429 подряд в этой же области), остальные области не
+    трогает. Возвращает длину кулдауна.
     """
-    global _cooldown_until, _consecutive_429
-    _consecutive_429 += 1
-    seconds = min(COOLDOWN_AFTER_429_SECONDS * (2 ** (_consecutive_429 - 1)), COOLDOWN_MAX_SECONDS)
-    _cooldown_until = max(_cooldown_until, time.time() + seconds)
+    state = _cooldown_state(scope)
+    state["consecutive_429"] += 1
+    seconds = min(COOLDOWN_AFTER_429_SECONDS * (2 ** (state["consecutive_429"] - 1)), COOLDOWN_MAX_SECONDS)
+    state["cooldown_until"] = max(state["cooldown_until"], time.time() + seconds)
     log.warning(
-        "Steam вернул 429 (%s-й подряд) — кулдаун на %.0f мин, к Steam не ходим до истечения",
-        _consecutive_429, seconds / 60,
+        "Steam (%s) вернул 429 (%s-й подряд) — кулдаун на %.0f мин для этой области",
+        scope, state["consecutive_429"], seconds / 60,
     )
-    await _persist_cooldown()
+    await _persist_cooldown(scope)
     return seconds
 
 
-async def note_steam_ok() -> None:
-    """Успешный ответ — сбрасываем счётчик 429 подряд."""
-    global _consecutive_429
-    if _consecutive_429 != 0:
-        _consecutive_429 = 0
-        await _persist_cooldown()
+async def note_steam_ok(scope: str = "listings") -> None:
+    """Успешный ответ в указанной области — сбрасываем счётчик 429 подряд для неё."""
+    state = _cooldown_state(scope)
+    if state["consecutive_429"] != 0:
+        state["consecutive_429"] = 0
+        await _persist_cooldown(scope)
 
 
-def raise_if_cooling_down() -> None:
-    remaining = steam_cooldown_remaining()
+def raise_if_cooling_down(scope: str = "listings") -> None:
+    remaining = steam_cooldown_remaining(scope)
     if remaining > 0:
         raise SteamRateLimited(
             f"Steam недавно ответил 429 (это временный бан IP, который продлевается "

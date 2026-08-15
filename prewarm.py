@@ -32,13 +32,16 @@ REQUEST_DELAY = 1.5
 
 
 async def _prewarm_once():
-    cooldown = steam_cooldown_remaining()
+    # scope="pricing" — пре-варминг ходит только за ценой стикеров
+    # (priceoverview/market-search), у этой области свой кулдаун, отдельный
+    # от листингов/вотчлиста (см. steam_client.py).
+    cooldown = steam_cooldown_remaining(scope="pricing")
     if cooldown > 0:
         # Steam всё ещё на кулдауне после 429 — раньше пре-варминг всё равно
         # лез за Steam-фолбэком по каждому непокрытому csgotrader.app ключу,
-        # игнорируя общий кулдаун, и тем самым лишний раз тыкал забаненный IP
-        # каждые LOOP_INTERVAL_SECONDS. Теперь просто ждём, как и вотчлист.
-        log.info("prewarm: пропускаю — кулдаун Steam ещё %.0f мин", cooldown / 60)
+        # игнорируя кулдаун, и тем самым лишний раз тыкал забаненный IP
+        # каждые LOOP_INTERVAL_SECONDS. Теперь просто ждём.
+        log.info("prewarm: пропускаю — кулдаун цен стикеров ещё %.0f мин", cooldown / 60)
         return
 
     now = time.time()

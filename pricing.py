@@ -261,25 +261,28 @@ def _steam_request_headers() -> dict:
 
 async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict, label: str):
     """
-    Один запрос к Steam через общий с steam_client троттлинг/кулдаун.
+    Один запрос к Steam через общий с steam_client троттлинг + СВОЙ,
+    отдельный от листингов, кулдаун (scope="pricing") — priceoverview и
+    market/search банятся Steam независимо от /render/ и заметно охотнее
+    (см. steam_client.py), поэтому бан здесь не должен тормозить листинги.
 
     Ретраев на 429 больше нет: у Steam это временный бан IP, который
     ПРОДЛЕВАЕТСЯ каждой новой попыткой — повторы только усугубляли бы бан.
-    Вместо этого ставим глобальный кулдаун (его видит и сбор листингов).
+    Вместо этого ставим кулдаун для этой области.
     """
-    if steam_cooldown_remaining() > 0:
+    if steam_cooldown_remaining(scope="pricing") > 0:
         raise RateLimited()
 
     await throttle_steam_request()
     async with session.get(url, params=params, headers=_steam_request_headers()) as resp:
         if resp.status == 429:
             log.warning(
-                "%s: HTTP 429 для запроса %r — ставлю глобальный кулдаун, не ретраю",
+                "%s: HTTP 429 для запроса %r — ставлю кулдаун для цен стикеров, не ретраю",
                 label, params.get("query") or params.get("market_hash_name"),
             )
-            await note_steam_429()
+            await note_steam_429(scope="pricing")
             raise RateLimited()
-        await note_steam_ok()
+        await note_steam_ok(scope="pricing")
         if resp.status != 200:
             log.warning("%s: HTTP %s для запроса %r", label, resp.status, params.get("query") or params.get("market_hash_name"))
             return None
@@ -358,7 +361,7 @@ async def _fetch_one_price(session: aiohttp.ClientSession, key: str, overrides: 
         if ct_price is not None:
             return name_or_query, ct_price
 
-    if steam_cooldown_remaining() > 0:
+    if steam_cooldown_remaining(scope="pricing") > 0:
         return name_or_query, 0.0
 
     matched_name, price, _ok = await _fetch_from_steam(session, key, name_or_query, is_exact)
@@ -446,54 +449,31 @@ async def get_sticker_prices(sticker_keys: set[str]) -> dict[str, float]:
             await set_prices_batch(ct_hits)
 
         if steam_fallback_needed:
-            log.info("get_sticker_prices: %s ключей не нашлись в прайс-листе csgotrader.app, идут на Steam-фолбэк", len(steam_fallback_needed))
-            is_banned = steam_cooldown_remaining() > 0
-
-            if is_banned:
-                # Уже знаем из глобального кулдауна, что IP забанен — не тратим
-                # на это ЕЩЁ ОДИН отдельный пробный запрос к Steam (раньше тут был
-                # именно такой запрос в обход общего троттлинга/кулдауна — он бил по
-                # Steam каждый раз, когда нужен был фолбэк, включая моменты, когда
-                # мы САМИ знали, что забанены, и только продлевал реальный бан).
-                # Гонять по 3 ретрая с экспоненциальным backoff на каждый из
-                # оставшихся ключей бессмысленно (только жжёт 20-30+ минут впустую
-                # на заведомо провальные попытки) — сразу помечаем как "не найдено"
-                # в этом прогоне. Ничего не кэшируем нулём, чтобы при следующем
-                # /scan (когда бан, возможно, снимется) эти ключи пересчитались заново.
-                log.warning(
-                    "get_sticker_prices: IP забанен целиком — пропускаю Steam-ретраи "
-                    "для %s ключей без попыток (будут пересчитаны, когда бан снимется)",
-                    len(steam_fallback_needed),
-                )
-                rate_limited_count += len(steam_fallback_needed)
-            else:
-                steam_hits: list[tuple[str, Optional[str], float, int]] = []
-                for i, (key, name_or_query, is_exact) in enumerate(steam_fallback_needed):
-                    matched_name, price, ok = await _fetch_from_steam(session, key, name_or_query, is_exact)
-                    if ok:
-                        steam_hits.append((key, matched_name, price, CACHE_TTL_SECONDS))
-                        result[key] = price
-                        continue
-
-                    rate_limited_count += 1
-                    if steam_cooldown_remaining() > 0:
-                        # Влетели в кулдаун — оставшиеся ключи в этом прогоне
-                        # всё равно не получим, нет смысла перебирать их вхолостую.
-                        remaining = len(steam_fallback_needed) - i - 1
-                        rate_limited_count += remaining
-                        log.warning(
-                            "get_sticker_prices: кулдаун Steam — пропускаю оставшиеся %s ключей в этом прогоне",
-                            remaining,
-                        )
-                        break
-                    # паузы между запросами держит throttle_steam_request()
-                if steam_hits:
-                    await set_prices_batch(steam_hits)
+            # Живой путь (/scan, /scanfile, автоскан вотчлиста) больше НЕ ходит в
+            # Steam за ценой стикера вообще — только в статичный прайс-лист
+            # csgotrader.app выше. Причина: 2026-08-14/15 дважды подряд (даже
+            # после подъёма паузы до 12 сек и 6+ часов отдыха между попытками)
+            # именно priceoverview/market-search — НЕ /render/, которым идёт сбор
+            # листингов, — сразу ловил 429 на первом же обращении. У этих двух
+            # эндпоинтов, похоже, отдельный и гораздо более жёсткий лимит у Steam,
+            # чем у /render/, и никакая пауза между запросами его не обходит.
+            # Ронять ВЕСЬ автоскан на 30+ минут ради пары стикеров, которых
+            # почти наверняка нет в csgotrader.app просто потому что они очень
+            # новые, того не стоит. Эти ключи остаются "не найдено" сейчас —
+            # их фоном подтянет prewarm_loop (раз в 30 мин, тоже уважает
+            # кулдаун — см. prewarm.py). Ничего не кэшируем нулём, чтобы при
+            # следующем прогоне (когда prewarm их уже посчитает) взялась
+            # актуальная цена.
+            log.info(
+                "get_sticker_prices: %s ключей не нашлись в прайс-листе csgotrader.app — "
+                "оставляю их фоновому prewarm'у, живой путь к Steam за ценой стикера не ходит",
+                len(steam_fallback_needed),
+            )
+            rate_limited_count += len(steam_fallback_needed)
 
     if rate_limited_count:
-        log.warning(
-            "get_sticker_prices: %s ключей не удалось узнать (Steam недоступен) "
-            "(не закэшированы нулём, будут повторены в следующем прогоне)",
+        log.info(
+            "get_sticker_prices: %s ключей пока без цены (ждут prewarm)",
             rate_limited_count,
         )
 
