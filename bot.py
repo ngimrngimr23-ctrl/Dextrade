@@ -7,18 +7,19 @@ Telegram-бот.
 Пример:
     /scan https://steamcommunity.com/market/listings/730/AK-47%20%7C%20Slate%20%28Field-Tested%29 5 7
 
-Бот пришлёт ссылку на страницу JSON — открываете её в своём браузере
-(с домашнего IP Steam не блокирует), сохраняете как .json (Ctrl+S) и
-присылаете файл боту. Он спарсит, попросит следующую страницу, если
-лотов больше 100, и в конце сам посчитает офферы.
+Бот сам сходит в Steam за листингами и посчитает офферы — прямой автоматический
+запрос, без ручной передачи файлов (актуально с тех пор, как разобрались с
+Market Beta и рейт-лимитами, см. steam_client.py). Если не указать числа —
+по умолчанию 5 баксов и 7%.
 
-Если когда-нибудь понадобится попытка прямого автоматического запроса
-к Steam (без ручной передачи файла — но Steam банит облачные IP, так
-что обычно не работает без рабочего прокси):
+Если автоматический запрос всё же не удался (например, IP временно на
+кулдауне после 429) — резервный ручной путь:
 
     /scanfile <ссылка на предмет> [мин$] [макс%]
 
-Если не указать числа — по умолчанию 5 баксов и 7%.
+Бот пришлёт ссылку на страницу JSON — открываете её в своём браузере,
+сохраняете как .json (Ctrl+S) и присылаете файл боту. Он спарсит, попросит
+следующую страницу, если лотов больше 100, и в конце сам посчитает офферы.
 
 Запуск:
     export TG_BOT_TOKEN=твой_токен_от_BotFather
@@ -244,7 +245,7 @@ async def _proceed_scan(update: Update, market_hash_name: str, min_value: float,
             await update.message.reply_text(
                 f"Не смог получить листинги: {e}\n\n"
                 f"Steam блокирует запросы бота (частая история для облачных IP) — "
-                f"попробуй /scan вместо /scanfile, там ты сам качаешь JSON из браузера."
+                f"попробуй /scanfile вместо /scan, там ты сам качаешь JSON из браузера."
             )
         return
     await _run_analysis(update, listings, min_value, max_markup, market_hash_name)
@@ -388,8 +389,8 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     def_min, def_max = await _get_defaults(chat_id)
     if not args:
         await update.message.reply_text(
-            f"Формат: /scan <ссылка или название предмета> [мин$ стикеров={def_min:.0f}] [макс наценка%={def_max:.0f}]\n"
-            f"Название — на английском: /scan AK-47 | Slate (Field-Tested)"
+            f"Формат: /scanfile <ссылка или название предмета> [мин$ стикеров={def_min:.0f}] [макс наценка%={def_max:.0f}]\n"
+            f"Название — на английском: /scanfile AK-47 | Slate (Field-Tested)"
         )
         return
 
@@ -535,8 +536,8 @@ async def scanfile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     def_min, def_max = await _get_defaults(chat_id)
     if not args:
         await update.message.reply_text(
-            f"Формат: /scanfile <ссылка или название предмета> [мин$ стикеров={def_min:.0f}] [макс наценка%={def_max:.0f}]\n"
-            f"Название — на английском: /scanfile AK-47 | Slate (Field-Tested)"
+            f"Формат: /scan <ссылка или название предмета> [мин$ стикеров={def_min:.0f}] [макс наценка%={def_max:.0f}]\n"
+            f"Название — на английском: /scan AK-47 | Slate (Field-Tested)"
         )
         return
 
@@ -1049,7 +1050,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     session = _file_sessions.get(chat_id)
     if session is None:
-        # файл прислан без /scan — заводим сессию сама на лету, доставая
+        # файл прислан без /scanfile — заводим сессию сама на лету, доставая
         # название предмета прямо из присланного HTML (нужно только для
         # ссылки на следующую страницу; параметры фильтра — по умолчанию)
         name_m = re.search(r'market_listing_item_name"[^>]*>([^<]+)<', html)
@@ -1068,7 +1069,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Файл принят без команды, начинаю сбор «{market_hash_name or 'предмет'}» "
             f"с параметрами по умолчанию (мин$ стикеров={def_min:.0f}, макс наценка={def_max:.0f}%).\n"
             f"Сменить дефолты: /setdefaults <мин$> <макс%>. "
-            f"Или задать разово: /scan <ссылка> [мин$] [макс%]."
+            f"Или задать разово: /scanfile <ссылка> [мин$] [макс%]."
         )
 
     session["listings"].extend(new_listings)
@@ -1098,7 +1099,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             f"Собрано {got} из {total_count}, но не смог понять название предмета из файла, "
-            f"чтобы дать ссылку на следующую страницу. Начни через /scan <ссылка>."
+            f"чтобы дать ссылку на следующую страницу. Начни через /scanfile <ссылка>."
         )
 
 
@@ -1108,13 +1109,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Пришли:\n"
         "/scan <ссылка или название предмета> [мин$ стикеров] [макс наценка%]\n"
-        "Название — на английском, с | или без: /scan AK-47 | Slate или /scan AK-47 Slate\n\n"
-        "Бот пришлёт ссылку на JSON — открой её в своём браузере, сохрани "
-        "(Ctrl+S) и пришли файл сюда, можно и без команды, просто скинуть файл. "
-        "Дальше бот сам всё посчитает.\n\n"
-        "/scanfile — попытка прямого автоматического запроса к Steam без "
-        "ручной передачи файла (обычно не работает — Steam блокирует облачные "
-        "IP), используй только если знаешь, что делаешь.\n\n"
+        "Название — на английском, с | или без: /scan AK-47 | Slate или /scan AK-47 Slate\n"
+        "Бот сам сходит в Steam за листингами и посчитает офферы.\n\n"
+        "/scanfile — резервный ручной путь, если автоматический запрос не удался "
+        "(например, IP временно на кулдауне после 429 у Steam): бот пришлёт ссылку "
+        "на JSON, открой её в браузере, сохрани (Ctrl+S) и пришли файл сюда — можно "
+        "и без команды, просто скинуть файл.\n\n"
         "/pricefile — загрузить прайс-лист цен на стикеры вручную (Steam market/search JSON), "
         "/clearprices — очистить его перед обновлением.\n\n"
         "/watchadd <предмет1>, <предмет2>, ... — добавить предметы в вотчлист на автоскан\n"
@@ -1137,8 +1137,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 BOT_COMMANDS = [
     BotCommand("start", "Помощь и список команд"),
-    BotCommand("scan", "Проверить один предмет по ссылке Steam Market"),
-    BotCommand("scanfile", "Проверить предмет по названию (без ссылки)"),
+    BotCommand("scan", "Проверить предмет (автоматический запрос к Steam)"),
+    BotCommand("scanfile", "Проверить предмет вручную (резерв, если /scan не удался)"),
     BotCommand("watchadd", "Добавить предмет(ы) в вотчлист"),
     BotCommand("watchdel", "Убрать предмет из вотчлиста"),
     BotCommand("watchclear", "Полностью очистить вотчлист"),
@@ -1220,8 +1220,8 @@ def main():
     _start_health_server()
     app = Application.builder().token(token).post_init(_on_startup).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("scan", scan))
-    app.add_handler(CommandHandler("scanfile", scanfile))
+    app.add_handler(CommandHandler("scan", scanfile))
+    app.add_handler(CommandHandler("scanfile", scan))
     app.add_handler(CommandHandler("setdefaults", setdefaults))
     app.add_handler(CommandHandler("setstreakmarkup", setstreakmarkup))
     app.add_handler(CommandHandler("setpricefilter", setpricefilter))
