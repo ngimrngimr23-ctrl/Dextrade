@@ -273,14 +273,14 @@ async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict
     if steam_cooldown_remaining(scope="pricing") > 0:
         raise RateLimited()
 
-    await throttle_steam_request()
+    await throttle_steam_request(scope="pricing")
     async with session.get(url, params=params, headers=_steam_request_headers()) as resp:
         if resp.status == 429:
             log.warning(
                 "%s: HTTP 429 для запроса %r — ставлю кулдаун для цен стикеров, не ретраю",
                 label, params.get("query") or params.get("market_hash_name"),
             )
-            await note_steam_429(scope="pricing")
+            await note_steam_429(scope="pricing", headers=dict(resp.headers))
             raise RateLimited()
         await note_steam_ok(scope="pricing")
         if resp.status != 200:

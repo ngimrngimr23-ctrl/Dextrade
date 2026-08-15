@@ -30,6 +30,7 @@ import os
 import re
 import time
 import urllib.parse
+from collections import deque
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -98,11 +99,94 @@ class SteamRateLimited(RuntimeError):
 # одного запуска процесса, ему персистентность не нужна, оставляем monotonic.
 _request_lock = asyncio.Lock()
 _last_request_at = 0.0
-_cooldowns: dict[str, dict] = {}  # scope -> {"cooldown_until": float, "consecutive_429": int}
+# scope -> {"cooldown_until": float, "consecutive_429": int, "last_429_at": float}
+_cooldowns: dict[str, dict] = {}
 
 
 def _cooldown_state(scope: str) -> dict:
-    return _cooldowns.setdefault(scope, {"cooldown_until": 0.0, "consecutive_429": 0})
+    return _cooldowns.setdefault(
+        scope, {"cooldown_until": 0.0, "consecutive_429": 0, "last_429_at": 0.0}
+    )
+
+
+# --- Диагностика рейт-лимита -------------------------------------------
+# Кольцевой журнал моментов ВСЕХ запросов к Steam. Нужен, чтобы при 429 в лог
+# попал не просто факт бана, а его "координаты": сколько запросов реально ушло
+# за последнюю минуту / 5 / 15 / 60 мин и за сутки, отдельно по области и
+# суммарно. Без этого каждый бан остаётся загадкой, а подбор паузы —
+# угадыванием (чем мы и занимались 2026-08-14/15, меняя интервал 4 -> 12 -> 4
+# по одиночным наблюдениям без данных). Лимиты Steam недокументированы и,
+# судя по всему, не сводятся к "N секунд между запросами" — поэтому сначала
+# собираем факты, потом решаем.
+REQUEST_LOG_WINDOW_SECONDS = 24 * 60 * 60
+_PERIODIC_STATS_EVERY = 200  # раз в столько запросов кидаем в лог текущий темп
+
+_request_log: deque[tuple[float, str]] = deque()
+_requests_since_stats = 0
+
+_STAT_WINDOWS = (("1мин", 60), ("5мин", 300), ("15мин", 900), ("60мин", 3600), ("24ч", REQUEST_LOG_WINDOW_SECONDS))
+
+
+def _record_steam_request(scope: str) -> None:
+    global _requests_since_stats
+
+    now = time.time()
+    _request_log.append((now, scope))
+    cutoff = now - REQUEST_LOG_WINDOW_SECONDS
+    while _request_log and _request_log[0][0] < cutoff:
+        _request_log.popleft()
+
+    _requests_since_stats += 1
+    if _requests_since_stats >= _PERIODIC_STATS_EVERY:
+        _requests_since_stats = 0
+        log.info("Темп запросов к Steam: %s", _format_counts(request_counts()))
+
+
+def request_counts(scope: str | None = None) -> dict[str, int]:
+    """Сколько запросов ушло за скользящие окна — всего либо только по одной области."""
+    now = time.time()
+    return {
+        label: sum(
+            1 for ts, sc in _request_log if ts >= now - seconds and (scope is None or sc == scope)
+        )
+        for label, seconds in _STAT_WINDOWS
+    }
+
+
+def _format_counts(counts: dict[str, int]) -> str:
+    return ", ".join(f"{label}={n}" for label, n in counts.items())
+
+
+def _log_429_diagnostics(scope: str, headers: dict | None) -> None:
+    """
+    Полный слепок обстоятельств бана — то, ради чего заведён журнал запросов.
+    Логируем и заголовки ответа: Steam может прислать Retry-After или что-то
+    из X-RateLimit-*, и это единственный источник, где лимит назван явно.
+    """
+    state = _cooldown_state(scope)
+    last_429 = state.get("last_429_at") or 0.0
+    since_last = f"{(time.time() - last_429) / 60:.1f} мин назад" if last_429 else "впервые с рестарта"
+
+    log.warning(
+        "ДИАГНОСТИКА 429 [%s]: запросов этой области — %s | всех областей — %s | "
+        "прошлый 429 в этой области: %s | текущая пауза между запросами: %.0f сек",
+        scope,
+        _format_counts(request_counts(scope)),
+        _format_counts(request_counts()),
+        since_last,
+        MIN_REQUEST_INTERVAL,
+    )
+
+    if headers:
+        retry_after = next((v for k, v in headers.items() if k.lower() == "retry-after"), None)
+        if retry_after:
+            log.warning("ДИАГНОСТИКА 429 [%s]: Steam прислал Retry-After=%s", scope, retry_after)
+        log.warning(
+            "ДИАГНОСТИКА 429 [%s]: заголовки ответа: %s",
+            scope, {k: v for k, v in headers.items()},
+        )
+    else:
+        log.warning("ДИАГНОСТИКА 429 [%s]: заголовки ответа не переданы вызывающим кодом", scope)
 
 
 def steam_cooldown_remaining(scope: str = "listings") -> float:
@@ -147,20 +231,26 @@ async def load_persisted_cooldown() -> None:
             )
 
 
-async def note_steam_429(scope: str = "listings") -> float:
+async def note_steam_429(scope: str = "listings", headers: dict | None = None) -> float:
     """
     Зафиксировать 429 в указанной области: ставит кулдаун только для неё
     (растёт вдвое при 429 подряд в этой же области), остальные области не
     трогает. Возвращает длину кулдауна.
+    headers — заголовки ответа Steam, попадают в диагностический слепок.
     """
     state = _cooldown_state(scope)
     state["consecutive_429"] += 1
     seconds = min(COOLDOWN_AFTER_429_SECONDS * (2 ** (state["consecutive_429"] - 1)), COOLDOWN_MAX_SECONDS)
-    state["cooldown_until"] = max(state["cooldown_until"], time.time() + seconds)
     log.warning(
         "Steam (%s) вернул 429 (%s-й подряд) — кулдаун на %.0f мин для этой области",
         scope, state["consecutive_429"], seconds / 60,
     )
+    # Слепок снимаем ДО обновления last_429_at, чтобы в нём было видно, сколько
+    # времени прошло с ПРОШЛОГО бана, а не ноль.
+    _log_429_diagnostics(scope, headers)
+
+    state["cooldown_until"] = max(state["cooldown_until"], time.time() + seconds)
+    state["last_429_at"] = time.time()
     await _persist_cooldown(scope)
     return seconds
 
@@ -183,14 +273,20 @@ def raise_if_cooling_down(scope: str = "listings") -> None:
         )
 
 
-async def throttle_steam_request() -> None:
-    """Держит паузу MIN_REQUEST_INTERVAL между любыми двумя запросами к Steam."""
+async def throttle_steam_request(scope: str = "listings") -> None:
+    """
+    Держит паузу MIN_REQUEST_INTERVAL между любыми двумя запросами к Steam
+    и попутно отмечает запрос в журнале (см. _record_steam_request) — через
+    эту функцию проходит КАЖДЫЙ запрос к Steam, так что журнал полон по
+    построению и не зависит от того, не забыл ли вызывающий код что-то учесть.
+    """
     global _last_request_at
     async with _request_lock:
         wait = MIN_REQUEST_INTERVAL - (time.monotonic() - _last_request_at)
         if wait > 0:
             await asyncio.sleep(wait)
         _last_request_at = time.monotonic()
+        _record_steam_request(scope)
 
 
 def steam_cookie_header() -> str:
@@ -367,13 +463,13 @@ async def fetch_all_listings(market_hash_name: str, max_listings: int | None = D
                 break
             steam_url = render_url(market_hash_name, start)
             final_url, params = _build_request(steam_url)
-            await throttle_steam_request()
+            await throttle_steam_request(scope="listings")
             async with session.get(final_url, params=params, headers=_with_cookie(_ajax_headers(market_hash_name))) as resp:
                 if resp.status == 429:
                     # НЕ ретраим: у Steam 429 — это временный бан IP, который
                     # продлевается каждой новой попыткой. Ставим глобальный
                     # кулдаун и сразу выходим, чтобы не закапываться глубже.
-                    seconds = await note_steam_429()
+                    seconds = await note_steam_429(scope="listings", headers=dict(resp.headers))
                     raise SteamRateLimited(
                         f"Steam ответил 429 (Too Many Requests) — это временный бан IP, "
                         f"который продлевается от новых попыток, поэтому не ретраю. "
