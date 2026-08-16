@@ -54,22 +54,25 @@ def _read_varint(data: bytes, pos: int) -> tuple[int, int]:
         shift += 7
 
 
-def _decode_varint_fields(payload: bytes, wanted: set[int]) -> dict[int, int]:
+def _decode_varint_fields(payload: bytes) -> tuple[dict[int, int], set[int]]:
     """
-    Проходит по protobuf-сообщению и достаёт только нужные varint-поля,
-    корректно ПРОПУСКАЯ остальные (в т.ч. length-delimited вроде stickers) —
-    иначе после первого же неизвестного поля разбор поедет вбок.
+    Проходит по protobuf-сообщению и достаёт varint-поля, корректно ПРОПУСКАЯ
+    остальные (в т.ч. length-delimited вроде stickers) — иначе после первого же
+    неизвестного поля разбор поедет вбок.
+    Возвращает (varint-поля, номера ВСЕХ встреченных полей) — второе нужно для
+    проверок валидности payload'а (см. _has_inspect_payload / _is_masked_payload).
     """
     fields: dict[int, int] = {}
+    present: set[int] = set()
     pos = 0
     while pos < len(payload):
         tag, pos = _read_varint(payload, pos)
         field_number = tag >> 3
         wire_type = tag & 0x7
+        present.add(field_number)
         if wire_type == 0:  # varint
             value, pos = _read_varint(payload, pos)
-            if field_number in wanted:
-                fields[field_number] = value
+            fields[field_number] = value
         elif wire_type == 1:  # 64-bit fixed
             pos += 8
         elif wire_type == 2:  # length-delimited (строки, вложенные сообщения, repeated)
@@ -79,7 +82,35 @@ def _decode_varint_fields(payload: bytes, wanted: set[int]) -> dict[int, int]:
             pos += 4
         else:
             raise InspectDecodeError(f"неизвестный wire type {wire_type}")
-    return fields
+        if pos > len(payload):
+            raise InspectDecodeError("поле выходит за границы payload'а")
+    return fields, present
+
+
+# Проверки "похоже ли это на осмысленный payload" — ровно как в эталоне
+# (hasDecodedInspectPayload / isDecodedMaskedInspectPayload). Нужны потому,
+# что masked-формат контрольной суммой не проверяется, и единственный способ
+# убедиться, что мы сняли маску правильным ключом — увидеть осмысленные поля.
+_FIELD_ITEMID = 2
+_FIELD_INVENTORY = 13
+_FIELD_ORIGIN = 14
+_FIELD_STICKERS = 12
+_FIELD_KEYCHAINS = 20
+_FIELD_VARIATIONS = 22
+
+
+def _has_inspect_payload(present: set[int]) -> bool:
+    return bool(present & {
+        _FIELD_ITEMID, _FIELD_DEFINDEX, _FIELD_PAINTINDEX, _FIELD_PAINTSEED,
+        _FIELD_STICKERS, _FIELD_KEYCHAINS, _FIELD_VARIATIONS,
+    })
+
+
+def _is_masked_payload(present: set[int]) -> bool:
+    return {
+        _FIELD_ITEMID, _FIELD_DEFINDEX, _FIELD_PAINTINDEX,
+        _FIELD_INVENTORY, _FIELD_ORIGIN,
+    } <= present
 
 
 def _checksum(payload: bytes) -> int:
@@ -99,26 +130,37 @@ def _xor_mask(buffer: bytes, key: int) -> bytes:
 
 
 def _decode_wrapped(buffer: bytes) -> dict[int, int]:
+    """Формат с ведущим нулевым байтом — здесь контрольная сумма ЕСТЬ и проверяется."""
     if len(buffer) < 5 or buffer[0] != 0:
         raise InspectDecodeError("не 'wrapped' формат")
     payload = buffer[1:-4]
     expected_checksum = struct.unpack(">I", buffer[-4:])[0]
     if _checksum(payload) != expected_checksum:
         raise InspectDecodeError("контрольная сумма не сошлась")
-    return _decode_varint_fields(payload, {_FIELD_DEFINDEX, _FIELD_PAINTINDEX, _FIELD_PAINTWEAR, _FIELD_PAINTSEED})
+    fields, present = _decode_varint_fields(payload)
+    if not _has_inspect_payload(present):
+        raise InspectDecodeError("payload разобрался, но в нём нет ожидаемых полей предмета")
+    return fields
 
 
 def _decode_masked(buffer: bytes) -> dict[int, int]:
+    """
+    Формат с XOR-маской (ключ = первый байт). ВАЖНО: контрольная сумма здесь
+    НЕ проверяется — эталонная реализация CSFloat её тоже не проверяет, и это
+    не случайность: раньше я добавил сюда проверку "по аналогии" с wrapped, и
+    она отсекала АБСОЛЮТНО ВСЕ реальные ссылки со Steam (в логах — decode_error
+    на всех 25 из 25). Вместо суммы корректность снятия маски подтверждается
+    тем, что payload разобрался и в нём есть осмысленный набор полей.
+    """
     if len(buffer) < 5:
         raise InspectDecodeError("буфер слишком короткий")
     unmasked = _xor_mask(buffer, buffer[0])
     if unmasked[0] != 0:
         raise InspectDecodeError("не 'masked' формат")
-    payload = unmasked[1:-4]
-    expected_checksum = struct.unpack(">I", unmasked[-4:])[0]
-    if _checksum(payload) != expected_checksum:
-        raise InspectDecodeError("контрольная сумма не сошлась (masked)")
-    return _decode_varint_fields(payload, {_FIELD_DEFINDEX, _FIELD_PAINTINDEX, _FIELD_PAINTWEAR, _FIELD_PAINTSEED})
+    fields, present = _decode_varint_fields(unmasked[1:-4])
+    if not _is_masked_payload(present):
+        raise InspectDecodeError("payload разобрался, но набор полей не похож на masked-предмет")
+    return fields
 
 
 def decode_hex(hex_str: str) -> dict:
@@ -136,7 +178,9 @@ def decode_hex(hex_str: str) -> dict:
         fields = _decode_masked(buffer)
 
     if _FIELD_PAINTWEAR not in fields:
-        raise InspectDecodeError("в сообщении нет поля paintwear")
+        # Предмет разобрался, но флоата у него нет (бывает у предметов без
+        # износа — кейсы, наклейки, брелоки). Это не ошибка разбора.
+        raise InspectDecodeError("у предмета нет поля paintwear (предмет без износа)")
 
     return {
         "floatvalue": _bytes_to_float(fields[_FIELD_PAINTWEAR]),
@@ -167,15 +211,17 @@ def decode_inspect_link(link: str) -> tuple[dict | None, str]:
 
     Возвращает (данные, причина):
       ({'floatvalue':..., 'defindex':..., 'paintindex':..., 'paintseed':...}, "ok")
-      (None, "no_link")      — ссылки нет вообще
-      (None, "legacy_link")  — старый формат (S/A/D/M-параметры, без hex-блока):
-                               флоат в самой ссылке не записан, локально взять
-                               его неоткуда, нужен Steam GC или сторонний сервис
-      (None, "decode_error") — hex-блок есть, но раскодировать не вышло
+      (None, "no_link")           — ссылки нет вообще
+      (None, "legacy_link")       — старый формат (S/A/D/M-параметры, без hex-блока):
+                                    флоат в самой ссылке не записан, локально взять
+                                    его неоткуда, нужен Steam GC или сторонний сервис
+      (None, "decode_error: ...") — hex-блок есть, но раскодировать не вышло;
+                                    после двоеточия — конкретная причина
 
-    Причину возвращаем отдельно, чтобы вызывающий код мог честно отличить
-    "нечего декодировать" от "декодер сломан" — раньше оба случая молча
-    сливались в None и диагностика вводила в заблуждение.
+    Причину возвращаем отдельно и с подробностью, чтобы вызывающий код мог
+    честно отличить "нечего декодировать" от "декодер сломан" и показать в
+    логе, ЧТО именно не сошлось — раньше оба случая молча сливались в None
+    и диагностика вводила в заблуждение.
     """
     if not link:
         return None, "no_link"
@@ -186,5 +232,5 @@ def decode_inspect_link(link: str) -> tuple[dict | None, str]:
 
     try:
         return decode_hex(match.group(1)), "ok"
-    except InspectDecodeError:
-        return None, "decode_error"
+    except InspectDecodeError as e:
+        return None, f"decode_error: {e}"
