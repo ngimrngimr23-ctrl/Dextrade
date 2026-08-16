@@ -67,6 +67,8 @@ from storage import (
     set_price_filter,
     get_float_filter,
     set_float_filter,
+    get_float_markup,
+    set_float_markup,
     get_watchlist,
     set_watchlist,
     get_watch_paused,
@@ -367,6 +369,7 @@ async def _compute_offers(chat_id: int, listings, min_value: float, max_markup: 
     streak_markup = await get_streak_markup(chat_id)
     min_price, max_price = await get_price_filter(chat_id)
     float_low, float_high = await get_float_filter(chat_id)
+    float_markup = await get_float_markup(chat_id)
 
     # Флоат для ОХОТЫ (фильтр) считаем только когда фильтр задан — незачем
     # декодировать все лоты, если результат никому не нужен. А вот показать
@@ -376,7 +379,9 @@ async def _compute_offers(chat_id: int, listings, min_value: float, max_markup: 
     if float_low is not None and float_high is not None and listings:
         top_floats = _decode_floats(listings, limit=FLOAT_CHECK_TOP_N)
         if top_floats:
-            float_offers = find_float_offers(listings, top_floats, float_low, float_high)
+            float_offers = find_float_offers(
+                listings, top_floats, float_low, float_high, max_markup_pct=float_markup
+            )
 
     offers = find_offers(
         listings, sticker_prices, min_value, max_markup,
@@ -412,8 +417,10 @@ def _format_offers_chunks(offers, sticker_prices, market_hash_name: str | None) 
 
     for o in offers[:20]:
         if o.found_by_float:
-            # находка чисто по флоату — стикерная наценка тут не считалась вообще
-            block = f"${o.price:.2f} | 🔍 редкий флоат {o.float_value:.5f}"
+            # находка чисто по флоату — стикерная наценка тут не считалась вообще,
+            # markup_pct — это наценка над самым дешёвым лотом предмета (см. /setfloatmarkup)
+            markup_str = f" | наценка {o.markup_pct:.1f}%" if o.markup_pct != float("inf") else ""
+            block = f"${o.price:.2f} | 🔍 редкий флоат {o.float_value:.5f}{markup_str}"
             if o.stickers:
                 block += f"\n  <code>{html_module.escape(', '.join(o.stickers))}</code>"
         else:
@@ -669,6 +676,54 @@ async def setfloatfilter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await set_float_filter(chat_id, low, high)
     await update.message.reply_text(
         f"Ок, теперь ищу лоты с флоатом ≤{low:g} или ≥{high:g} среди всех лотов на предмет."
+    )
+
+
+async def setfloatmarkup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /setfloatmarkup        — показать текущий порог
+    /setfloatmarkup <макс%> — показывать флоат-находку, только если её цена не больше
+                              чем на макс% выше самого дешёвого лота этого предмета
+    /setfloatmarkup off    — без ограничения по цене (любая цена подходит)
+    Отсекает случаи, когда продавец и так знает о редком флоате и уже заложил
+    его в цену — оставляет только недооценённые находки. Требует /setfloatfilter.
+    """
+    chat_id = update.effective_chat.id
+    args = context.args
+
+    if not args:
+        pct = await get_float_markup(chat_id)
+        if pct is None:
+            await update.message.reply_text(
+                "Порог наценки для флоат-находок не задан — подходит любая цена.\n\n"
+                "Формат: /setfloatmarkup <макс%>\nПример: /setfloatmarkup 15 — показывать находку, "
+                "только если её цена не больше чем на 15% выше самого дешёвого лота этого предмета "
+                "(иначе продавец уже знает о редком флоате и заложил его в цену).\n"
+                "/setfloatmarkup off — убрать ограничение"
+            )
+        else:
+            await update.message.reply_text(f"Текущий порог наценки для флоат-находок: ≤{pct:g}%.")
+        return
+
+    if args[0].lower() == "off":
+        await set_float_markup(chat_id, None)
+        await update.message.reply_text("Ограничение по цене для флоат-находок убрано.")
+        return
+
+    try:
+        pct = float(args[0])
+    except ValueError:
+        await update.message.reply_text("Значение должно быть числом. Пример: /setfloatmarkup 15")
+        return
+
+    if pct < 0:
+        await update.message.reply_text("Наценка не может быть отрицательной.")
+        return
+
+    await set_float_markup(chat_id, pct)
+    await update.message.reply_text(
+        f"Ок, теперь флоат-находки показываются, только если их цена не больше чем на {pct:g}% "
+        f"выше самого дешёвого лота этого предмета."
     )
 
 
@@ -1277,7 +1332,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"(со стикерами); /setpricefilter off — убрать фильтр.\n"
         f"/setfloatfilter <низкий> <высокий> — искать лоты с редким флоатом (близко к 0 — топ "
         f"для Factory New, близко к 1 — топ для Battle-Scarred), не связано со стикерами; "
-        f"/setfloatfilter off — убрать фильтр."
+        f"/setfloatfilter off — убрать фильтр.\n"
+        f"/setfloatmarkup <макс%> — показывать флоат-находку, только если её цена не больше "
+        f"чем на макс% выше самого дешёвого лота этого предмета (иначе продавец уже в курсе "
+        f"и заложил редкость в цену); /setfloatmarkup off — без ограничения по цене."
     )
 
 
@@ -1296,6 +1354,7 @@ BOT_COMMANDS = [
     BotCommand("setstreakmarkup", "Наценка для стрик-лотов (4-5 одинаковых стикеров)"),
     BotCommand("setpricefilter", "Фильтр по итоговой цене лота"),
     BotCommand("setfloatfilter", "Искать лоты с редким флоатом"),
+    BotCommand("setfloatmarkup", "Макс. наценка для флоат-находок"),
     BotCommand("pricefile", "Загрузить свои цены на стикеры файлом"),
     BotCommand("clearprices", "Очистить загруженные цены на стикеры"),
 ]
@@ -1373,6 +1432,7 @@ def main():
     app.add_handler(CommandHandler("setstreakmarkup", setstreakmarkup))
     app.add_handler(CommandHandler("setpricefilter", setpricefilter))
     app.add_handler(CommandHandler("setfloatfilter", setfloatfilter))
+    app.add_handler(CommandHandler("setfloatmarkup", setfloatmarkup))
     app.add_handler(CommandHandler("pricefile", pricefile))
     app.add_handler(CommandHandler("clearprices", clearprices))
     app.add_handler(CommandHandler("watchadd", watchadd))

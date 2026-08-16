@@ -279,6 +279,21 @@ async def set_float_filter(chat_id: int, low_max: Optional[float], high_min: Opt
     await _save_chat_settings(chat_id, settings)
 
 
+async def get_float_markup(chat_id: int) -> Optional[float]:
+    """
+    Макс. наценка (%) над самым дешёвым лотом предмета, при которой флоат-находка
+    (см. get_float_filter) всё ещё считается недооценённой, а не просто дорогим
+    лотом с честной ценой за редкость. None — без ограничения по цене.
+    """
+    return (await _get_chat_settings(chat_id)).get("float_markup_pct")
+
+
+async def set_float_markup(chat_id: int, pct: Optional[float]) -> None:
+    settings = await _get_chat_settings(chat_id)
+    settings["float_markup_pct"] = pct
+    await _save_chat_settings(chat_id, settings)
+
+
 # ---------------------------------------------------------------------------
 # Вотчлист /watchadd: список предметов на автоскан по расписанию + интервал,
 # по chat_id. Тот же паттерн хранения (Upstash + локальный fallback), что и
