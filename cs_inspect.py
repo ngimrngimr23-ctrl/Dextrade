@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 import struct
+import urllib.parse
 import zlib
 
 # Поля CEconItemPreviewDataBlock, которые нас интересуют (varint, wire type 0).
@@ -145,23 +146,45 @@ def decode_hex(hex_str: str) -> dict:
     }
 
 
-def decode_inspect_link(link: str) -> dict | None:
+def _normalize_link(link: str) -> str:
     """
-    Пытается раскодировать inspect-ссылку ЛОКАЛЬНО, без единого сетевого
-    запроса. Возвращает {'floatvalue':..., 'defindex':..., 'paintindex':...,
-    'paintseed':...} либо None, если ссылка старого формата (S/A/D/M-параметры
-    без hex-блока) или повреждена — для таких вариантов флоат без похода
-    на Steam Game Coordinator или сторонний сервис не достать, этот модуль
-    таких запросов сознательно не делает.
+    В HTML от Steam пробел перед hex-блоком закодирован как %20, а иногда
+    ссылка приходит закодированной целиком — поэтому СНАЧАЛА раскодируем
+    проценты, и только потом ищем hex. Эталонная реализация CSFloat делает
+    ровно то же самое первым шагом (decodeURIComponentSafely); без этого
+    регулярка с \\s+ не совпадёт никогда и любая, даже валидная новая
+    ссылка будет молча выглядеть как "старый формат".
+    """
+    try:
+        return urllib.parse.unquote(link.strip())
+    except Exception:
+        return link.strip()
+
+
+def decode_inspect_link(link: str) -> tuple[dict | None, str]:
+    """
+    Пытается раскодировать inspect-ссылку ЛОКАЛЬНО, без единого сетевого запроса.
+
+    Возвращает (данные, причина):
+      ({'floatvalue':..., 'defindex':..., 'paintindex':..., 'paintseed':...}, "ok")
+      (None, "no_link")      — ссылки нет вообще
+      (None, "legacy_link")  — старый формат (S/A/D/M-параметры, без hex-блока):
+                               флоат в самой ссылке не записан, локально взять
+                               его неоткуда, нужен Steam GC или сторонний сервис
+      (None, "decode_error") — hex-блок есть, но раскодировать не вышло
+
+    Причину возвращаем отдельно, чтобы вызывающий код мог честно отличить
+    "нечего декодировать" от "декодер сломан" — раньше оба случая молча
+    сливались в None и диагностика вводила в заблуждение.
     """
     if not link:
-        return None
+        return None, "no_link"
 
-    match = _HEX_RE.search(link)
+    match = _HEX_RE.search(_normalize_link(link))
     if not match:
-        return None  # старый формат (S...A...D...) или что-то совсем другое
+        return None, "legacy_link"
 
     try:
-        return decode_hex(match.group(1))
+        return decode_hex(match.group(1)), "ok"
     except InspectDecodeError:
-        return None
+        return None, "decode_error"
