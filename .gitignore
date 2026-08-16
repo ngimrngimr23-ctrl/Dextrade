@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Локальные fallback-файлы хранилища (storage.py) — создаются на ходу, когда
+# Upstash не настроен или недоступен. Это состояние конкретного запуска,
+# в репозитории ему не место.
+sticker_prices_local.json
+chat_defaults_local.json
+watchlist_local.json
+sent_offers_local.json
+steam_cooldown_local.json
+
+# Кэши, которые бот скачивает/собирает сам при работе
+sticker_catalog_cache.json
+csgotrader_prices_cache.json
+manual_sticker_prices.json
+
+# ВАЖНО: sticker_overrides.json НЕ игнорируем — это курируемый вручную файл,
+# он отслеживается в репозитории.
