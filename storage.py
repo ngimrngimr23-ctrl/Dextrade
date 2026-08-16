@@ -262,6 +262,23 @@ async def set_price_filter(chat_id: int, min_price: Optional[float], max_price: 
     await _save_chat_settings(chat_id, settings)
 
 
+async def get_float_filter(chat_id: int) -> tuple[Optional[float], Optional[float]]:
+    """
+    (низкий_порог, высокий_порог) для охоты за редким флоатом — лот интересен,
+    если флоат <= низкий_порог (топ для FN) ИЛИ >= высокий_порог (топ для BS).
+    Оба None, если фильтр не задан (/setfloatfilter ещё не вызывали или выключен).
+    """
+    settings = await _get_chat_settings(chat_id)
+    return settings.get("float_low_max"), settings.get("float_high_min")
+
+
+async def set_float_filter(chat_id: int, low_max: Optional[float], high_min: Optional[float]) -> None:
+    settings = await _get_chat_settings(chat_id)
+    settings["float_low_max"] = low_max
+    settings["float_high_min"] = high_min
+    await _save_chat_settings(chat_id, settings)
+
+
 # ---------------------------------------------------------------------------
 # Вотчлист /watchadd: список предметов на автоскан по расписанию + интервал,
 # по chat_id. Тот же паттерн хранения (Upstash + локальный fallback), что и

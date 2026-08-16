@@ -22,6 +22,7 @@ class Offer:
     stickers: list[str]
     streak: int = 0  # длина самой длинной последовательности подряд одинаковых стикеров (0-5)
     inspect_link: str | None = None
+    good_float: float | None = None  # задан, если лот попал в подборку именно по флоату (не по стикерам)
 
 
 def _floor_price(listings: list[Listing]) -> float:
@@ -114,5 +115,49 @@ def find_offers(
             )
 
     offers.sort(key=lambda o: o.markup_pct)
+    return offers
+
+
+def find_float_offers(
+    listings: list[Listing],
+    listing_floats: dict[str, float],
+    float_low_max: float,
+    float_high_min: float,
+) -> list[Offer]:
+    """
+    Отдельная, не связанная со стикерами подборка — лот интересен, если его
+    флоат близко к 0 (топ для Factory New) ИЛИ близко к 1 (топ для
+    Battle-Scarred): float_low_max — верхняя граница "низкого" флоата,
+    float_high_min — нижняя граница "высокого". listing_floats — уже
+    раскодированные флоаты по inspect_link (декодируются локально в
+    cs_inspect.py, сюда приходят готовыми — этот модуль сети не касается).
+    Лоты без стикеров сюда тоже попадают — критерий чисто по флоату.
+    """
+    floor_price = _floor_price(listings)
+
+    offers = []
+    for listing in listings:
+        if not listing.inspect_link:
+            continue
+        float_value = listing_floats.get(listing.inspect_link)
+        if float_value is None:
+            continue
+        if not (float_value <= float_low_max or float_value >= float_high_min):
+            continue
+
+        offers.append(
+            Offer(
+                price=listing.price,
+                floor_price=floor_price,
+                overpay=listing.price - floor_price,
+                stickers_value=0.0,  # флоат-подборка цену стикеров не учитывает
+                markup_pct=0.0,
+                stickers=listing.stickers,
+                inspect_link=listing.inspect_link,
+                good_float=float_value,
+            )
+        )
+
+    offers.sort(key=lambda o: min(o.good_float, 1 - o.good_float))
     return offers
 

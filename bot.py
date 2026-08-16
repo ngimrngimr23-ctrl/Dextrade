@@ -55,7 +55,8 @@ from steam_client import (
 )
 from csgo_api import search_items as search_csgo_items
 from pricing import get_sticker_prices, ingest_manual_prices, clear_manual_prices, manual_prices_count
-from analyzer import find_offers, Offer, STREAK_THRESHOLD
+from analyzer import find_offers, find_float_offers, Offer, STREAK_THRESHOLD
+from cs_inspect import decode_inspect_link
 from prewarm import prewarm_loop
 from storage import (
     get_chat_defaults,
@@ -64,6 +65,8 @@ from storage import (
     set_streak_markup,
     get_price_filter,
     set_price_filter,
+    get_float_filter,
+    set_float_filter,
     get_watchlist,
     set_watchlist,
     get_watch_paused,
@@ -87,6 +90,13 @@ _file_sessions: dict[int, dict] = {}
 # обычного dict в памяти процесса.
 DEFAULT_MIN_VALUE = 5.0
 DEFAULT_MAX_MARKUP = 7.0
+
+# /setfloatfilter: сколько самых дешёвых лотов на предмет проверяем на флоат.
+# Steam всегда отдаёт лоты отсортированными от дешёвых к дорогим, так что
+# "недооценённый редкий флоат" (продавец не в курсе, что он особенный) скорее
+# всего среди дешёвых — проверять все 100 лотов на каждый предмет ради этого
+# смысла нет, а вот стоимость (лишние запросы) была бы ощутимой.
+FLOAT_CHECK_TOP_N = 25
 
 # Ожидание выбора варианта после неоднозначного поиска по названию (несколько
 # степеней износа и т.п.) — chat_id -> {"results": [...], "min_value":..., "max_markup":...}
@@ -308,6 +318,30 @@ async def handle_text_selection(update: Update, context: ContextTypes.DEFAULT_TY
         await _proceed_scanfile(update, market_hash_name, min_value, max_markup)
 
 
+def _decode_floats(listings: list) -> dict[str, float]:
+    """
+    Пытается раскодировать флоат ЛОКАЛЬНО (без единого сетевого запроса) для
+    первых FLOAT_CHECK_TOP_N лотов — см. cs_inspect.py. С марта 2026 часть
+    inspect-ссылок уже самодостаточна (флоат зашит в саму ссылку), часть ещё
+    старого формата — для тех вернётся None, просто пропускаем без похода
+    куда-либо. Логируем долю, чтобы видеть на реальных данных, сколько вообще
+    удаётся раскодировать (см. историю с угадыванием лимитов Steam — тут же
+    сразу меряем, а не гадаем).
+    """
+    to_check = [l for l in listings[:FLOAT_CHECK_TOP_N] if l.inspect_link]
+    result: dict[str, float] = {}
+    for listing in to_check:
+        info = decode_inspect_link(listing.inspect_link)
+        if info is not None:
+            result[listing.inspect_link] = info["floatvalue"]
+    if to_check:
+        log.info(
+            "cs_inspect: раскодировано локально %d из %d inspect-ссылок (остальные — старый формат ссылки)",
+            len(result), len(to_check),
+        )
+    return result
+
+
 async def _compute_offers(chat_id: int, listings, min_value: float, max_markup: float):
     """Общая логика для /scan, /scanfile и автоскана вотчлиста: цены стикеров -> офферы."""
     all_sticker_keys = {s for l in listings for s in l.stickers}
@@ -318,6 +352,13 @@ async def _compute_offers(chat_id: int, listings, min_value: float, max_markup: 
         listings, sticker_prices, min_value, max_markup,
         streak_max_markup_pct=streak_markup, min_price=min_price, max_price=max_price,
     )
+
+    float_low, float_high = await get_float_filter(chat_id)
+    if float_low is not None and float_high is not None and listings:
+        listing_floats = _decode_floats(listings)
+        if listing_floats:
+            offers = offers + find_float_offers(listings, listing_floats, float_low, float_high)
+
     return offers, sticker_prices
 
 
@@ -335,17 +376,23 @@ def _format_offers_chunks(offers, sticker_prices, market_hash_name: str | None) 
     lines = [header]
 
     for o in offers[:20]:
-        # все названия стикеров — в одном <code>, чтобы тап копировал их разом
-        # (как раньше); цены стикеров — отдельной строкой ниже, вне <code>
-        stickers_html = html_module.escape(", ".join(o.stickers))
-        prices_str = ", ".join(f"${sticker_prices.get(s, 0.0):.2f}" for s in o.stickers)
-        streak_tag = f" 🔥 стрик x{o.streak}" if o.streak >= STREAK_THRESHOLD else ""
-        block = (
-            f"${o.price:.2f} | переплата над голым скином ${o.overpay:.2f} | "
-            f"стикеры ≈${o.stickers_value:.2f} | наценка {o.markup_pct:.1f}%{streak_tag}\n"
-            f"  <code>{stickers_html}</code>\n"
-            f"  цены: {prices_str}"
-        )
+        if o.good_float is not None:
+            # находка чисто по флоату — стикерная наценка тут не считалась вообще
+            block = f"${o.price:.2f} | 🔍 редкий флоат {o.good_float:.5f}"
+            if o.stickers:
+                block += f"\n  <code>{html_module.escape(', '.join(o.stickers))}</code>"
+        else:
+            # все названия стикеров — в одном <code>, чтобы тап копировал их разом
+            # (как раньше); цены стикеров — отдельной строкой ниже, вне <code>
+            stickers_html = html_module.escape(", ".join(o.stickers))
+            prices_str = ", ".join(f"${sticker_prices.get(s, 0.0):.2f}" for s in o.stickers)
+            streak_tag = f" 🔥 стрик x{o.streak}" if o.streak >= STREAK_THRESHOLD else ""
+            block = (
+                f"${o.price:.2f} | переплата над голым скином ${o.overpay:.2f} | "
+                f"стикеры ≈${o.stickers_value:.2f} | наценка {o.markup_pct:.1f}%{streak_tag}\n"
+                f"  <code>{stickers_html}</code>\n"
+                f"  цены: {prices_str}"
+            )
         if o.inspect_link:
             block += f'\n  <a href="{html_module.escape(o.inspect_link)}">Инспект этого лота</a>'
         lines.append(block)
@@ -526,6 +573,66 @@ async def setpricefilter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Ок, теперь показываются офферы с итоговой ценой лота (со стикерами) "
         f"от ${min_price:.2f} до ${max_price:.2f}."
+    )
+
+
+async def setfloatfilter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /setfloatfilter                    — показать текущий фильтр флоата
+    /setfloatfilter <низкий> <высокий> — искать лоты с флоатом ≤низкий (топ для FN) или ≥высокий (топ для BS)
+    /setfloatfilter off                — убрать фильтр
+    Не связано со стикерами — отдельная находка, попадает в ту же подборку с пометкой 🔍.
+    """
+    chat_id = update.effective_chat.id
+    args = context.args
+
+    if not args:
+        low, high = await get_float_filter(chat_id)
+        if low is None or high is None:
+            await update.message.reply_text(
+                "Фильтр флоата не задан — флоат не проверяется вообще (лишних запросов не тратим).\n\n"
+                "Формат: /setfloatfilter <низкий> <высокий>\nПример: /setfloatfilter 0.01 0.99 "
+                "(поймает почти идеальный Factory New и предельно убитый Battle-Scarred)\n"
+                f"Проверяются первые {FLOAT_CHECK_TOP_N} самых дешёвых лотов на предмет — там, где "
+                "недооценённый редкий флоат вероятнее всего.\n"
+                "/setfloatfilter off — убрать фильтр"
+            )
+        else:
+            await update.message.reply_text(
+                f"Текущий фильтр флоата: ≤{low:g} (топ для FN) или ≥{high:g} (топ для BS), "
+                f"среди первых {FLOAT_CHECK_TOP_N} самых дешёвых лотов на предмет."
+            )
+        return
+
+    if args[0].lower() == "off":
+        await set_float_filter(chat_id, None, None)
+        await update.message.reply_text("Фильтр флоата убран.")
+        return
+
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Нужны оба значения. Формат: /setfloatfilter <низкий> <высокий>, или /setfloatfilter off"
+        )
+        return
+
+    try:
+        low = float(args[0])
+        high = float(args[1])
+    except ValueError:
+        await update.message.reply_text("Оба значения должны быть числами от 0 до 1. Пример: /setfloatfilter 0.01 0.99")
+        return
+
+    if not (0.0 <= low <= 1.0 and 0.0 <= high <= 1.0):
+        await update.message.reply_text("Флоат — число от 0 до 1.")
+        return
+    if low >= high:
+        await update.message.reply_text("Низкий порог должен быть меньше высокого.")
+        return
+
+    await set_float_filter(chat_id, low, high)
+    await update.message.reply_text(
+        f"Ок, теперь ищу лоты с флоатом ≤{low:g} или ≥{high:g} "
+        f"среди первых {FLOAT_CHECK_TOP_N} самых дешёвых лотов на предмет."
     )
 
 
@@ -1131,7 +1238,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/setstreakmarkup <%> — отдельный порог наценки для лотов с {STREAK_THRESHOLD}+ "
         f"подряд одинаковыми стикерами (\"стрик\").\n"
         f"/setpricefilter <мин$> <макс$> — показывать только лоты в этом диапазоне цены "
-        f"(со стикерами); /setpricefilter off — убрать фильтр."
+        f"(со стикерами); /setpricefilter off — убрать фильтр.\n"
+        f"/setfloatfilter <низкий> <высокий> — искать лоты с редким флоатом (близко к 0 — топ "
+        f"для Factory New, близко к 1 — топ для Battle-Scarred), не связано со стикерами; "
+        f"/setfloatfilter off — убрать фильтр."
     )
 
 
@@ -1149,6 +1259,7 @@ BOT_COMMANDS = [
     BotCommand("setdefaults", "Настроить мин. стоимость стикеров и наценку"),
     BotCommand("setstreakmarkup", "Наценка для стрик-лотов (4-5 одинаковых стикеров)"),
     BotCommand("setpricefilter", "Фильтр по итоговой цене лота"),
+    BotCommand("setfloatfilter", "Искать лоты с редким флоатом"),
     BotCommand("pricefile", "Загрузить свои цены на стикеры файлом"),
     BotCommand("clearprices", "Очистить загруженные цены на стикеры"),
 ]
@@ -1225,6 +1336,7 @@ def main():
     app.add_handler(CommandHandler("setdefaults", setdefaults))
     app.add_handler(CommandHandler("setstreakmarkup", setstreakmarkup))
     app.add_handler(CommandHandler("setpricefilter", setpricefilter))
+    app.add_handler(CommandHandler("setfloatfilter", setfloatfilter))
     app.add_handler(CommandHandler("pricefile", pricefile))
     app.add_handler(CommandHandler("clearprices", clearprices))
     app.add_handler(CommandHandler("watchadd", watchadd))
