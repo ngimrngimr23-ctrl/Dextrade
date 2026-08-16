@@ -133,6 +133,7 @@ def find_float_offers(
     listing_floats: dict[str, float],
     float_low_max: float,
     float_high_min: float,
+    max_markup_pct: float | None = None,
 ) -> list[Offer]:
     """
     Отдельная, не связанная со стикерами подборка — лот интересен, если его
@@ -142,6 +143,11 @@ def find_float_offers(
     раскодированные флоаты по inspect_link (декодируются локально в
     cs_inspect.py, сюда приходят готовыми — этот модуль сети не касается).
     Лоты без стикеров сюда тоже попадают — критерий чисто по флоату.
+
+    max_markup_pct: насколько цена лота может быть выше самого дешёвого лота
+    этого предмета (floor_price), чтобы находка всё ещё считалась "недооценённой"
+    редким флоатом, а не просто дорогим лотом, который продавец и так продаёт
+    по honest-цене за редкость. None — без ограничения по цене (как раньше).
     """
     floor_price = _floor_price(listings)
 
@@ -155,13 +161,22 @@ def find_float_offers(
         if not (float_value <= float_low_max or float_value >= float_high_min):
             continue
 
+        overpay = listing.price - floor_price
+        # markup_pct = на сколько % цена лота выше самого дешёвого лота этого
+        # предмета — та же идея, что и наценка по стикерам (overpay/floor_price
+        # вместо overpay/stickers_value, потому что у флоата нет своей "цены",
+        # с которой можно сравнить переплату).
+        markup_pct = (overpay / floor_price) * 100 if floor_price else float("inf")
+        if max_markup_pct is not None and markup_pct > max_markup_pct:
+            continue
+
         offers.append(
             Offer(
                 price=listing.price,
                 floor_price=floor_price,
-                overpay=listing.price - floor_price,
+                overpay=overpay,
                 stickers_value=0.0,  # флоат-подборка цену стикеров не учитывает
-                markup_pct=0.0,
+                markup_pct=markup_pct,
                 stickers=listing.stickers,
                 inspect_link=listing.inspect_link,
                 float_value=float_value,
