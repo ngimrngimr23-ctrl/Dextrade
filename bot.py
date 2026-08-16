@@ -318,27 +318,45 @@ async def handle_text_selection(update: Update, context: ContextTypes.DEFAULT_TY
         await _proceed_scanfile(update, market_hash_name, min_value, max_markup)
 
 
-def _decode_floats(listings: list) -> dict[str, float]:
+def _decode_floats(listings: list, limit: int | None = None) -> dict[str, float]:
     """
-    Пытается раскодировать флоат ЛОКАЛЬНО (без единого сетевого запроса) для
-    первых FLOAT_CHECK_TOP_N лотов — см. cs_inspect.py. С марта 2026 часть
-    inspect-ссылок уже самодостаточна (флоат зашит в саму ссылку), часть ещё
-    старого формата — для тех вернётся None, просто пропускаем без похода
-    куда-либо. Логируем долю, чтобы видеть на реальных данных, сколько вообще
-    удаётся раскодировать (см. историю с угадыванием лимитов Steam — тут же
-    сразу меряем, а не гадаем).
+    Пытается раскодировать флоат ЛОКАЛЬНО (без единого сетевого запроса) —
+    см. cs_inspect.py. С марта 2026 часть inspect-ссылок самодостаточна (флоат
+    зашит в саму ссылку), часть ещё старого формата — для тех локально взять
+    флоат неоткуда, просто пропускаем без похода куда-либо.
+    limit=None — по всем переданным лотам (для уже отобранных офферов их
+    единицы), иначе — только по первым limit самым дешёвым.
+
+    Диагностика различает "нечего декодировать" (старый формат) и "декодер
+    не справился" — раньше оба случая сливались в одно сообщение, из-за чего
+    баг в самом декодере (пропущенное URL-декодирование) выглядел как
+    "у Steam старый формат ссылок". Урок тот же, что с лимитами Steam:
+    логировать факты, а не свою интерпретацию.
     """
-    to_check = [l for l in listings[:FLOAT_CHECK_TOP_N] if l.inspect_link]
+    candidates = listings if limit is None else listings[:limit]
+    to_check = [l for l in candidates if l.inspect_link]
+    if not to_check:
+        return {}
+
     result: dict[str, float] = {}
+    reasons: dict[str, int] = {}
+    sample_legacy = None
     for listing in to_check:
-        info = decode_inspect_link(listing.inspect_link)
+        info, reason = decode_inspect_link(listing.inspect_link)
+        reasons[reason] = reasons.get(reason, 0) + 1
         if info is not None:
             result[listing.inspect_link] = info["floatvalue"]
-    if to_check:
-        log.info(
-            "cs_inspect: раскодировано локально %d из %d inspect-ссылок (остальные — старый формат ссылки)",
-            len(result), len(to_check),
-        )
+        elif reason == "legacy_link" and sample_legacy is None:
+            sample_legacy = listing.inspect_link[:120]
+
+    log.info(
+        "cs_inspect: раскодировано %d из %d inspect-ссылок (по причинам: %s)",
+        len(result), len(to_check), reasons,
+    )
+    if sample_legacy and not result:
+        # ни одной не раскодировали — показываем образец, чтобы в следующем
+        # прогоне сразу было видно, в каком виде реально приходят ссылки
+        log.info("cs_inspect: пример нераспознанной ссылки: %s", sample_legacy)
     return result
 
 
@@ -348,18 +366,35 @@ async def _compute_offers(chat_id: int, listings, min_value: float, max_markup: 
     sticker_prices = await get_sticker_prices(all_sticker_keys) if all_sticker_keys else {}
     streak_markup = await get_streak_markup(chat_id)
     min_price, max_price = await get_price_filter(chat_id)
+    float_low, float_high = await get_float_filter(chat_id)
+
+    # Флоат для ОХОТЫ (фильтр) считаем только когда фильтр задан — там нужны
+    # первые FLOAT_CHECK_TOP_N самых дешёвых лотов. А вот показать флоат на
+    # уже отобранных по стикерам офферах можно всегда: декодирование локальное,
+    # сетевых запросов не делает, и офферов обычно единицы.
+    float_offers = []
+    if float_low is not None and float_high is not None and listings:
+        top_floats = _decode_floats(listings, limit=FLOAT_CHECK_TOP_N)
+        if top_floats:
+            float_offers = find_float_offers(listings, top_floats, float_low, float_high)
+
     offers = find_offers(
         listings, sticker_prices, min_value, max_markup,
         streak_max_markup_pct=streak_markup, min_price=min_price, max_price=max_price,
     )
+    if offers:
+        matched_links = {o.inspect_link for o in offers if o.inspect_link}
+        sticker_floats = _decode_floats([l for l in listings if l.inspect_link in matched_links])
+        for offer in offers:
+            if offer.inspect_link:
+                offer.float_value = sticker_floats.get(offer.inspect_link)
 
-    float_low, float_high = await get_float_filter(chat_id)
-    if float_low is not None and float_high is not None and listings:
-        listing_floats = _decode_floats(listings)
-        if listing_floats:
-            offers = offers + find_float_offers(listings, listing_floats, float_low, float_high)
+    # Лот мог подойти сразу по обоим критериям — показываем его один раз,
+    # как стикерный оффер (там больше данных, и флоат теперь тоже виден).
+    seen_links = {o.inspect_link for o in offers if o.inspect_link}
+    float_offers = [o for o in float_offers if o.inspect_link not in seen_links]
 
-    return offers, sticker_prices
+    return offers + float_offers, sticker_prices
 
 
 def _format_offers_chunks(offers, sticker_prices, market_hash_name: str | None) -> list[str]:
@@ -376,9 +411,9 @@ def _format_offers_chunks(offers, sticker_prices, market_hash_name: str | None) 
     lines = [header]
 
     for o in offers[:20]:
-        if o.good_float is not None:
+        if o.found_by_float:
             # находка чисто по флоату — стикерная наценка тут не считалась вообще
-            block = f"${o.price:.2f} | 🔍 редкий флоат {o.good_float:.5f}"
+            block = f"${o.price:.2f} | 🔍 редкий флоат {o.float_value:.5f}"
             if o.stickers:
                 block += f"\n  <code>{html_module.escape(', '.join(o.stickers))}</code>"
         else:
@@ -387,9 +422,11 @@ def _format_offers_chunks(offers, sticker_prices, market_hash_name: str | None) 
             stickers_html = html_module.escape(", ".join(o.stickers))
             prices_str = ", ".join(f"${sticker_prices.get(s, 0.0):.2f}" for s in o.stickers)
             streak_tag = f" 🔥 стрик x{o.streak}" if o.streak >= STREAK_THRESHOLD else ""
+            # флоат показываем справочно, если удалось раскодировать локально
+            float_tag = f" | флоат {o.float_value:.5f}" if o.float_value is not None else ""
             block = (
                 f"${o.price:.2f} | переплата над голым скином ${o.overpay:.2f} | "
-                f"стикеры ≈${o.stickers_value:.2f} | наценка {o.markup_pct:.1f}%{streak_tag}\n"
+                f"стикеры ≈${o.stickers_value:.2f} | наценка {o.markup_pct:.1f}%{streak_tag}{float_tag}\n"
                 f"  <code>{stickers_html}</code>\n"
                 f"  цены: {prices_str}"
             )

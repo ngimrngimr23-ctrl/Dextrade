@@ -22,7 +22,12 @@ class Offer:
     stickers: list[str]
     streak: int = 0  # длина самой длинной последовательности подряд одинаковых стикеров (0-5)
     inspect_link: str | None = None
-    good_float: float | None = None  # задан, если лот попал в подборку именно по флоату (не по стикерам)
+    # Флоат лота, если его удалось раскодировать локально из inspect-ссылки
+    # (см. cs_inspect.py). Показывается справочно на ЛЮБОМ оффере — декодирование
+    # бесплатное, сетевых запросов не требует.
+    float_value: float | None = None
+    # True, если лот попал в подборку ИМЕННО из-за редкого флоата, а не по стикерам.
+    found_by_float: bool = False
 
 
 def _floor_price(listings: list[Listing]) -> float:
@@ -60,6 +65,7 @@ def find_offers(
     streak_max_markup_pct: float | None = None,
     min_price: float | None = None,
     max_price: float | None = None,
+    listing_floats: dict[str, float] | None = None,
 ) -> list[Offer]:
     """
     streak_max_markup_pct: отдельный порог наценки для "стрик"-лотов (от
@@ -67,7 +73,10 @@ def find_offers(
     задан, для таких лотов действует обычный max_markup_pct, как для всех.
     min_price/max_price: фильтр по итоговой цене лота (с учётом стикеров),
     любой из них можно не задавать (None = без ограничения с этой стороны).
+    listing_floats: раскодированные флоаты по inspect_link — на отбор НЕ влияют,
+    подставляются в оффер справочно, чтобы показать флоат в сообщении.
     """
+    listing_floats = listing_floats or {}
     floor_price = _floor_price(listings)
 
     offers = []
@@ -111,6 +120,7 @@ def find_offers(
                     stickers=listing.stickers,
                     streak=streak,
                     inspect_link=listing.inspect_link,
+                    float_value=listing_floats.get(listing.inspect_link) if listing.inspect_link else None,
                 )
             )
 
@@ -154,10 +164,12 @@ def find_float_offers(
                 markup_pct=0.0,
                 stickers=listing.stickers,
                 inspect_link=listing.inspect_link,
-                good_float=float_value,
+                float_value=float_value,
+                found_by_float=True,
             )
         )
 
-    offers.sort(key=lambda o: min(o.good_float, 1 - o.good_float))
+    # самые "экстремальные" (ближе к 0 или к 1) — наверх
+    offers.sort(key=lambda o: min(o.float_value, 1 - o.float_value))
     return offers
 
