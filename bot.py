@@ -340,23 +340,24 @@ def _decode_floats(listings: list, limit: int | None = None) -> dict[str, float]
 
     result: dict[str, float] = {}
     reasons: dict[str, int] = {}
-    sample_legacy = None
+    sample_failed = None
     for listing in to_check:
         info, reason = decode_inspect_link(listing.inspect_link)
         reasons[reason] = reasons.get(reason, 0) + 1
         if info is not None:
             result[listing.inspect_link] = info["floatvalue"]
-        elif reason == "legacy_link" and sample_legacy is None:
-            sample_legacy = listing.inspect_link[:120]
+        elif sample_failed is None:
+            # образец берём с ЛЮБОЙ неудачи, не только legacy — в прошлый раз
+            # выборка только по legacy оставила нас без данных ровно тогда,
+            # когда они были нужнее всего (все ошибки были decode_error)
+            sample_failed = listing.inspect_link[:160]
 
     log.info(
         "cs_inspect: раскодировано %d из %d inspect-ссылок (по причинам: %s)",
         len(result), len(to_check), reasons,
     )
-    if sample_legacy and not result:
-        # ни одной не раскодировали — показываем образец, чтобы в следующем
-        # прогоне сразу было видно, в каком виде реально приходят ссылки
-        log.info("cs_inspect: пример нераспознанной ссылки: %s", sample_legacy)
+    if sample_failed and not result:
+        log.info("cs_inspect: пример нераспознанной ссылки: %s", sample_failed)
     return result
 
 
