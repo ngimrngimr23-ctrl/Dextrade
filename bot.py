@@ -71,6 +71,8 @@ from storage import (
     set_float_markup,
     get_watchlist,
     set_watchlist,
+    get_float_watchlist,
+    set_float_watchlist,
     get_watch_paused,
     set_watch_paused,
     all_watchlist_chat_ids,
@@ -362,8 +364,24 @@ def _decode_floats(listings: list, limit: int | None = None) -> dict[str, float]
     return result
 
 
-async def _compute_offers(chat_id: int, listings, min_value: float, max_markup: float):
-    """Общая логика для /scan, /scanfile и автоскана вотчлиста: цены стикеров -> офферы."""
+async def _compute_offers(
+    chat_id: int,
+    listings,
+    min_value: float,
+    max_markup: float,
+    *,
+    check_stickers: bool = True,
+    check_floats: bool = True,
+):
+    """
+    Общая логика для /scan, /scanfile и автоскана вотчлиста: цены стикеров -> офферы.
+
+    check_stickers / check_floats — что именно искать в этом предмете. Автоскан
+    держит два независимых списка (обычный вотчлист /watchadd и список под охоту
+    за флоатом /floatadd), поэтому для конкретного предмета может быть нужно
+    только одно из двух. Ручные /scan и /scanfile считают всё — там пользователь
+    сам назвал предмет, значит интересно и то, и другое.
+    """
     all_sticker_keys = {s for l in listings for s in l.stickers}
     sticker_prices = await get_sticker_prices(all_sticker_keys) if all_sticker_keys else {}
     streak_markup = await get_streak_markup(chat_id)
@@ -371,22 +389,25 @@ async def _compute_offers(chat_id: int, listings, min_value: float, max_markup: 
     float_low, float_high = await get_float_filter(chat_id)
     float_markup = await get_float_markup(chat_id)
 
-    # Флоат для ОХОТЫ (фильтр) считаем только когда фильтр задан — незачем
-    # декодировать все лоты, если результат никому не нужен. А вот показать
-    # флоат на уже отобранных по стикерам офферах можно всегда: декодирование
-    # локальное, сетевых запросов не делает, и офферов обычно единицы.
+    # Флоат для ОХОТЫ (фильтр) считаем только когда фильтр задан и предмет за
+    # этим следит — незачем декодировать все лоты, если результат никому не
+    # нужен. А вот показать флоат на уже отобранных по стикерам офферах можно
+    # всегда: декодирование локальное, сетевых запросов не делает, и офферов
+    # обычно единицы.
     float_offers = []
-    if float_low is not None and float_high is not None and listings:
+    if check_floats and float_low is not None and float_high is not None and listings:
         top_floats = _decode_floats(listings, limit=FLOAT_CHECK_TOP_N)
         if top_floats:
             float_offers = find_float_offers(
                 listings, top_floats, float_low, float_high, max_markup_pct=float_markup
             )
 
-    offers = find_offers(
-        listings, sticker_prices, min_value, max_markup,
-        streak_max_markup_pct=streak_markup, min_price=min_price, max_price=max_price,
-    )
+    offers = []
+    if check_stickers:
+        offers = find_offers(
+            listings, sticker_prices, min_value, max_markup,
+            streak_max_markup_pct=streak_markup, min_price=min_price, max_price=max_price,
+        )
     if offers:
         matched_links = {o.inspect_link for o in offers if o.inspect_link}
         sticker_floats = _decode_floats([l for l in listings if l.inspect_link in matched_links])
@@ -933,6 +954,155 @@ async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+# --- Отдельный список под охоту за редким флоатом (/floatadd) ---------------
+# Намеренно не смешан с обычным вотчлистом: флоат имеет смысл искать на
+# конкретных скинах, а не гонять по всему списку. Предмет может быть и там,
+# и там — тогда в прогоне он тянется из Steam один раз и проверяется по обоим
+# критериям сразу (см. _run_watchlist_scan).
+
+async def floatadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /floatadd <предмет1>, <предмет2>, ... — добавить предметы в список охоты за
+    редким флоатом. Формат тот же, что у /watchadd: ссылка или название через
+    запятую, последним элементом можно задать степень износа для всего списка.
+    """
+    chat_id = update.effective_chat.id
+    if not context.args:
+        low, high = await get_float_filter(chat_id)
+        hint = (
+            "\n\n⚠️ Порог флоата пока не задан — без него охота не идёт. "
+            "Задай: /setfloatfilter 0.01 0.99"
+            if low is None or high is None else ""
+        )
+        await update.message.reply_text(
+            "Формат: /floatadd <предмет1>, <предмет2>, ...\n"
+            "Можно ссылку или название (на английском), через запятую для нескольких сразу.\n"
+            "Пример: /floatadd AK-47 | Redline (Field-Tested)\n\n"
+            "Степень износа можно указать один раз последним элементом (FN/MW/FT/WW/BS):\n"
+            "/floatadd AK-47 | Redline, AWP | Asiimov, Factory New\n\n"
+            "Это ОТДЕЛЬНЫЙ список от /watchadd — флоат ищется только по нему." + hint
+        )
+        return
+
+    parts = [p.strip() for p in " ".join(context.args).split(",") if p.strip()]
+
+    global_wear = None
+    if len(parts) > 1 and parts[-1].lower() in _WEAR_ALIASES:
+        global_wear = _WEAR_ALIASES[parts[-1].lower()]
+        parts = parts[:-1]
+
+    current = await get_float_watchlist(chat_id)
+
+    added, warnings, skipped = [], [], []
+    for part in parts:
+        if global_wear and "(" not in part:
+            part = f"{part} ({global_wear})"
+        names, warning = await _resolve_for_watchlist(part)
+        if not names:
+            skipped.append(warning)
+            continue
+        if warning:
+            warnings.append(warning)
+        for name in names:
+            if name in current:
+                skipped.append(f"«{name}»: уже в списке флоата")
+                continue
+            current.append(name)
+            added.append(name)
+
+    await set_float_watchlist(chat_id, current)
+    if context.application.job_queue and not context.application.job_queue.get_jobs_by_name(f"{WATCHLIST_JOB_PREFIX}{chat_id}"):
+        _schedule_watchlist_job(context.application.job_queue, chat_id, await _get_watch_interval(chat_id))
+
+    lines = []
+    if global_wear:
+        lines.append(f"Степень износа «{global_wear}» применена ко всем предметам списка без своей степени.")
+    if added:
+        lines.append("Добавлено в охоту за флоатом:\n" + "\n".join(f"• {a}" for a in added))
+    if warnings:
+        lines.append("Уточни, если не то:\n" + "\n".join(f"• {w}" for w in warnings))
+    if skipped:
+        lines.append("Пропущено:\n" + "\n".join(f"• {s}" for s in skipped))
+
+    low, high = await get_float_filter(chat_id)
+    if low is None or high is None:
+        lines.append("⚠️ Порог флоата не задан — охота не пойдёт. Задай: /setfloatfilter 0.01 0.99")
+    lines.append(f"Всего в списке флоата: {len(current)}.")
+    await update.message.reply_text("\n\n".join(lines))
+
+
+async def floatdel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/floatdel <номер из /floatlist или точное название> — убрать предмет из списка флоата."""
+    chat_id = update.effective_chat.id
+    current = await get_float_watchlist(chat_id)
+
+    if not context.args:
+        await update.message.reply_text(
+            "Формат: /floatdel <номер из /floatlist или точное название>\nПример: /floatdel 2"
+        )
+        return
+    if not current:
+        await update.message.reply_text("Список флоата пуст.")
+        return
+
+    arg = " ".join(context.args).strip()
+    if arg.isdigit():
+        idx = int(arg) - 1
+        if not (0 <= idx < len(current)):
+            await update.message.reply_text(f"Номер должен быть от 1 до {len(current)}.")
+            return
+        removed = current.pop(idx)
+    else:
+        match = next((x for x in current if x.lower() == arg.lower()), None)
+        if match is None:
+            await update.message.reply_text(f"«{arg}» не найден. Точное название смотри в /floatlist.")
+            return
+        current.remove(match)
+        removed = match
+
+    await set_float_watchlist(chat_id, current)
+    await update.message.reply_text(f"Удалено из охоты за флоатом: {removed}\nОсталось: {len(current)}.")
+
+
+async def floatclear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/floatclear — полностью очистить список охоты за флоатом."""
+    chat_id = update.effective_chat.id
+    current = await get_float_watchlist(chat_id)
+    if not current:
+        await update.message.reply_text("Список флоата уже пуст.")
+        return
+
+    await set_float_watchlist(chat_id, [])
+    await update.message.reply_text(f"Список флоата очищен — удалено {len(current)} предмет(ов).")
+
+
+async def floatlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/floatlist — показать список предметов, по которым ищется редкий флоат."""
+    chat_id = update.effective_chat.id
+    items = await get_float_watchlist(chat_id)
+    low, high = await get_float_filter(chat_id)
+    markup = await get_float_markup(chat_id)
+
+    if not items:
+        await update.message.reply_text(
+            "Список охоты за флоатом пуст — флоат сейчас не ищется ни по одному предмету.\n"
+            "Добавить: /floatadd <предмет>"
+        )
+        return
+
+    if low is None or high is None:
+        threshold = "⚠️ порог не задан (/setfloatfilter 0.01 0.99) — охота не идёт"
+    else:
+        threshold = f"флоат ≤{low:g} или ≥{high:g}"
+        if markup is not None:
+            threshold += f", наценка ≤{markup:g}%"
+
+    lines = [f"🔍 Охота за флоатом ({len(items)}), условие: {threshold}"]
+    for i, name in enumerate(items, start=1):
+        lines.append(f"{i}. {name}")
+    await update.message.reply_text("\n".join(lines))
+
+
 def _offer_key(market_hash_name: str, offer: Offer) -> str:
     """
     Стабильный ключ конкретного лота — по inspect-ссылке (уникальна для
@@ -944,10 +1114,15 @@ def _offer_key(market_hash_name: str, offer: Offer) -> str:
     return hashlib.sha1(basis.encode("utf-8")).hexdigest()
 
 
-async def _watchlist_scan_item(bot, chat_id: int, market_hash_name: str, min_value: float, max_markup: float) -> bool:
+async def _watchlist_scan_item(
+    bot, chat_id: int, market_hash_name: str, min_value: float, max_markup: float,
+    *, check_stickers: bool = True, check_floats: bool = True,
+) -> bool:
     """
     Возвращает True, если нашлись НОВЫЕ офферы (не присылавшиеся этому чату
     за последние 5 часов) и сообщение реально ушло в чат.
+    check_stickers/check_floats — что искать: предмет мог попасть в прогон из
+    обычного вотчлиста, из списка охоты за флоатом, или сразу из обоих.
     SteamRateLimited пробрасывается наверх — прогон должен остановиться целиком,
     а не продолжать долбить Steam остальными предметами во время бана.
     """
@@ -959,7 +1134,10 @@ async def _watchlist_scan_item(bot, chat_id: int, market_hash_name: str, min_val
         log.warning("watchlist: %s (chat_id=%s): %s", market_hash_name, chat_id, e)
         return False
 
-    offers, sticker_prices = await _compute_offers(chat_id, listings, min_value, max_markup)
+    offers, sticker_prices = await _compute_offers(
+        chat_id, listings, min_value, max_markup,
+        check_stickers=check_stickers, check_floats=check_floats,
+    )
     if not offers:
         return False  # автоскан молчит, если нечего показать — иначе спамил бы каждый тик
 
@@ -989,17 +1167,30 @@ async def _run_watchlist_scan(bot, chat_id: int) -> bool | None:
         log.info("watchlist: прогон для chat_id=%s уже идёт, пропускаю повторный запуск", chat_id)
         return None
 
-    items = await get_watchlist(chat_id)
-    if not items:
+    sticker_items = await get_watchlist(chat_id)
+    float_items = await get_float_watchlist(chat_id)
+    if not sticker_items and not float_items:
         return None
+
+    # Два независимых списка, но прогон один: предмет, попавший в оба, тянем из
+    # Steam ОДИН раз и проверяем сразу по обоим критериям — иначе платили бы
+    # двумя запросами за одни и те же лоты. Порядок: сначала обычный вотчлист,
+    # затем предметы, которые нужны только под флоат.
+    float_set = set(float_items)
+    scan_plan = [(name, True, name in float_set) for name in sticker_items]
+    sticker_set = set(sticker_items)
+    scan_plan += [(name, False, True) for name in float_items if name not in sticker_set]
 
     _watchlist_running.add(chat_id)
     try:
         min_value, max_markup = await _get_defaults(chat_id)
         found_any = False
-        for market_hash_name in items:
+        for market_hash_name, check_stickers, check_floats in scan_plan:
             try:
-                found = await _watchlist_scan_item(bot, chat_id, market_hash_name, min_value, max_markup)
+                found = await _watchlist_scan_item(
+                    bot, chat_id, market_hash_name, min_value, max_markup,
+                    check_stickers=check_stickers, check_floats=check_floats,
+                )
             except SteamRateLimited as e:
                 # Влетели в рейт-лимит Steam. Останавливаем весь прогон: каждая
                 # следующая попытка во время бана только продлевает его.
@@ -1069,9 +1260,14 @@ async def watchresume(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/scanall — сканировать весь вотчлист прямо сейчас, не дожидаясь расписания."""
     chat_id = update.effective_chat.id
-    items = await get_watchlist(chat_id)
+    sticker_items = await get_watchlist(chat_id)
+    float_items = await get_float_watchlist(chat_id)
+    items = set(sticker_items) | set(float_items)
     if not items:
-        await update.message.reply_text("Вотчлист пуст. Добавь предметы: /watchadd <предмет1>, <предмет2>, ...")
+        await update.message.reply_text(
+            "Оба списка пусты. Добавь предметы: /watchadd <предмет1>, <предмет2>, ... "
+            "(охота по стикерам) или /floatadd <предмет> (охота за флоатом)."
+        )
         return
     if chat_id in _watchlist_running:
         await update.message.reply_text("Скан вотчлиста уже идёт, дождись его окончания.")
@@ -1322,8 +1518,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "после конца предыдущего (сам прогон списка уже безопасно троттлится по времени, так что "
         "отдельно ждать дольше для больших списков не нужно); бот пришлёт сообщение, только если "
         "найдёт новые офферы (один и тот же лот повторно не пришлёт в течение 5 часов).\n"
-        "/scanall — сканировать весь вотчлист прямо сейчас, не дожидаясь расписания.\n"
+        "/scanall — сканировать оба списка прямо сейчас, не дожидаясь расписания.\n"
         "/watchpause — остановить автоскан (список сохраняется), /watchresume — возобновить.\n\n"
+        "🔍 Охота за редким флоатом идёт по ОТДЕЛЬНОМУ списку — флоат имеет смысл искать на "
+        "конкретных скинах, а не по всему вотчлисту:\n"
+        "/floatadd <предмет1>, <предмет2>, ... — добавить предметы в охоту за флоатом\n"
+        "/floatdel <номер или название> — убрать, /floatclear — очистить весь список\n"
+        "/floatlist — показать список и текущее условие отбора\n"
+        "(предмет может быть в обоих списках — тогда за прогон он тянется из Steam один раз "
+        "и проверяется сразу по обоим критериям)\n\n"
         f"/setdefaults <мин$> <макс%> — поменять значения по умолчанию "
         f"(сейчас: {def_min:.0f}$ / {def_max:.0f}%).\n"
         f"/setstreakmarkup <%> — отдельный порог наценки для лотов с {STREAK_THRESHOLD}+ "
@@ -1346,6 +1549,10 @@ BOT_COMMANDS = [
     BotCommand("watchadd", "Добавить предмет(ы) в вотчлист"),
     BotCommand("watchdel", "Убрать предмет из вотчлиста"),
     BotCommand("watchclear", "Полностью очистить вотчлист"),
+    BotCommand("floatadd", "Добавить предмет в охоту за флоатом"),
+    BotCommand("floatlist", "Показать список охоты за флоатом"),
+    BotCommand("floatdel", "Убрать предмет из охоты за флоатом"),
+    BotCommand("floatclear", "Очистить список охоты за флоатом"),
     BotCommand("watchlist", "Показать вотчлист и интервал автоскана"),
     BotCommand("watchpause", "Остановить автоскан вотчлиста"),
     BotCommand("watchresume", "Возобновить автоскан вотчлиста"),
@@ -1376,8 +1583,8 @@ async def _on_startup(app: Application):
     chat_ids = await all_watchlist_chat_ids()
     restored = 0
     for chat_id in chat_ids:
-        items = await get_watchlist(chat_id)
-        if not items:
+        # джоба нужна, если непуст хоть один из списков — обычный или флоатовый
+        if not await get_watchlist(chat_id) and not await get_float_watchlist(chat_id):
             continue
         if await get_watch_paused(chat_id):
             # /watchpause переживает редеплой: не воскрешаем джобу для чата,
@@ -1438,6 +1645,10 @@ def main():
     app.add_handler(CommandHandler("watchadd", watchadd))
     app.add_handler(CommandHandler("watchdel", watchdel))
     app.add_handler(CommandHandler("watchclear", watchclear))
+    app.add_handler(CommandHandler("floatadd", floatadd))
+    app.add_handler(CommandHandler("floatdel", floatdel))
+    app.add_handler(CommandHandler("floatlist", floatlist_cmd))
+    app.add_handler(CommandHandler("floatclear", floatclear))
     app.add_handler(CommandHandler("watchlist", watchlist_cmd))
     app.add_handler(CommandHandler("watchpause", watchpause))
     app.add_handler(CommandHandler("watchresume", watchresume))

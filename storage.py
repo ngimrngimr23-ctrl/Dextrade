@@ -328,8 +328,15 @@ async def _get_watchlist_entry(chat_id: int) -> dict:
     return _local_watchlist_load().get(str(chat_id), {})
 
 
-async def _save_watchlist_entry(chat_id: int, items: list[str], paused: bool = False) -> None:
-    entry = {"items": items, "paused": paused}
+async def _save_watchlist_entry(chat_id: int, **updates) -> None:
+    """
+    Обновляет только переданные поля записи, остальные сохраняет как были.
+    Раньше запись собиралась заново из фиксированного набора полей, и каждое
+    новое поле приходилось протаскивать через все вызовы — легко было случайно
+    затереть соседнее. Теперь достаточно передать то, что меняется.
+    """
+    entry = await _get_watchlist_entry(chat_id)
+    entry.update(updates)
     value = json.dumps(entry, ensure_ascii=False)
 
     if REDIS_ENABLED:
@@ -346,13 +353,25 @@ async def _save_watchlist_entry(chat_id: int, items: list[str], paused: bool = F
 
 
 async def get_watchlist(chat_id: int) -> list[str]:
-    """Список предметов (market_hash_name) в вотчлисте чата."""
+    """Список предметов (market_hash_name) в вотчлисте чата — охота по стикерам."""
     return (await _get_watchlist_entry(chat_id)).get("items", [])
 
 
 async def set_watchlist(chat_id: int, items: list[str]) -> None:
-    entry = await _get_watchlist_entry(chat_id)
-    await _save_watchlist_entry(chat_id, items, bool(entry.get("paused")))
+    await _save_watchlist_entry(chat_id, items=items)
+
+
+async def get_float_watchlist(chat_id: int) -> list[str]:
+    """
+    Отдельный список предметов под охоту за редким флоатом (/floatadd).
+    Намеренно не смешан с обычным вотчлистом: флоат интересен на конкретных
+    скинах, а гонять его по всему списку — лишняя работа и лишний шум.
+    """
+    return (await _get_watchlist_entry(chat_id)).get("float_items", [])
+
+
+async def set_float_watchlist(chat_id: int, items: list[str]) -> None:
+    await _save_watchlist_entry(chat_id, float_items=items)
 
 
 async def get_watch_paused(chat_id: int) -> bool:
@@ -361,9 +380,7 @@ async def get_watch_paused(chat_id: int) -> bool:
 
 
 async def set_watch_paused(chat_id: int, paused: bool) -> None:
-    entry = await _get_watchlist_entry(chat_id)
-    entry["paused"] = paused
-    await _save_watchlist_entry(chat_id, entry.get("items", []), paused)
+    await _save_watchlist_entry(chat_id, paused=paused)
 
 
 async def all_watchlist_chat_ids() -> list[int]:
