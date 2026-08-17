@@ -1230,27 +1230,41 @@ async def watchlist_scan_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def watchpause(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/watchpause — остановить автоскан вотчлиста (список при этом сохраняется)."""
+    """
+    /watchpause — остановить автоскан по расписанию (оба списка — обычный
+    вотчлист и охота за флоатом — сохраняются и не трогаются, они делят одну
+    и ту же джобу).
+    """
     chat_id = update.effective_chat.id
     await set_watch_paused(chat_id, True)
     for job in context.application.job_queue.get_jobs_by_name(f"{WATCHLIST_JOB_PREFIX}{chat_id}"):
         job.schedule_removal()
-    items = await get_watchlist(chat_id)
+    sticker_items = await get_watchlist(chat_id)
+    float_items = await get_float_watchlist(chat_id)
     await update.message.reply_text(
-        f"⏸ Автоскан вотчлиста остановлен. Список ({len(items)} шт.) сохранён — "
-        f"его можно смотреть /watchlist и чистить /watchdel.\n"
-        f"Возобновить: /watchresume. Разовый скан вручную по-прежнему работает: /scanall."
+        f"⏸ Автоскан остановлен: вотчлист ({len(sticker_items)} шт.) и охота за флоатом "
+        f"({len(float_items)} шт.) сохранены — их можно смотреть /watchlist, /floatlist и чистить "
+        f"/watchdel, /floatdel.\n"
+        f"Возобновить оба сразу: /watchresume. Разовый скан вручную по-прежнему работает: /scanall."
     )
 
 
 async def watchresume(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/watchresume — снова включить автоскан вотчлиста по расписанию."""
+    """
+    /watchresume — снова включить автоскан по расписанию. Одна джоба на чат
+    прогоняет ОБА списка (обычный вотчлист и охоту за флоатом) за один
+    проход — включаются и выключаются вместе, отдельной команды под флоат нет.
+    """
     chat_id = update.effective_chat.id
     await set_watch_paused(chat_id, False)
     interval = await _get_watch_interval(chat_id)
     _schedule_watchlist_job(context.application.job_queue, chat_id, interval)
-    items = await get_watchlist(chat_id)
-    text = f"▶️ Автоскан вотчлиста возобновлён: {len(items)} предмет(ов), пауза {interval:g} мин между прогонами."
+    sticker_items = await get_watchlist(chat_id)
+    float_items = await get_float_watchlist(chat_id)
+    text = (
+        f"▶️ Автоскан возобновлён: вотчлист ({len(sticker_items)} шт.) + охота за флоатом "
+        f"({len(float_items)} шт.), пауза {interval:g} мин между прогонами."
+    )
     cooldown = steam_cooldown_remaining()
     if cooldown > 0:
         text += f"\n\n⚠️ Но Steam сейчас на кулдауне после 429 — первые {cooldown / 60:.0f} мин прогоны будут пропускаться."
