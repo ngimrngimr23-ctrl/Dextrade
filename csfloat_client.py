@@ -43,8 +43,35 @@ CSFLOAT_BASE_URL = "https://csfloat.com/api/v1"
 MIN_REQUEST_INTERVAL = 1.5
 MAX_LIMIT = 50  # жёсткий потолок эндпоинта, больше он всё равно не отдаст
 
+# CSFloat стоит за Cloudflare, а запросы идут с датацентрового IP Render —
+# то есть мы и так в группе риска по антибот-защите. Урезанный "Mozilla/5.0"
+# в User-Agent (как было в первой версии) для неё явная подпись бота, поэтому
+# представляемся полноценным браузером и шлём тот же набор заголовков, что и
+# реальная вкладка. Это не обход защиты, а отказ от заведомо подозрительного
+# минимализма: запросы всё равно идут по документированному API со своим ключом.
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://csfloat.com",
+    "Referer": "https://csfloat.com/search",
+    "sec-ch-ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+}
+
 COOLDOWN_AFTER_429_SECONDS = 10 * 60
 COOLDOWN_MAX_SECONDS = 2 * 60 * 60
+# Пауза для 429 БЕЗ заголовков лимита — то есть похожего на антибот-блок, а не
+# на исчерпанную квоту. Короткая и не растущая: ожидание такую блокировку не
+# снимает, а длинный кулдаун только мешает проверить исправление запроса.
+SUSPECT_BLOCK_COOLDOWN_SECONDS = 2 * 60
 
 _COOLDOWN_SCOPE = "csfloat"
 
@@ -102,26 +129,48 @@ async def load_persisted_cooldown() -> None:
         )
 
 
-async def _note_429(retry_after: str | None, headers: dict) -> float:
+async def _note_429(retry_after: str | None, headers: dict, body: str = "") -> float:
     global _cooldown_until, _consecutive_429
 
-    _consecutive_429 += 1
-    seconds = min(
-        COOLDOWN_AFTER_429_SECONDS * (2 ** (_consecutive_429 - 1)), COOLDOWN_MAX_SECONDS
+    # Настоящий рейт-лимит всегда сообщает Retry-After или X-RateLimit-*.
+    # Если их нет — это, скорее всего, вовсе не квота, а антибот-защита
+    # (CSFloat стоит за Cloudflare, а мы стучимся с датацентрового IP Render).
+    has_limit_headers = any(
+        "ratelimit" in k.lower() or k.lower() == "retry-after" for k in headers
     )
-    # Если сервис прямым текстом сказал, сколько ждать — верим ему, а не своей формуле
-    if retry_after:
-        try:
-            seconds = max(seconds, float(retry_after))
-        except ValueError:
-            pass
+
+    if has_limit_headers:
+        # Реальная квота: имеет смысл ждать, и ждать всё дольше при повторах.
+        _consecutive_429 += 1
+        seconds = min(
+            COOLDOWN_AFTER_429_SECONDS * (2 ** (_consecutive_429 - 1)), COOLDOWN_MAX_SECONDS
+        )
+        if retry_after:  # сервис прямо сказал, сколько ждать — верим ему, а не формуле
+            try:
+                seconds = max(seconds, float(retry_after))
+            except ValueError:
+                pass
+        verdict = "похоже на реальную квоту"
+    else:
+        # Антибот-защита: ожидание НЕ помогает, лечится только изменением
+        # запроса (заголовки, IP). Поэтому короткая фиксированная пауза без
+        # нарастания — иначе бот сам себя запирает на часы из-за проблемы,
+        # которую время не решает, и проверить исправление невозможно.
+        seconds = SUSPECT_BLOCK_COOLDOWN_SECONDS
+        verdict = "заголовков лимита НЕТ — вероятно, антибот-защита, а не квота (ждать бесполезно)"
 
     _cooldown_until = max(_cooldown_until, time.time() + seconds)
     log.warning(
-        "CSFloat вернул 429 (%s-й подряд) — кулдаун на %.0f мин. Retry-After=%s, заголовки: %s",
-        _consecutive_429, seconds / 60, retry_after or "нет",
-        {k: v for k, v in headers.items() if "limit" in k.lower() or "retry" in k.lower()},
+        "CSFloat вернул 429 — пауза %.0f мин. Retry-After=%s. %s",
+        seconds / 60, retry_after or "нет", verdict,
     )
+    # Логируем ВСЕ заголовки и начало тела: в прошлый раз фильтр по словам
+    # limit/retry оставил нас с пустым {} ровно тогда, когда данные были нужнее
+    # всего. cf-ray/cf-mitigated/server сразу покажут, Cloudflare это или нет.
+    log.warning("CSFloat 429: все заголовки ответа: %s", dict(headers))
+    if body:
+        log.warning("CSFloat 429: начало тела ответа: %r", body[:400])
+
     await _persist_cooldown()
     return seconds
 
@@ -260,10 +309,15 @@ async def fetch_listings_page(
     await _throttle()
     url = f"{CSFLOAT_BASE_URL}/listings"
     async with session.get(
-        url, params=params, headers={"Authorization": CSFLOAT_API_KEY}
+        url, params=params, headers={**_BROWSER_HEADERS, "Authorization": CSFLOAT_API_KEY}
     ) as resp:
         if resp.status == 429:
-            seconds = await _note_429(resp.headers.get("Retry-After"), dict(resp.headers))
+            body = ""
+            try:
+                body = await resp.text()
+            except Exception:
+                pass
+            seconds = await _note_429(resp.headers.get("Retry-After"), dict(resp.headers), body)
             raise CSFloatRateLimited(
                 f"CSFloat ответил 429 — запросы приостановлены на {seconds / 60:.0f} мин."
             )
@@ -325,7 +379,7 @@ async def fetch_market(
     cursor = None
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=30),
-        headers={"User-Agent": "Mozilla/5.0"},
+        headers=_BROWSER_HEADERS,
     ) as session:
         for page in range(pages):
             listings, cursor = await fetch_listings_page(
