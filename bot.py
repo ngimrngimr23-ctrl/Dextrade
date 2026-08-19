@@ -37,7 +37,7 @@ import re
 import subprocess
 import tempfile
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -2086,8 +2086,50 @@ async def _on_startup(app: Application):
         log.info("arb: восстановлены джобы арбитража для %d чат(ов)", arb_restored)
 
 
+# ---------------------------------------------------------------------------
+# Приём апдейтов: webhook вместо long-polling
+# ---------------------------------------------------------------------------
+# Зачем: Render делает zero-downtime деплой — поднимает новый контейнер и лишь
+# потом гасит старый. Telegram же допускает только ОДНОГО читателя getUpdates
+# на токен, поэтому в окне пересечения оба контейнера дерутся за апдейты, и
+# проигравший падает с "Conflict: terminated by other getUpdates request".
+# В логах это повторялось на каждом релизе. Webhook снимает проблему на корню:
+# инициатива у Telegram, драться не за что.
+#
+# Почему не Application.run_webhook: его tornado-сервер регистрирует ровно один
+# обработчик — POST на путь вебхука. Любой GET (в т.ч. "/") получит 404, то
+# есть health-check, которым UptimeRobot не даёт бесплатному сервису заснуть,
+# просто исчезнет. Поэтому апдейты принимает наш собственный HTTP-сервер,
+# который и так слушает $PORT ради health-check.
+#
+# WEBHOOK_BASE_URL пуст (по умолчанию) — работаем на long-polling, как раньше.
+# Это и способ отката: снял переменную, передеплоил, вернулся к polling —
+# PTB при старте polling всегда сам зовёт delete_webhook, так что подвисшая
+# подписка не помешает.
+WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "").rstrip("/")
+# Секрет в заголовке X-Telegram-Bot-Api-Secret-Token: Telegram шлёт его с
+# каждым апдейтом, и это единственный способ отличить настоящий апдейт от
+# чужого POST'а на наш URL. Необязателен, но без него мы верим кому угодно.
+TG_WEBHOOK_SECRET = os.environ.get("TG_WEBHOOK_SECRET", "").strip()
+
+# Путь вебхука не угадать со стороны, но и токен в URL не светим (он попадал бы
+# в логи Render и в заголовки Referer): берём необратимый хэш от токена.
+def _webhook_path(token: str) -> str:
+    return "tg/" + hashlib.sha256(token.encode()).hexdigest()[:32]
+
+
+# Заполняются перед стартом приёма апдейтов; до этого момента webhook отвечает
+# 503 — сервер слушает порт раньше, чем поднимается Application.
+_tg_application = None
+_tg_loop: asyncio.AbstractEventLoop | None = None
+_tg_webhook_path = ""
+
+
 class _HealthHandler(BaseHTTPRequestHandler):
-    """Отвечает 200 OK на любой GET — этого достаточно UptimeRobot'у, чтобы считать сервис живым."""
+    """
+    Health-check (GET/HEAD на что угодно) плюс приём апдейтов Telegram
+    (POST на _tg_webhook_path), если включён режим webhook.
+    """
 
     def do_GET(self):
         self.send_response(200)
@@ -2100,6 +2142,49 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
 
+    def do_POST(self):
+        if not _tg_webhook_path or self.path.lstrip("/") != _tg_webhook_path:
+            self._reply(404, b"not found")
+            return
+        if TG_WEBHOOK_SECRET and self.headers.get(
+            "X-Telegram-Bot-Api-Secret-Token"
+        ) != TG_WEBHOOK_SECRET:
+            log.warning("webhook: POST с неверным секретом, игнорирую")
+            self._reply(403, b"forbidden")
+            return
+        if _tg_application is None or _tg_loop is None:
+            self._reply(503, b"not ready")
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            update = Update.de_json(payload, _tg_application.bot)
+        except Exception:
+            log.exception("webhook: не смог разобрать апдейт")
+            self._reply(400, b"bad request")
+            return
+
+        # HTTP-сервер живёт в отдельном потоке, а очередь апдейтов — в
+        # asyncio-цикле бота, поэтому кладём через run_coroutine_threadsafe.
+        # Отвечаем Telegram сразу, не дожидаясь обработки: он ретраит по
+        # таймауту, а обработка предмета может занять минуты.
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _tg_application.update_queue.put(update), _tg_loop
+            )
+        except Exception:
+            log.exception("webhook: не смог поставить апдейт в очередь")
+            self._reply(500, b"error")
+            return
+        self._reply(200, b"ok")
+
+    def _reply(self, code: int, body: bytes):
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, format, *args):
         pass  # не засоряем логи health-чеками от UptimeRobot
 
@@ -2108,13 +2193,54 @@ def _start_health_server():
     """
     Render (Web Service) ждёт, что процесс слушает $PORT — без этого он решит,
     что деплой не удался, и будет перезапускать контейнер. Плюс сюда же будет
-    стучаться UptimeRobot, чтобы бесплатный сервис не засыпал по бездействию.
+    стучаться UptimeRobot, чтобы бесплатный сервис не засыпал по бездействию,
+    и (в режиме webhook) сам Telegram с апдейтами.
     Работает в отдельном потоке, чтобы не мешать asyncio-циклу python-telegram-bot.
+
+    ThreadingHTTPServer, а не HTTPServer: обычный обрабатывает запросы строго
+    по одному, и тогда health-check от UptimeRobot вставал бы в очередь за
+    апдейтами Telegram (и наоборот). Для health-check это означало бы ложное
+    "сервис не отвечает".
     """
     port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     log.info("health-check сервер слушает порт %d", port)
+
+
+async def _run_with_webhook(app, token: str) -> None:
+    """
+    Приём апдейтов через webhook: Telegram сам шлёт их на наш HTTPS-адрес.
+    Application ведём вручную (initialize/start), потому что апдейты в очередь
+    кладёт наш HTTP-сервер, а не Updater — см. комментарий у WEBHOOK_BASE_URL.
+    """
+    global _tg_application, _tg_loop, _tg_webhook_path
+
+    url = f"{WEBHOOK_BASE_URL}/{_webhook_path(token)}"
+    await app.initialize()  # здесь же отрабатывает post_init (_on_startup)
+    await app.start()
+
+    # Публикуем состояние для HTTP-потока только после старта Application:
+    # до этого POST'ы должны получать 503, а не падать на полуготовом объекте.
+    _tg_application, _tg_loop = app, asyncio.get_running_loop()
+    _tg_webhook_path = _webhook_path(token)
+
+    await app.bot.set_webhook(
+        url=url,
+        secret_token=TG_WEBHOOK_SECRET or None,
+        allowed_updates=Update.ALL_TYPES,
+    )
+    log.info(
+        "Режим webhook: апдейты принимаются на %s (секрет %s)",
+        url, "задан" if TG_WEBHOOK_SECRET else "НЕ задан — стоит задать TG_WEBHOOK_SECRET",
+    )
+
+    try:
+        await asyncio.Event().wait()  # работаем, пока процесс не погасят
+    finally:
+        _tg_application = None
+        await app.stop()
+        await app.shutdown()
 
 
 def main():
@@ -2150,7 +2276,15 @@ def main():
     app.add_handler(CommandHandler("arbreset", arbreset))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_selection))
-    app.run_polling()
+
+    if WEBHOOK_BASE_URL:
+        asyncio.run(_run_with_webhook(app, token))
+    else:
+        # Long-polling — прежнее поведение и путь отката. PTB при старте
+        # polling сам зовёт delete_webhook, так что снять WEBHOOK_BASE_URL и
+        # передеплоить достаточно, чтобы вернуться сюда без ручной уборки.
+        log.info("Режим long-polling (WEBHOOK_BASE_URL не задан)")
+        app.run_polling()
 
 
 if __name__ == "__main__":
