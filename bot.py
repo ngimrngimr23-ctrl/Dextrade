@@ -1379,6 +1379,25 @@ async def arb_scan_job(context: ContextTypes.DEFAULT_TYPE):
         await _run_arb_scan(context.bot, chat_id)
     except CSFloatRateLimited as e:
         log.warning("arb: chat_id=%s рейт-лимит CSFloat: %s", chat_id, e)
+        if e.is_ip_block:
+            # Это не квота и не разовый челлендж — CSFloat блокирует IP Render
+            # как VPN, время это не лечит. Ретраи бот всё равно продолжит (вдруг
+            # IP сменится или блок снимут), но раз в SENT_OFFER_TTL_SECONDS
+            # честно предупреждаем в чате, а не молчим про то, что арбитраж не работает.
+            notice_key = "arb_ip_block_notice"
+            if not await was_offer_sent_recently(chat_id, notice_key):
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "⚠️ Арбитраж CSFloat приостановлен: CSFloat блокирует IP-адрес "
+                        "сервера (Render) как VPN и просит «отключить VPN или сменить сеть». "
+                        "Это не временная квота — ожиданием не лечится. Бот продолжит "
+                        f"пробовать раз в {csfloat_client.IP_BLOCK_COOLDOWN_SECONDS // 3600} ч "
+                        "на случай, если IP сменится или блокировку снимут, но пока CSFloat "
+                        "с этого сервера недоступен."
+                    ),
+                )
+                await mark_offer_sent(chat_id, notice_key)
     except CSFloatError as e:
         log.warning("arb: chat_id=%s ошибка CSFloat: %s", chat_id, e)
         await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Арбитраж: {e}")
@@ -1632,7 +1651,14 @@ async def arbnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         sent = await _run_arb_scan(context.bot, chat_id)
     except CSFloatRateLimited as e:
-        await update.message.reply_text(f"⏸ {e}")
+        if e.is_ip_block:
+            await update.message.reply_text(
+                f"⏸ {e}\nПричина — CSFloat блокирует IP сервера как VPN "
+                "(«disable your VPN or try a different network»). Это не квота, "
+                "ожиданием не лечится."
+            )
+        else:
+            await update.message.reply_text(f"⏸ {e}")
         return
     except CSFloatError as e:
         await update.message.reply_text(f"⚠️ {e}")
