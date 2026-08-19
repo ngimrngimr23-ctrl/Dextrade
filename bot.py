@@ -40,6 +40,7 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import aiohttp
 from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -55,7 +56,13 @@ from steam_client import (
     load_persisted_cooldown,
 )
 from csgo_api import search_items as search_csgo_items
-from pricing import get_sticker_prices, ingest_manual_prices, clear_manual_prices, manual_prices_count
+from pricing import (
+    get_sticker_prices,
+    ingest_manual_prices,
+    clear_manual_prices,
+    manual_prices_count,
+    get_csgotrader_prices,
+)
 from analyzer import (
     find_offers, find_float_offers, find_arbitrage_offers,
     Offer, STREAK_THRESHOLD, STEAM_FEE_MULTIPLIER,
@@ -1309,7 +1316,9 @@ def _format_arb_chunks(offers) -> list[str]:
     """Сообщения по арбитражным находкам, разбитые под лимит Telegram."""
     lines = [
         f"💱 CSFloat дешевле Steam — найдено {len(offers)}\n"
-        f"<i>«Чистыми» = сколько останется, если перепродать в Steam по текущей цене, "
+        f"<i>Цена Steam — медиана продаж за сутки из прайс-листа, а не текущая "
+        f"нижняя цена в стакане: проверяй лот перед покупкой. "
+        f"«Чистыми» = сколько останется при перепродаже в Steam по этой цене, "
         f"за вычетом комиссии Steam ~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%. "
         f"Помни: выручка в Steam приходит на кошелёк и не выводится.</i>"
     ]
@@ -1345,6 +1354,50 @@ def _format_arb_chunks(offers) -> list[str]:
     return _chunk_lines(lines, sep="\n\n")
 
 
+async def _fill_steam_prices(listings) -> int:
+    """
+    Проставить лотам цену Steam из прайс-листа csgotrader.app.
+
+    Зачем: модуль CSFloat писался в расчёте на то, что площадка сама кладёт
+    цену Steam в каждый лот (item.scm.price), и весь арбитраж считался из
+    одного ответа. 2026-08-19 выяснилось, что ключа scm в ответе больше нет
+    вообще — ни у одного лота из 50. Отбор при этом молча выбрасывал всё
+    подряд («сравнивать не с чем»), и снаружи это выглядело как слишком
+    строгий порог: ноль находок при любых настройках.
+
+    Зависеть от чужого необязательного поля тут больше незачем. Прайс-лист
+    csgotrader.app бот и так качает для цен стикеров — это статический файл на
+    CDN со ВСЕМ каталогом CS2 по market_hash_name, без ключа, лимита и бана по
+    IP. Он же переживёт следующее изменение формата у CSFloat.
+
+    Оговорка про смысл числа: там медиана продаж Steam за последние сутки, а не
+    текущая нижняя цена в стакане. Для «дешевле рынка» это даже устойчивее
+    (разовый выброс не сдвинет), но точной ценой продажи считать нельзя.
+    """
+    missing = [l for l in listings if l.steam_price is None]
+    if not missing:
+        return 0
+
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+        prices = await get_csgotrader_prices(session)
+    if not prices:
+        log.warning("arb: прайс-лист csgotrader пуст — цену Steam подставить нечем")
+        return 0
+
+    filled = 0
+    for l in missing:
+        price = prices.get(l.market_hash_name)
+        if price:
+            l.steam_price = price
+            filled += 1
+
+    log.info(
+        "arb: цена Steam подставлена из csgotrader для %d из %d лотов без неё",
+        filled, len(missing),
+    )
+    return filled
+
+
 async def _run_arb_scan(bot, chat_id: int) -> int | None:
     """
     Один прогон арбитража. Возвращает число отправленных находок, либо None,
@@ -1371,6 +1424,7 @@ async def _run_arb_scan(bot, chat_id: int) -> int | None:
             min_price=settings["min_price"],
             max_price=settings["max_price"],
         )
+        await _fill_steam_prices(listings)
         offers = find_arbitrage_offers(
             listings,
             min_discount_pct=settings["min_discount"],

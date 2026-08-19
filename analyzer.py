@@ -264,7 +264,13 @@ def find_arbitrage_offers(
     # этом мы и застряли: порог 0.1% пропускает всё, что дешевле Steam хоть на
     # копейку, то есть ноль офферов из двух сотен лотов означал не строгий
     # отбор, а поломку в данных — но отличить это по логам было нельзя.
-    dropped = {"нет цены Steam": 0, "цена вне диапазона": 0, "мало продаж": 0, "скидка ниже порога": 0}
+    dropped = {
+        "нет цены Steam": 0,
+        "цена вне диапазона": 0,
+        "мало продаж": 0,
+        "объём неизвестен (не отсеян)": 0,
+        "скидка ниже порога": 0,
+    }
     best_discount: float | None = None
 
     for l in listings:
@@ -277,7 +283,15 @@ def find_arbitrage_offers(
         if max_price is not None and l.price > max_price:
             dropped["цена вне диапазона"] += 1
             continue
-        if min_steam_volume is not None and (l.steam_volume or 0) < min_steam_volume:
+        # Неизвестный объём продаж больше НЕ считается нулевым. Он приезжал из
+        # того же item.scm, что и цена Steam, и вместе с ним пропал — а прежнее
+        # (l.steam_volume or 0) превращало "не знаем" в "ноль продаж" и с
+        # заданным min_volume выбрасывало вообще всё, ровно тем же молчаливым
+        # способом, что и пропавшая цена. Неизвестное не отсеиваем, но считаем
+        # отдельно, чтобы это было видно в логе, а не выглядело как пустой рынок.
+        if min_steam_volume is not None and l.steam_volume is None:
+            dropped["объём неизвестен (не отсеян)"] += 1
+        elif min_steam_volume is not None and l.steam_volume < min_steam_volume:
             dropped["мало продаж"] += 1
             continue
 
