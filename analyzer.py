@@ -4,10 +4,12 @@
 N% наценки сверху".
 """
 
+import logging
 from dataclasses import dataclass
 
 from steam_client import Listing
 
+log = logging.getLogger("steam_bot.analyzer")
 
 STREAK_THRESHOLD = 4  # от скольки подряд идущих одинаковых стикеров считаем это "стриком"
 
@@ -257,18 +259,31 @@ def find_arbitrage_offers(
     продаётся пару раз в месяц, чаще всего бумажная — выйти из него не выйдет.
     """
     offers: list[ArbOffer] = []
+    # Счётчики отсева. Без них «просмотрено 200 лотов, подошло 0» не отвечает
+    # на единственный важный вопрос — какое условие всё выбросило. Ровно на
+    # этом мы и застряли: порог 0.1% пропускает всё, что дешевле Steam хоть на
+    # копейку, то есть ноль офферов из двух сотен лотов означал не строгий
+    # отбор, а поломку в данных — но отличить это по логам было нельзя.
+    dropped = {"нет цены Steam": 0, "цена вне диапазона": 0, "мало продаж": 0, "скидка ниже порога": 0}
+    best_discount: float | None = None
 
     for l in listings:
         if l.steam_price is None or l.steam_price <= 0:
+            dropped["нет цены Steam"] += 1
             continue  # без цены Steam сравнивать не с чем
         if min_price is not None and l.price < min_price:
+            dropped["цена вне диапазона"] += 1
             continue
         if max_price is not None and l.price > max_price:
+            dropped["цена вне диапазона"] += 1
             continue
         if min_steam_volume is not None and (l.steam_volume or 0) < min_steam_volume:
+            dropped["мало продаж"] += 1
             continue
 
         discount_pct = (l.steam_price - l.price) / l.steam_price * 100
+        if best_discount is None or discount_pct > best_discount:
+            best_discount = discount_pct
 
         # Наценка за наклейки — считаем только когда цены наклеек реально известны
         sticker_markup = None
@@ -283,6 +298,7 @@ def find_arbitrage_offers(
             and sticker_markup <= sticker_max_markup_pct
         )
         if not (by_price or by_stickers):
+            dropped["скидка ниже порога"] += 1
             continue
 
         offers.append(
@@ -306,5 +322,25 @@ def find_arbitrage_offers(
         )
 
     offers.sort(key=lambda o: o.discount_pct, reverse=True)
+
+    # Логируем всегда, а не только при нуле офферов: разбивка нужна и чтобы
+    # понять, что порог наконец стал разумным, и чтобы заметить перекос
+    # (например, что почти всё уходит в "нет цены Steam" — это уже не настройки,
+    # а изменившийся формат ответа CSFloat).
+    log.info(
+        "arb-фильтр: %d лот(ов) -> %d оффер(ов). Отсеяно: %s. Лучшая скидка среди "
+        "лотов с ценой Steam: %s",
+        len(listings), len(offers),
+        ", ".join(f"{k} {v}" for k, v in dropped.items() if v) or "ничего",
+        f"{best_discount:.1f}%" if best_discount is not None else "—",
+    )
+    if listings and dropped["нет цены Steam"] == len(listings):
+        log.warning(
+            "arb-фильтр: цены Steam НЕТ НИ У ОДНОГО из %d лотов — сравнивать не с чем. "
+            "Это не настройки отбора: похоже, в ответе CSFloat больше нет item.scm.price "
+            "(см. csfloat_client._parse_listing).",
+            len(listings),
+        )
+
     return offers
 
