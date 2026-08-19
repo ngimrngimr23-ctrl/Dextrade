@@ -2208,16 +2208,60 @@ def _start_health_server():
     log.info("health-check сервер слушает порт %d", port)
 
 
-async def _run_with_webhook(app, token: str) -> None:
+# Telegram принимает секрет только из этих символов, 1-256 длиной. Несоблюдение
+# он ловит на set_webhook ошибкой "Secret token contains unallowed characters" —
+# и раньше это роняло весь процесс, а Render уходил в цикл перезапусков. Лучше
+# проверить самим и сказать понятным текстом, что именно не так.
+_WEBHOOK_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
+
+
+def _webhook_secret_problem() -> str | None:
+    """Что не так с TG_WEBHOOK_SECRET, либо None если всё в порядке (в т.ч. если он не задан)."""
+    if not TG_WEBHOOK_SECRET:
+        return None
+    if _WEBHOOK_SECRET_RE.match(TG_WEBHOOK_SECRET):
+        return None
+
+    # Разбираем причину отдельно: при слишком длинном, но корректном по символам
+    # секрете список "плохих символов" пуст, и сообщение про символы сбивало бы с толку.
+    bad = sorted({c for c in TG_WEBHOOK_SECRET if not re.match(r"[A-Za-z0-9_-]", c)})
+    if bad:
+        return (
+            f"TG_WEBHOOK_SECRET содержит символы, которых Telegram не принимает: {bad}. "
+            f"Разрешены только латинские буквы, цифры, _ и - (длина 1-256)."
+        )
+    return (
+        f"TG_WEBHOOK_SECRET длиной {len(TG_WEBHOOK_SECRET)} — Telegram принимает от 1 до 256 символов."
+    )
+
+
+async def _run_with_webhook(app, token: str) -> bool:
     """
     Приём апдейтов через webhook: Telegram сам шлёт их на наш HTTPS-адрес.
     Application ведём вручную (initialize/start), потому что апдейты в очередь
     кладёт наш HTTP-сервер, а не Updater — см. комментарий у WEBHOOK_BASE_URL.
+
+    Возвращает False, если поднять webhook не удалось — тогда main() уходит на
+    long-polling. Падать нельзя: Render перезапускает процесс на любой выход, и
+    ошибка конфигурации превращается в бесконечный цикл перезапусков вместо
+    работающего (пусть и на polling) бота.
     """
     global _tg_application, _tg_loop, _tg_webhook_path
 
     url = f"{WEBHOOK_BASE_URL}/{_webhook_path(token)}"
     await app.initialize()  # здесь же отрабатывает post_init (_on_startup)
+
+    try:
+        await app.bot.set_webhook(
+            url=url,
+            secret_token=TG_WEBHOOK_SECRET or None,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    except Exception:
+        log.exception("webhook: set_webhook не удался, откатываюсь на long-polling")
+        await app.shutdown()
+        return False
+
     await app.start()
 
     # Публикуем состояние для HTTP-потока только после старта Application:
@@ -2225,11 +2269,6 @@ async def _run_with_webhook(app, token: str) -> None:
     _tg_application, _tg_loop = app, asyncio.get_running_loop()
     _tg_webhook_path = _webhook_path(token)
 
-    await app.bot.set_webhook(
-        url=url,
-        secret_token=TG_WEBHOOK_SECRET or None,
-        allowed_updates=Update.ALL_TYPES,
-    )
     log.info(
         "Режим webhook: апдейты принимаются на %s (секрет %s)",
         url, "задан" if TG_WEBHOOK_SECRET else "НЕ задан — стоит задать TG_WEBHOOK_SECRET",
@@ -2241,11 +2280,16 @@ async def _run_with_webhook(app, token: str) -> None:
         _tg_application = None
         await app.stop()
         await app.shutdown()
+    return True
 
 
-def main():
-    token = os.environ["TG_BOT_TOKEN"]
-    _start_health_server()
+def _build_application(token: str):
+    """
+    Собрать Application со всеми обработчиками. Отдельной функцией, потому что
+    при откате с webhook на polling объект приходится строить заново: он уже
+    прошёл initialize()/shutdown(), а run_polling() зовёт initialize() сам, и
+    дважды инициализировать один и тот же Application нельзя.
+    """
     app = Application.builder().token(token).post_init(_on_startup).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("scan", scan))
@@ -2276,14 +2320,37 @@ def main():
     app.add_handler(CommandHandler("arbreset", arbreset))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_selection))
+    return app
 
-    if WEBHOOK_BASE_URL:
-        asyncio.run(_run_with_webhook(app, token))
-    else:
+
+def main():
+    token = os.environ["TG_BOT_TOKEN"]
+    _start_health_server()
+    app = _build_application(token)
+
+    use_webhook = bool(WEBHOOK_BASE_URL)
+    if use_webhook:
+        problem = _webhook_secret_problem()
+        if problem:
+            # Не падаем: Render перезапускает процесс на любой выход, и опечатка
+            # в переменной окружения превратилась бы в цикл перезапусков вместо
+            # работающего бота. Работаем на polling и громко говорим, что чинить.
+            log.error("%s Webhook не включён, работаю на long-polling.", problem)
+            use_webhook = False
+
+    if use_webhook:
+        use_webhook = asyncio.run(_run_with_webhook(app, token))
+        if not use_webhook:
+            # set_webhook не прошёл — Application уже выключен, строим заново:
+            # run_polling() сам зовёт initialize(), а дважды инициализировать
+            # один и тот же объект нельзя.
+            app = _build_application(token)
+
+    if not use_webhook:
         # Long-polling — прежнее поведение и путь отката. PTB при старте
         # polling сам зовёт delete_webhook, так что снять WEBHOOK_BASE_URL и
         # передеплоить достаточно, чтобы вернуться сюда без ручной уборки.
-        log.info("Режим long-polling (WEBHOOK_BASE_URL не задан)")
+        log.info("Режим long-polling")
         app.run_polling()
 
 
