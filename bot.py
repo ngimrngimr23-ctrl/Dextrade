@@ -28,6 +28,7 @@ Market Beta и рейт-лимитами, см. steam_client.py). Если не 
 """
 
 import asyncio
+import datetime as dt
 import hashlib
 import html as html_module
 import json
@@ -1955,10 +1956,151 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+def _fmt_mins(seconds: float) -> str:
+    """Человеческая длительность: секунды не нужны, часы читаются лучше минут."""
+    if seconds <= 0:
+        return "сейчас"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{minutes:.0f} мин"
+    return f"{minutes / 60:.1f} ч"
+
+
+def _next_run_in(job_queue, name: str) -> float | None:
+    """Сколько секунд до следующего запуска джобы, либо None если её нет."""
+    jobs = job_queue.get_jobs_by_name(name) if job_queue else []
+    if not jobs:
+        return None
+    try:
+        return max(0.0, (jobs[0].next_t - dt.datetime.now(dt.timezone.utc)).total_seconds())
+    except Exception:
+        return None
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /status — одна сводка: что запущено, что на паузе, что на кулдауне, какие
+    пороги отбора действуют.
+
+    Появилась потому, что почти все вопросы при отладке были вида "почему
+    ничего не приходит", а ответ приходилось собирать из логов Render: списки —
+    в одной команде, пауза — во второй, кулдауны — вообще нигде. Здесь всё
+    сразу и в одном месте.
+    """
+    chat_id = update.effective_chat.id
+    jq = context.job_queue
+
+    sticker_items = await get_watchlist(chat_id)
+    float_items = await get_float_watchlist(chat_id)
+    paused = await get_watch_paused(chat_id)
+    interval = await _get_watch_interval(chat_id)
+    arb = await get_arb_settings(chat_id)
+    def_min, def_max = await _get_defaults(chat_id)
+    streak = await get_streak_markup(chat_id)
+    p_lo, p_hi = await get_price_filter(chat_id)
+    f_lo, f_hi = await get_float_filter(chat_id)
+    f_markup = await get_float_markup(chat_id)
+
+    lines = ["📊 <b>Состояние</b>", ""]
+
+    # --- Списки и автоскан -------------------------------------------------
+    lines.append("<b>Списки</b>")
+    lines.append(f"  Вотчлист (стикеры): {len(sticker_items)}")
+    lines.append(f"  Охота за флоатом: {len(float_items)}")
+    if not sticker_items and not float_items:
+        lines.append("  ⚠️ оба пусты — сканировать нечего (/watchadd, /floatadd)")
+
+    lines.append("")
+    lines.append("<b>Автоскан Steam</b>")
+    if paused:
+        lines.append("  ⏸ на паузе — /watchresume чтобы включить")
+    else:
+        nxt = _next_run_in(jq, f"{WATCHLIST_JOB_PREFIX}{chat_id}")
+        when = f"следующий прогон через {_fmt_mins(nxt)}" if nxt is not None else "прогон не запланирован"
+        lines.append(f"  ▶️ включён, {when} (интервал {interval:g} мин)")
+
+    # --- Арбитраж ----------------------------------------------------------
+    lines.append("")
+    lines.append("<b>Арбитраж CSFloat</b>")
+    if arb["min_discount"] is None:
+        lines.append("  ⏹ выключен — /setarb 5 чтобы включить")
+    else:
+        nxt = _next_run_in(jq, f"{ARB_JOB_PREFIX}{chat_id}")
+        when = f"проверка через {_fmt_mins(nxt)}" if nxt is not None else "проверка не запланирована"
+        lines.append(f"  ▶️ включён: дешевле Steam на {arb['min_discount']:g}%+, {when}")
+        if arb["sticker_markup"] is not None:
+            lines.append(f"  наклейки: наценка ≤{arb['sticker_markup']:g}%")
+        if arb["min_price"] is not None or arb["max_price"] is not None:
+            lo = f"${arb['min_price']:.2f}" if arb["min_price"] is not None else "—"
+            hi = f"${arb['max_price']:.2f}" if arb["max_price"] is not None else "—"
+            lines.append(f"  цена лота: {lo} … {hi}")
+        if arb["min_volume"] is not None:
+            lines.append(f"  ликвидность: от {arb['min_volume']} продаж на Steam")
+
+    # --- Доступ к площадкам ------------------------------------------------
+    # Ровно то, чего не хватало: "почему /scanall отказывает" и "почему
+    # арбитраж молчит" — оба ответа тут.
+    lines.append("")
+    lines.append("<b>Доступ к площадкам</b>")
+    for scope, label in (("listings", "Steam, листинги"), ("pricing", "Steam, цены стикеров")):
+        cd = steam_cooldown_remaining(scope)
+        lines.append(f"  {label}: " + (f"⏸ кулдаун ещё {_fmt_mins(cd)}" if cd > 0 else "✅ свободен"))
+    cf = csfloat_client.cooldown_remaining()
+    if not csfloat_client.csfloat_enabled():
+        lines.append("  CSFloat: ⚠️ нет ключа (CSFLOAT_API_KEY)")
+    else:
+        lines.append("  CSFloat: " + (f"⏸ кулдаун ещё {_fmt_mins(cf)} (/arbreset)" if cf > 0 else "✅ свободен"))
+        lines.append(f"  маршрут CSFloat: {csfloat_client.route_description()}")
+
+    # --- Пороги отбора -----------------------------------------------------
+    lines.append("")
+    lines.append("<b>Пороги отбора</b>")
+    lines.append(f"  Стикеры: от ${def_min:.0f}, наценка ≤{def_max:g}%")
+    if streak is not None:
+        lines.append(f"  Стрик ({STREAK_THRESHOLD}+ подряд): наценка ≤{streak:g}%")
+    if p_lo is not None or p_hi is not None:
+        lo = f"${p_lo:.2f}" if p_lo is not None else "—"
+        hi = f"${p_hi:.2f}" if p_hi is not None else "—"
+        lines.append(f"  Цена лота: {lo} … {hi}")
+    if f_lo is None or f_hi is None:
+        lines.append("  Флоат: ⚠️ порог не задан — охота за флоатом не идёт (/setfloatfilter 0.01 0.99)")
+    else:
+        extra = f", наценка ≤{f_markup:g}%" if f_markup is not None else ""
+        lines.append(f"  Флоат: ≤{f_lo:g} или ≥{f_hi:g}{extra}")
+
+    for chunk in _chunk_lines(lines):
+        await update.message.reply_text(chunk, parse_mode="HTML")
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /start — короткая карточка на один экран. Полный справочник вынесен в
+    /help: раньше всё жило в одном сообщении, и оно разрослось так, что
+    прочитать его целиком было невозможно, а /scanall терялся в середине.
+    """
+    await update.message.reply_text(
+        "Привет! Я слежу за скинами CS2 и присылаю выгодные лоты.\n\n"
+        "▶️ <b>Начать</b>\n"
+        "/status — что сейчас происходит: списки, автоскан, кулдауны, пороги\n"
+        "/scanall — проверить оба списка прямо сейчас\n"
+        "/scan [предмет] — разовая проверка одного предмета\n\n"
+        "📋 <b>Списки</b> (по ним идёт автоскан)\n"
+        "/watchadd, /watchdel, /watchlist — охота по стикерам\n"
+        "/floatadd, /floatdel, /floatlist — охота за редким флоатом\n"
+        "/watchpause, /watchresume — пауза автоскана\n\n"
+        "💱 <b>Арбитраж CSFloat ↔ Steam</b>\n"
+        "/setarb [мин%] — включить, /arbnow — проверить сейчас\n\n"
+        "⚙️ <b>Пороги</b>: /setdefaults, /setfloatfilter и другие — см. /help\n\n"
+        "📖 <b>/help</b> — полный справочник со всеми командами и пояснениями",
+        parse_mode="HTML",
+    )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/help — полный справочник. Длинный намеренно: это место, куда идут за деталями."""
     chat_id = update.effective_chat.id
     def_min, def_max = await _get_defaults(chat_id)
-    await update.message.reply_text(
+    text = (
         "Привет! Пришли:\n"
         "/scan <ссылка или название предмета> [мин$ стикеров] [макс наценка%]\n"
         "Название — на английском, с | или без: /scan AK-47 | Slate или /scan AK-47 Slate\n"
@@ -2010,37 +2152,42 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"поэтому в сообщениях показываю «чистыми» с учётом комиссии "
         f"~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%."
     )
+    # Справочник давно перерос лимит Telegram в 4096 символов — режем на части
+    # тем же helper'ом, что и списки (см. _chunk_lines).
+    for chunk in _chunk_lines(text.split("\n\n"), sep="\n\n"):
+        await update.message.reply_text(chunk)
 
 
+# Меню команд Telegram (то, что видно при вводе "/"). Здесь НЕ все команды:
+# их 27, и списком в четыре экрана пользоваться невозможно. Оставлены те, что
+# нужны регулярно, в порядке реального сценария — сначала "посмотреть и
+# проверить", потом списки, потом настройка. Остальные продолжают работать и
+# перечислены в /help: команда, которой нет в меню, не перестаёт существовать.
 BOT_COMMANDS = [
-    BotCommand("start", "Помощь и список команд"),
-    BotCommand("scan", "Проверить предмет (автоматический запрос к Steam)"),
-    BotCommand("scanfile", "Проверить предмет вручную (резерв, если /scan не удался)"),
+    BotCommand("status", "Что сейчас происходит: списки, автоскан, кулдауны"),
+    BotCommand("scanall", "Проверить оба списка прямо сейчас"),
+    BotCommand("scan", "Проверить один предмет"),
+    BotCommand("watchlist", "Показать вотчлист (стикеры)"),
     BotCommand("watchadd", "Добавить предмет(ы) в вотчлист"),
     BotCommand("watchdel", "Убрать предмет из вотчлиста"),
-    BotCommand("watchclear", "Полностью очистить вотчлист"),
-    BotCommand("floatadd", "Добавить предмет в охоту за флоатом"),
     BotCommand("floatlist", "Показать список охоты за флоатом"),
+    BotCommand("floatadd", "Добавить предмет в охоту за флоатом"),
     BotCommand("floatdel", "Убрать предмет из охоты за флоатом"),
-    BotCommand("floatclear", "Очистить список охоты за флоатом"),
-    BotCommand("watchlist", "Показать вотчлист и интервал автоскана"),
-    BotCommand("watchpause", "Остановить автоскан вотчлиста"),
-    BotCommand("watchresume", "Возобновить автоскан вотчлиста"),
-    BotCommand("scanall", "Сканировать весь вотчлист прямо сейчас"),
+    BotCommand("watchpause", "Остановить автоскан"),
+    BotCommand("watchresume", "Возобновить автоскан"),
+    BotCommand("arbnow", "Проверить арбитраж CSFloat прямо сейчас"),
     BotCommand("setarb", "Арбитраж: CSFloat дешевле Steam на N%"),
-    BotCommand("arbnow", "Проверить арбитраж прямо сейчас"),
-    BotCommand("arbreset", "Снять кулдаун CSFloat"),
-    BotCommand("setarbprice", "Арбитраж: диапазон цены лота"),
-    BotCommand("setarbvolume", "Арбитраж: фильтр ликвидности"),
-    BotCommand("setarbstickers", "Арбитраж: наклейки почти даром"),
-    BotCommand("setdefaults", "Настроить мин. стоимость стикеров и наценку"),
-    BotCommand("setstreakmarkup", "Наценка для стрик-лотов (4-5 одинаковых стикеров)"),
-    BotCommand("setpricefilter", "Фильтр по итоговой цене лота"),
-    BotCommand("setfloatfilter", "Искать лоты с редким флоатом"),
-    BotCommand("setfloatmarkup", "Макс. наценка для флоат-находок"),
-    BotCommand("pricefile", "Загрузить свои цены на стикеры файлом"),
-    BotCommand("clearprices", "Очистить загруженные цены на стикеры"),
+    BotCommand("help", "Полный справочник по всем командам"),
 ]
+
+# Команды, которых нет в меню, но которые работают. Держим списком имён, чтобы
+# /help мог свериться и не забыть про них при добавлении новых.
+_UNLISTED_COMMANDS = (
+    "start", "help", "scanfile", "watchclear", "floatclear",
+    "arbreset", "setarbprice", "setarbvolume", "setarbstickers",
+    "setdefaults", "setstreakmarkup", "setpricefilter",
+    "setfloatfilter", "setfloatmarkup", "pricefile", "clearprices",
+)
 
 
 async def _on_startup(app: Application):
@@ -2292,6 +2439,8 @@ def _build_application(token: str):
     """
     app = Application.builder().token(token).post_init(_on_startup).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("scan", scan))
     app.add_handler(CommandHandler("scanfile", scanfile))
     app.add_handler(CommandHandler("setdefaults", setdefaults))
