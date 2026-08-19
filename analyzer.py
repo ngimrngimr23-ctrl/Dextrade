@@ -188,3 +188,123 @@ def find_float_offers(
     offers.sort(key=lambda o: min(o.float_value, 1 - o.float_value))
     return offers
 
+
+# ---------------------------------------------------------------------------
+# Кросс-маркет арбитраж: лот дешевле на CSFloat, чем стоит на Steam.
+# Данные приходят одним ответом CSFloat (там уже есть и цена Steam, и цены
+# наклеек), поэтому в Steam за ними ходить не нужно — см. csfloat_client.py.
+# ---------------------------------------------------------------------------
+
+# Steam забирает комиссию с продавца (~13% от цены, которую платит покупатель).
+# Без её учёта "скидка 15%" выглядит прибылью, хотя ею не является.
+STEAM_FEE_MULTIPLIER = 0.87
+
+
+@dataclass
+class ArbOffer:
+    market_hash_name: str
+    csfloat_price: float
+    steam_price: float
+    discount_pct: float          # на сколько % дешевле цены Steam
+    net_after_fee: float         # сколько останется, если перепродать в Steam по той же цене
+    listing_id: str
+    steam_volume: int | None = None
+    float_value: float | None = None
+    wear_name: str | None = None
+    stickers: list[str] = None
+    stickers_value: float = 0.0
+    # Наценка за наклейки по той же формуле, что у стикерного арбитража в Steam:
+    # сколько сверх голой цены платишь относительно реальной стоимости набора.
+    # None — если наклеек нет или их цены неизвестны.
+    sticker_markup_pct: float | None = None
+    stickers_unpriced: int = 0
+    inspect_link: str | None = None
+    watchers: int = 0
+
+    def __post_init__(self):
+        if self.stickers is None:
+            self.stickers = []
+
+    @property
+    def url(self) -> str:
+        return f"https://csfloat.com/item/{self.listing_id}"
+
+
+def find_arbitrage_offers(
+    listings,
+    min_discount_pct: float,
+    *,
+    min_price: float | None = None,
+    max_price: float | None = None,
+    min_steam_volume: int | None = None,
+    sticker_max_markup_pct: float | None = None,
+) -> list[ArbOffer]:
+    """
+    listings — объекты csfloat_client.CSFloatListing.
+
+    Отбор идёт по двум независимым основаниям, лот проходит по любому:
+
+    1. ГОЛАЯ ЦЕНА: лот дешевле цены Steam минимум на min_discount_pct.
+       Работает и для лотов с наклейками — там наклейки просто идут бонусом.
+
+    2. НАКЛЕЙКИ (если задан sticker_max_markup_pct): та же логика, что у
+       стикерного арбитража внутри Steam — сколько сверх голой цены просят за
+       набор наклеек относительно его реальной стоимости. 0% значит наклейки
+       достались даром. Ловит случаи, когда сам скин не дешевле рынка, но
+       наклейки на нём фактически бесплатны.
+
+    min_steam_volume отсекает неликвид: "скидка" на предмете, который на Steam
+    продаётся пару раз в месяц, чаще всего бумажная — выйти из него не выйдет.
+    """
+    offers: list[ArbOffer] = []
+
+    for l in listings:
+        if l.steam_price is None or l.steam_price <= 0:
+            continue  # без цены Steam сравнивать не с чем
+        if min_price is not None and l.price < min_price:
+            continue
+        if max_price is not None and l.price > max_price:
+            continue
+        if min_steam_volume is not None and (l.steam_volume or 0) < min_steam_volume:
+            continue
+
+        discount_pct = (l.steam_price - l.price) / l.steam_price * 100
+
+        # Наценка за наклейки — считаем только когда цены наклеек реально известны
+        sticker_markup = None
+        if l.stickers and l.stickers_value > 0:
+            overpay = l.price - l.steam_price
+            sticker_markup = overpay / l.stickers_value * 100
+
+        by_price = discount_pct >= min_discount_pct
+        by_stickers = (
+            sticker_max_markup_pct is not None
+            and sticker_markup is not None
+            and sticker_markup <= sticker_max_markup_pct
+        )
+        if not (by_price or by_stickers):
+            continue
+
+        offers.append(
+            ArbOffer(
+                market_hash_name=l.market_hash_name,
+                csfloat_price=l.price,
+                steam_price=l.steam_price,
+                discount_pct=discount_pct,
+                net_after_fee=l.steam_price * STEAM_FEE_MULTIPLIER - l.price,
+                listing_id=l.listing_id,
+                steam_volume=l.steam_volume,
+                float_value=l.float_value,
+                wear_name=l.wear_name,
+                stickers=list(l.stickers),
+                stickers_value=l.stickers_value,
+                sticker_markup_pct=sticker_markup,
+                stickers_unpriced=len(l.stickers) - l.stickers_priced,
+                inspect_link=l.inspect_link,
+                watchers=l.watchers,
+            )
+        )
+
+    offers.sort(key=lambda o: o.discount_pct, reverse=True)
+    return offers
+

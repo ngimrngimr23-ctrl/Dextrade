@@ -55,7 +55,10 @@ from steam_client import (
 )
 from csgo_api import search_items as search_csgo_items
 from pricing import get_sticker_prices, ingest_manual_prices, clear_manual_prices, manual_prices_count
-from analyzer import find_offers, find_float_offers, Offer, STREAK_THRESHOLD
+from analyzer import (
+    find_offers, find_float_offers, find_arbitrage_offers,
+    Offer, STREAK_THRESHOLD, STEAM_FEE_MULTIPLIER,
+)
 from cs_inspect import decode_inspect_link
 from prewarm import prewarm_loop
 from storage import (
@@ -78,7 +81,12 @@ from storage import (
     all_watchlist_chat_ids,
     was_offer_sent_recently,
     mark_offer_sent,
+    get_arb_settings,
+    set_arb_setting,
+    all_chat_ids_with_settings,
 )
+import csfloat_client
+from csfloat_client import CSFloatError, CSFloatRateLimited
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("steam_bot")
@@ -127,6 +135,16 @@ _pricefile_mode: set[int] = set()
 WATCH_GAP_MINUTES = 2.0  # пауза между концом одного прогона и началом следующего
 WATCHLIST_JOB_PREFIX = "watchlist_scan_"
 WATCHLIST_ITEM_DELAY_SECONDS = 3  # пауза между предметами внутри одного тика, чтобы не долбить Steam пачкой сразу
+
+# --- Кросс-маркет арбитраж (CSFloat против Steam) ---------------------------
+# Отдельная джоба, не связанная с вотчлистом: сканируется весь рынок CSFloat
+# подряд, а не заранее заданный список предметов — ошибки в цене обычно как
+# раз там, где ты бы не догадался посмотреть. К Steam при этом не ходим вообще:
+# цена Steam приходит внутри ответа CSFloat (см. csfloat_client.py).
+ARB_JOB_PREFIX = "arb_scan_"
+ARB_INTERVAL_MINUTES = 5.0
+ARB_PAGES_PER_SCAN = 4  # 4 страницы по 50 = до 200 свежих лотов за прогон
+_arb_running: set[int] = set()
 
 # chat_id -> идёт прогон вотчлиста прямо сейчас — защита от наложения тиков,
 # если сканирование всех предметов не укладывается в заданный интервал.
@@ -1229,6 +1247,149 @@ async def watchlist_scan_job(context: ContextTypes.DEFAULT_TYPE):
         _schedule_watchlist_job(context.job_queue, chat_id, interval)
 
 
+# ---------------------------------------------------------------------------
+# Кросс-маркет арбитраж: сканируем рынок CSFloat и сравниваем с ценой Steam
+# ---------------------------------------------------------------------------
+
+def _schedule_arb_job(job_queue, chat_id: int, delay_minutes: float = ARB_INTERVAL_MINUTES) -> None:
+    """Следующий прогон арбитража — одноразовой джобой, как и у вотчлиста (без наложений)."""
+    for job in job_queue.get_jobs_by_name(f"{ARB_JOB_PREFIX}{chat_id}"):
+        job.schedule_removal()
+    job_queue.run_once(
+        arb_scan_job,
+        when=delay_minutes * 60,
+        data={"chat_id": chat_id},
+        name=f"{ARB_JOB_PREFIX}{chat_id}",
+    )
+
+
+def _format_arb_chunks(offers) -> list[str]:
+    """Сообщения по арбитражным находкам, разбитые под лимит Telegram."""
+    lines = [
+        f"💱 CSFloat дешевле Steam — найдено {len(offers)}\n"
+        f"<i>«Чистыми» = сколько останется, если перепродать в Steam по текущей цене, "
+        f"за вычетом комиссии Steam ~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%. "
+        f"Помни: выручка в Steam приходит на кошелёк и не выводится.</i>"
+    ]
+
+    for o in offers[:15]:
+        # Лот мог попасть сюда из-за наклеек, а не из-за цены — тогда сам скин
+        # бывает и дороже Steam, и писать "дешевле на -2%" было бы враньём.
+        if o.discount_pct >= 0:
+            price_cmp = f"дешевле на {o.discount_pct:.1f}%"
+        else:
+            price_cmp = f"дороже на {abs(o.discount_pct):.1f}%"
+        net = f"+${o.net_after_fee:.2f}" if o.net_after_fee >= 0 else f"-${abs(o.net_after_fee):.2f}"
+        block = (
+            f"<b>{html_module.escape(o.market_hash_name)}</b>\n"
+            f"  CSFloat ${o.csfloat_price:.2f} | Steam ${o.steam_price:.2f} | {price_cmp}\n"
+            f"  чистыми при перепродаже: {net}"
+        )
+        if o.float_value is not None:
+            block += f"\n  флоат {o.float_value:.5f}"
+        if o.steam_volume is not None:
+            block += f" | продаж на Steam: {o.steam_volume}"
+        if o.stickers:
+            block += f"\n  <code>{html_module.escape(', '.join(o.stickers))}</code>"
+            if o.stickers_value > 0:
+                block += f"\n  наклейки ≈${o.stickers_value:.2f}"
+                if o.sticker_markup_pct is not None:
+                    block += f", наценка за них {o.sticker_markup_pct:.1f}%"
+            if o.stickers_unpriced:
+                block += f" (у {o.stickers_unpriced} цена неизвестна)"
+        block += f'\n  <a href="{o.url}">Открыть на CSFloat</a>'
+        lines.append(block)
+
+    chunks, chunk = [], ""
+    for line in lines:
+        candidate = (chunk + "\n\n" + line) if chunk else line
+        if len(candidate) > 3800:
+            chunks.append(chunk)
+            chunk = line
+        else:
+            chunk = candidate
+    if chunk:
+        chunks.append(chunk)
+    return chunks
+
+
+async def _run_arb_scan(bot, chat_id: int) -> int | None:
+    """
+    Один прогон арбитража. Возвращает число отправленных находок, либо None,
+    если прогон не запускался (выключено / уже идёт / кулдаун).
+    """
+    settings = await get_arb_settings(chat_id)
+    if settings["min_discount"] is None:
+        return None
+    if chat_id in _arb_running:
+        log.info("arb: прогон для chat_id=%s уже идёт, пропускаю", chat_id)
+        return None
+    if csfloat_client.cooldown_remaining() > 0:
+        log.info(
+            "arb: chat_id=%s пропускает прогон — кулдаун CSFloat ещё %.0f мин",
+            chat_id, csfloat_client.cooldown_remaining() / 60,
+        )
+        return None
+
+    _arb_running.add(chat_id)
+    try:
+        listings = await csfloat_client.fetch_market(
+            pages=ARB_PAGES_PER_SCAN,
+            min_price=settings["min_price"],
+            max_price=settings["max_price"],
+        )
+        offers = find_arbitrage_offers(
+            listings,
+            min_discount_pct=settings["min_discount"],
+            min_price=settings["min_price"],
+            max_price=settings["max_price"],
+            min_steam_volume=settings["min_volume"],
+            sticker_max_markup_pct=settings["sticker_markup"],
+        )
+        log.info(
+            "arb: chat_id=%s просмотрено %s лотов, подошло %s",
+            chat_id, len(listings), len(offers),
+        )
+        if not offers:
+            return 0
+
+        # Тот же дедуп, что у вотчлиста: один и тот же лот не присылаем повторно
+        new_offers = []
+        for o in offers:
+            key = f"arb:{o.listing_id}"
+            if not await was_offer_sent_recently(chat_id, key):
+                new_offers.append(o)
+        if not new_offers:
+            return 0
+
+        for chunk in _format_arb_chunks(new_offers):
+            await bot.send_message(
+                chat_id=chat_id, text=chunk, parse_mode="HTML", disable_web_page_preview=True
+            )
+        for o in new_offers:
+            await mark_offer_sent(chat_id, f"arb:{o.listing_id}")
+        return len(new_offers)
+    finally:
+        _arb_running.discard(chat_id)
+
+
+async def arb_scan_job(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.data["chat_id"]
+    try:
+        await _run_arb_scan(context.bot, chat_id)
+    except CSFloatRateLimited as e:
+        log.warning("arb: chat_id=%s рейт-лимит CSFloat: %s", chat_id, e)
+    except CSFloatError as e:
+        log.warning("arb: chat_id=%s ошибка CSFloat: %s", chat_id, e)
+        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Арбитраж: {e}")
+    except Exception:
+        log.exception("arb: непредвиденная ошибка в прогоне chat_id=%s", chat_id)
+    finally:
+        settings = await get_arb_settings(chat_id)
+        if settings["min_discount"] is not None:
+            _schedule_arb_job(context.job_queue, chat_id)
+
+
 async def watchpause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /watchpause — остановить автоскан по расписанию (оба списка — обычный
@@ -1269,6 +1430,216 @@ async def watchresume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cooldown > 0:
         text += f"\n\n⚠️ Но Steam сейчас на кулдауне после 429 — первые {cooldown / 60:.0f} мин прогоны будут пропускаться."
     await update.message.reply_text(text)
+
+
+async def setarb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /setarb              — показать настройки арбитража
+    /setarb <мин%>       — включить: слать лоты CSFloat, которые дешевле Steam на мин%
+    /setarb off          — выключить
+    """
+    chat_id = update.effective_chat.id
+    args = context.args
+    settings = await get_arb_settings(chat_id)
+
+    if not args:
+        if settings["min_discount"] is None:
+            await update.message.reply_text(
+                "💱 Арбитраж CSFloat ↔ Steam выключен.\n\n"
+                "Включить: /setarb <мин%>\nПример: /setarb 20 — слать лоты, которые "
+                f"на CSFloat дешевле цены Steam минимум на 20%.\n"
+                f"Проверка каждые {ARB_INTERVAL_MINUTES:g} мин, до "
+                f"{ARB_PAGES_PER_SCAN * 50} свежих лотов за прогон.\n\n"
+                "Дополнительно:\n"
+                "/setarbprice <мин$> <макс$> — ограничить диапазон цены\n"
+                "/setarbvolume <шт> — только ликвидное (продаж на Steam за сутки)\n"
+                "/setarbstickers <макс%> — ещё и лоты, где наклейки почти даром\n"
+                "/arbnow — проверить прямо сейчас"
+            )
+        else:
+            lines = [f"💱 Арбитраж включён: дешевле Steam минимум на {settings['min_discount']:g}%"]
+            if settings["min_price"] is not None or settings["max_price"] is not None:
+                lo = f"${settings['min_price']:.2f}" if settings["min_price"] is not None else "без границы"
+                hi = f"${settings['max_price']:.2f}" if settings["max_price"] is not None else "без границы"
+                lines.append(f"Цена лота: от {lo} до {hi}")
+            if settings["min_volume"] is not None:
+                lines.append(f"Ликвидность: от {settings['min_volume']} продаж на Steam")
+            if settings["sticker_markup"] is not None:
+                lines.append(f"Плюс лоты с наценкой за наклейки ≤{settings['sticker_markup']:g}%")
+            lines.append(f"Проверка каждые {ARB_INTERVAL_MINUTES:g} мин. Выключить: /setarb off")
+            await update.message.reply_text("\n".join(lines))
+        return
+
+    if args[0].lower() == "off":
+        await set_arb_setting(chat_id, "min_discount", None)
+        for job in context.application.job_queue.get_jobs_by_name(f"{ARB_JOB_PREFIX}{chat_id}"):
+            job.schedule_removal()
+        await update.message.reply_text("💱 Арбитраж выключен.")
+        return
+
+    if not csfloat_client.csfloat_enabled():
+        await update.message.reply_text(
+            "⚠️ Не задан CSFLOAT_API_KEY — без него CSFloat не отвечает.\n"
+            "Ключ берётся в профиле csfloat.com на вкладке developer и прописывается "
+            "переменной окружения CSFLOAT_API_KEY на Render."
+        )
+        return
+
+    try:
+        pct = float(args[0])
+    except ValueError:
+        await update.message.reply_text("Нужно число процентов. Пример: /setarb 20")
+        return
+    if pct <= 0:
+        await update.message.reply_text("Процент должен быть больше нуля.")
+        return
+
+    await set_arb_setting(chat_id, "min_discount", pct)
+    _schedule_arb_job(context.application.job_queue, chat_id, delay_minutes=0.2)
+    await update.message.reply_text(
+        f"💱 Арбитраж включён: ищу лоты CSFloat дешевле цены Steam минимум на {pct:g}%.\n"
+        f"Проверка каждые {ARB_INTERVAL_MINUTES:g} мин, первый прогон — прямо сейчас.\n\n"
+        f"⚠️ Учти: выручка от продажи в Steam попадает на кошелёк Steam и не выводится. "
+        f"В сообщениях показываю «чистыми» с учётом комиссии ~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%, "
+        f"чтобы процент не обманывал."
+    )
+
+
+async def setarbprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setarbprice <мин$> <макс$> — диапазон цены лота для арбитража; off — снять."""
+    chat_id = update.effective_chat.id
+    args = context.args
+
+    if not args:
+        s = await get_arb_settings(chat_id)
+        lo = f"${s['min_price']:.2f}" if s["min_price"] is not None else "без границы"
+        hi = f"${s['max_price']:.2f}" if s["max_price"] is not None else "без границы"
+        await update.message.reply_text(
+            f"Диапазон цены для арбитража: от {lo} до {hi}.\n"
+            "Задать: /setarbprice <мин$> <макс$>, снять: /setarbprice off"
+        )
+        return
+
+    if args[0].lower() == "off":
+        await set_arb_setting(chat_id, "min_price", None)
+        await set_arb_setting(chat_id, "max_price", None)
+        await update.message.reply_text("Ограничение по цене снято.")
+        return
+
+    if len(args) < 2:
+        await update.message.reply_text("Нужны оба значения: /setarbprice <мин$> <макс$>")
+        return
+    try:
+        lo, hi = float(args[0]), float(args[1])
+    except ValueError:
+        await update.message.reply_text("Оба значения должны быть числами. Пример: /setarbprice 5 500")
+        return
+    if lo > hi:
+        await update.message.reply_text("Минимум не может быть больше максимума.")
+        return
+
+    await set_arb_setting(chat_id, "min_price", lo)
+    await set_arb_setting(chat_id, "max_price", hi)
+    await update.message.reply_text(f"Арбитраж: смотрю лоты от ${lo:.2f} до ${hi:.2f}.")
+
+
+async def setarbvolume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setarbvolume <шт> — минимум продаж на Steam (отсекает неликвид); off — снять."""
+    chat_id = update.effective_chat.id
+    args = context.args
+
+    if not args:
+        s = await get_arb_settings(chat_id)
+        cur = f"{s['min_volume']} продаж" if s["min_volume"] is not None else "не задан"
+        await update.message.reply_text(
+            f"Фильтр ликвидности: {cur}.\n\n"
+            "Смысл: скидка на предмете, который на Steam почти не продаётся, обычно бумажная — "
+            "выйти из него не получится.\n"
+            "Задать: /setarbvolume <шт>, напр. /setarbvolume 5. Снять: /setarbvolume off"
+        )
+        return
+
+    if args[0].lower() == "off":
+        await set_arb_setting(chat_id, "min_volume", None)
+        await update.message.reply_text("Фильтр ликвидности снят.")
+        return
+
+    try:
+        vol = int(float(args[0]))
+    except ValueError:
+        await update.message.reply_text("Нужно целое число. Пример: /setarbvolume 5")
+        return
+    if vol < 0:
+        await update.message.reply_text("Число не может быть отрицательным.")
+        return
+
+    await set_arb_setting(chat_id, "min_volume", vol)
+    await update.message.reply_text(f"Арбитраж: только предметы с {vol}+ продаж на Steam.")
+
+
+async def setarbstickers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setarbstickers <макс%> — ловить лоты, где наклейки достаются почти даром; off — снять."""
+    chat_id = update.effective_chat.id
+    args = context.args
+
+    if not args:
+        s = await get_arb_settings(chat_id)
+        cur = f"≤{s['sticker_markup']:g}%" if s["sticker_markup"] is not None else "не задан"
+        await update.message.reply_text(
+            f"Наценка за наклейки в арбитраже: {cur}.\n\n"
+            "Это та же логика, что у обычного вотчлиста, но применённая к лотам CSFloat: "
+            "сколько сверх голой цены Steam просят за набор наклеек относительно их реальной "
+            "стоимости. 0% — наклейки достались даром.\n"
+            "Ловит случаи, когда сам скин не дешевле рынка, а наклейки фактически бесплатны.\n"
+            "Задать: /setarbstickers <макс%>, напр. /setarbstickers 10. Снять: /setarbstickers off"
+        )
+        return
+
+    if args[0].lower() == "off":
+        await set_arb_setting(chat_id, "sticker_markup", None)
+        await update.message.reply_text("Отбор по наклейкам в арбитраже выключен.")
+        return
+
+    try:
+        pct = float(args[0])
+    except ValueError:
+        await update.message.reply_text("Нужно число процентов. Пример: /setarbstickers 10")
+        return
+
+    await set_arb_setting(chat_id, "sticker_markup", pct)
+    await update.message.reply_text(
+        f"Арбитраж: теперь показываю ещё и лоты, где наценка за наклейки ≤{pct:g}%."
+    )
+
+
+async def arbnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/arbnow — проверить арбитраж прямо сейчас, не дожидаясь расписания."""
+    chat_id = update.effective_chat.id
+    settings = await get_arb_settings(chat_id)
+    if settings["min_discount"] is None:
+        await update.message.reply_text("Арбитраж выключен. Включить: /setarb <мин%>, напр. /setarb 20")
+        return
+    if chat_id in _arb_running:
+        await update.message.reply_text("Проверка уже идёт, дождись окончания.")
+        return
+
+    cooldown = csfloat_client.cooldown_remaining()
+    if cooldown > 0:
+        await update.message.reply_text(f"CSFloat на кулдауне после 429 — ещё {cooldown / 60:.0f} мин.")
+        return
+
+    await update.message.reply_text("Смотрю рынок CSFloat…")
+    try:
+        sent = await _run_arb_scan(context.bot, chat_id)
+    except CSFloatRateLimited as e:
+        await update.message.reply_text(f"⏸ {e}")
+        return
+    except CSFloatError as e:
+        await update.message.reply_text(f"⚠️ {e}")
+        return
+
+    if not sent:
+        await update.message.reply_text("Готово, ничего подходящего не нашлось.")
 
 
 async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1552,7 +1923,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/setfloatfilter off — убрать фильтр.\n"
         f"/setfloatmarkup <макс%> — показывать флоат-находку, только если её цена не больше "
         f"чем на макс% выше самого дешёвого лота этого предмета (иначе продавец уже в курсе "
-        f"и заложил редкость в цену); /setfloatmarkup off — без ограничения по цене."
+        f"и заложил редкость в цену); /setfloatmarkup off — без ограничения по цене.\n\n"
+        "💱 Арбитраж CSFloat ↔ Steam (по умолчанию выключен, вотчлист не нужен — "
+        "сканируется весь рынок CSFloat):\n"
+        "/setarb <мин%> — включить: слать лоты, которые на CSFloat дешевле цены Steam "
+        "минимум на мин%; /setarb off — выключить\n"
+        "/setarbprice <мин$> <макс$> — ограничить диапазон цены лота\n"
+        "/setarbvolume <шт> — только ликвидное (сколько продаётся на Steam)\n"
+        "/setarbstickers <макс%> — ещё и лоты, где наклейки достаются почти даром\n"
+        "/arbnow — проверить прямо сейчас\n"
+        f"Учти: выручка от продажи в Steam приходит на кошелёк и не выводится, "
+        f"поэтому в сообщениях показываю «чистыми» с учётом комиссии "
+        f"~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%."
     )
 
 
@@ -1571,6 +1953,11 @@ BOT_COMMANDS = [
     BotCommand("watchpause", "Остановить автоскан вотчлиста"),
     BotCommand("watchresume", "Возобновить автоскан вотчлиста"),
     BotCommand("scanall", "Сканировать весь вотчлист прямо сейчас"),
+    BotCommand("setarb", "Арбитраж: CSFloat дешевле Steam на N%"),
+    BotCommand("arbnow", "Проверить арбитраж прямо сейчас"),
+    BotCommand("setarbprice", "Арбитраж: диапазон цены лота"),
+    BotCommand("setarbvolume", "Арбитраж: фильтр ликвидности"),
+    BotCommand("setarbstickers", "Арбитраж: наклейки почти даром"),
     BotCommand("setdefaults", "Настроить мин. стоимость стикеров и наценку"),
     BotCommand("setstreakmarkup", "Наценка для стрик-лотов (4-5 одинаковых стикеров)"),
     BotCommand("setpricefilter", "Фильтр по итоговой цене лота"),
@@ -1589,6 +1976,7 @@ async def _on_startup(app: Application):
     # Без этого бот "забывал" бы про ещё не снятый бан на каждом рестарте
     # процесса и тут же пробовал снова, продлевая реальный бан.
     await load_persisted_cooldown()
+    await csfloat_client.load_persisted_cooldown()
 
     asyncio.create_task(prewarm_loop())
 
@@ -1609,6 +1997,18 @@ async def _on_startup(app: Application):
         _schedule_watchlist_job(app.job_queue, chat_id, interval)
         restored += 1
     log.info("watchlist: восстановлены джобы автоскана для %d чат(ов)", restored)
+
+    # Джобы арбитража живут отдельно от вотчлиста: он не привязан к списку
+    # предметов, поэтому и чаты берём по наличию настроек, а не по вотчлисту.
+    arb_restored = 0
+    for chat_id in await all_chat_ids_with_settings():
+        settings = await get_arb_settings(chat_id)
+        if settings["min_discount"] is None:
+            continue
+        _schedule_arb_job(app.job_queue, chat_id)
+        arb_restored += 1
+    if arb_restored:
+        log.info("arb: восстановлены джобы арбитража для %d чат(ов)", arb_restored)
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -1667,6 +2067,11 @@ def main():
     app.add_handler(CommandHandler("watchpause", watchpause))
     app.add_handler(CommandHandler("watchresume", watchresume))
     app.add_handler(CommandHandler("scanall", scanall))
+    app.add_handler(CommandHandler("setarb", setarb))
+    app.add_handler(CommandHandler("setarbprice", setarbprice))
+    app.add_handler(CommandHandler("setarbvolume", setarbvolume))
+    app.add_handler(CommandHandler("setarbstickers", setarbstickers))
+    app.add_handler(CommandHandler("arbnow", arbnow))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_selection))
     app.run_polling()

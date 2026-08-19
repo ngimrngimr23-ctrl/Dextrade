@@ -294,6 +294,57 @@ async def set_float_markup(chat_id: int, pct: Optional[float]) -> None:
     await _save_chat_settings(chat_id, settings)
 
 
+# --- Кросс-маркет арбитраж (CSFloat против Steam) ---------------------------
+# Все настройки в том же блоке настроек чата. По умолчанию всё None —
+# то есть арбитраж выключен и бот ведёт себя ровно как раньше.
+
+async def get_arb_settings(chat_id: int) -> dict:
+    """
+    {'min_discount': %, 'min_price': $, 'max_price': $, 'min_volume': шт,
+     'sticker_markup': %} — любое поле может быть None.
+    min_discount = None означает, что арбитраж выключен целиком.
+    """
+    s = await _get_chat_settings(chat_id)
+    return {
+        "min_discount": s.get("arb_min_discount"),
+        "min_price": s.get("arb_min_price"),
+        "max_price": s.get("arb_max_price"),
+        "min_volume": s.get("arb_min_volume"),
+        "sticker_markup": s.get("arb_sticker_markup"),
+    }
+
+
+async def set_arb_setting(chat_id: int, key: str, value) -> None:
+    """key — одно из: min_discount, min_price, max_price, min_volume, sticker_markup."""
+    allowed = {"min_discount", "min_price", "max_price", "min_volume", "sticker_markup"}
+    if key not in allowed:
+        raise ValueError(f"неизвестная настройка арбитража: {key}")
+    settings = await _get_chat_settings(chat_id)
+    settings[f"arb_{key}"] = value
+    await _save_chat_settings(chat_id, settings)
+
+
+async def all_chat_ids_with_settings() -> list[int]:
+    """
+    Чаты, у которых вообще есть сохранённые настройки — нужно, чтобы понять,
+    кому слать арбитраж (он не привязан к вотчлисту: сканируется весь рынок).
+    """
+    if REDIS_ENABLED:
+        try:
+            keys = await _redis_cmd("KEYS", DEFAULTS_KEY_PREFIX + "*")
+            out = []
+            for k in keys or []:
+                raw_id = k.split(":", 1)[-1]
+                try:
+                    out.append(int(raw_id))
+                except ValueError:
+                    continue
+            return out
+        except Exception:
+            pass
+    return [int(x) for x in _local_defaults_load().keys() if str(x).lstrip("-").isdigit()]
+
+
 # ---------------------------------------------------------------------------
 # Вотчлист /watchadd: список предметов на автоскан по расписанию + интервал,
 # по chat_id. Тот же паттерн хранения (Upstash + локальный fallback), что и
