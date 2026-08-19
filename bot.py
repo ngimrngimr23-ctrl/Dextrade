@@ -1685,7 +1685,8 @@ async def arbreset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ Кулдаун CSFloat сброшен ({was}).\n"
         f"Ключ: {csfloat_client.key_fingerprint()}\n"
-        f"User-Agent: {csfloat_client.CSFLOAT_USER_AGENT}\n\n"
+        f"User-Agent: {csfloat_client.CSFLOAT_USER_AGENT}\n"
+        f"Маршрут: {csfloat_client.route_description()}\n\n"
         "Проверить прямо сейчас: /arbnow"
     )
 
