@@ -16,10 +16,14 @@ Community Market, в центах) и item.scm.volume (объём продаж, 
 Ключ берётся в профиле csfloat.com на вкладке developer и задаётся переменной
 окружения CSFLOAT_API_KEY (в код не зашивается).
 
-ВАЖНО про лимиты: в отличие от Steam, где мы их выясняли методом тыка и ловили
-многочасовые баны, CSFloat документирован и отдаёт заголовки с остатком
-лимита. Поэтому здесь не угадываем: читаем заголовки, а на 429 уважаем
-Retry-After и уходим на кулдаун без ретраев.
+ВАЖНО про лимиты: на практике заголовки остатка лимита CSFloat присылает не
+всегда. 429 без них — это НЕ обязательно квота: как минимум один раз тело
+ответа прямым текстом говорило "Please disable your VPN or try a different
+network" — это собственная блокировка CSFloat по репутации IP (Render сидит
+на датацентровых адресах, которые Cloudflare/CSFloat помечают как VPN).
+Такую блокировку время не лечит — она снимается только сменой исходящего IP,
+поэтому для неё отдельный, куда более длинный и не растущий кулдаун: частые
+ретраи против нерешаемой блокировки бессмысленны и только зря дёргают чат.
 """
 
 from __future__ import annotations
@@ -68,10 +72,21 @@ _BROWSER_HEADERS = {
 
 COOLDOWN_AFTER_429_SECONDS = 10 * 60
 COOLDOWN_MAX_SECONDS = 2 * 60 * 60
-# Пауза для 429 БЕЗ заголовков лимита — то есть похожего на антибот-блок, а не
-# на исчерпанную квоту. Короткая и не растущая: ожидание такую блокировку не
-# снимает, а длинный кулдаун только мешает проверить исправление запроса.
+# Пауза для 429 БЕЗ заголовков лимита и без признаков IP-блока — общий случай
+# "непонятно почему, но не квота". Короткая и не растущая: ожидание такую
+# блокировку не снимает, а длинный кулдаун только мешает проверить исправление.
 SUSPECT_BLOCK_COOLDOWN_SECONDS = 2 * 60
+# Пауза для ПОДТВЕРЖДЁННОГО IP-блока (тело ответа прямо говорит про VPN) —
+# это не квота и не временный челлендж, а бинарная метка "этот IP не пускаем".
+# Ждать 2 минуты и долбиться заново бессмысленно: метка сама не снимется.
+# Кулдаун длинный и фиксированный (не растёт от повтора к повтору — это и так
+# не квота, расти тут не от чего), но конечный — чтобы заметить, если исходящий
+# IP всё же сменится (передеплой на Render иногда меняет адрес) или CSFloat
+# снимет блокировку.
+IP_BLOCK_COOLDOWN_SECONDS = 3 * 60 * 60
+# Подстроки из реального ответа CSFloat при IP-блоке, по которым его отличаем
+# от прочих 429 без заголовков лимита.
+_IP_BLOCK_MARKERS = ("vpn", "different network")
 
 _COOLDOWN_SCOPE = "csfloat"
 
@@ -82,6 +97,14 @@ class CSFloatError(RuntimeError):
 
 class CSFloatRateLimited(RuntimeError):
     """CSFloat ответил 429 либо мы сами на кулдауне после недавнего 429."""
+
+    def __init__(self, message: str, is_ip_block: bool = False):
+        super().__init__(message)
+        # True — подтверждённый бан по IP-репутации (см. IP_BLOCK_COOLDOWN_SECONDS),
+        # а не обычная квота или разовый антибот-челлендж. Используется в bot.py,
+        # чтобы один раз честно предупредить в чате, а не молчать вечно про то,
+        # что арбитраж не работает.
+        self.is_ip_block = is_ip_block
 
 
 _request_lock = asyncio.Lock()
@@ -129,17 +152,24 @@ async def load_persisted_cooldown() -> None:
         )
 
 
-async def _note_429(retry_after: str | None, headers: dict, body: str = "") -> float:
+async def _note_429(retry_after: str | None, headers: dict, body: str = "") -> tuple[float, bool]:
+    """Возвращает (пауза_в_секундах, is_ip_block)."""
     global _cooldown_until, _consecutive_429
 
     # Настоящий рейт-лимит всегда сообщает Retry-After или X-RateLimit-*.
-    # Если их нет — это, скорее всего, вовсе не квота, а антибот-защита
-    # (CSFloat стоит за Cloudflare, а мы стучимся с датацентрового IP Render).
     has_limit_headers = any(
         "ratelimit" in k.lower() or k.lower() == "retry-after" for k in headers
     )
+    # Подтверждённый бан по IP-репутации — тело прямым текстом просит
+    # отключить VPN/сменить сеть. Проверяем ДО ветки has_limit_headers на
+    # случай, если CSFloat когда-нибудь начнёт слать лимит-заголовки и на
+    # такие ответы тоже — это всё равно не квота, ждать бесполезно.
+    is_ip_block = any(marker in body.lower() for marker in _IP_BLOCK_MARKERS)
 
-    if has_limit_headers:
+    if is_ip_block:
+        seconds = IP_BLOCK_COOLDOWN_SECONDS
+        verdict = "тело ответа говорит про VPN — это бан по IP, не квота (короткие ретраи бессмысленны)"
+    elif has_limit_headers:
         # Реальная квота: имеет смысл ждать, и ждать всё дольше при повторах.
         _consecutive_429 += 1
         seconds = min(
@@ -172,7 +202,7 @@ async def _note_429(retry_after: str | None, headers: dict, body: str = "") -> f
         log.warning("CSFloat 429: начало тела ответа: %r", body[:400])
 
     await _persist_cooldown()
-    return seconds
+    return seconds, is_ip_block
 
 
 async def _note_ok() -> None:
@@ -317,9 +347,12 @@ async def fetch_listings_page(
                 body = await resp.text()
             except Exception:
                 pass
-            seconds = await _note_429(resp.headers.get("Retry-After"), dict(resp.headers), body)
+            seconds, is_ip_block = await _note_429(
+                resp.headers.get("Retry-After"), dict(resp.headers), body
+            )
             raise CSFloatRateLimited(
-                f"CSFloat ответил 429 — запросы приостановлены на {seconds / 60:.0f} мин."
+                f"CSFloat ответил 429 — запросы приостановлены на {seconds / 60:.0f} мин.",
+                is_ip_block=is_ip_block,
             )
         if resp.status in (401, 403):
             body = (await resp.text())[:200]
