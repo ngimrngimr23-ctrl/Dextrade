@@ -118,6 +118,11 @@ _last_request_at = 0.0
 # scope -> {"cooldown_until": float, "consecutive_429": int, "last_429_at": float}
 _cooldowns: dict[str, dict] = {}
 
+# Все области, которые ходят в Steam. Нужен явный список: при 429 в одной из них
+# остальные надо придержать (Steam банит IP, а не эндпоинт — см. note_steam_429),
+# а узнать о ещё не созданных состояниях из _cooldowns нельзя.
+KNOWN_SCOPES = ("listings", "pricing")
+
 
 def _cooldown_state(scope: str) -> dict:
     return _cooldowns.setdefault(
@@ -228,7 +233,7 @@ async def load_persisted_cooldown() -> None:
     """
     from storage import get_steam_cooldown
 
-    for scope in ("listings", "pricing"):
+    for scope in KNOWN_SCOPES:
         try:
             persisted = await get_steam_cooldown(scope)
         except Exception:
@@ -249,10 +254,22 @@ async def load_persisted_cooldown() -> None:
 
 async def note_steam_429(scope: str = "listings", headers: dict | None = None) -> float:
     """
-    Зафиксировать 429 в указанной области: ставит кулдаун только для неё
-    (растёт вдвое при 429 подряд в этой же области), остальные области не
-    трогает. Возвращает длину кулдауна.
+    Зафиксировать 429 в указанной области. Возвращает длину кулдауна для неё.
     headers — заголовки ответа Steam, попадают в диагностический слепок.
+
+    ВАЖНО про области: разделение на "listings" и "pricing" — НАША выдумка,
+    Steam её не соблюдает. Он банит IP целиком, независимо от того, на какой
+    эндпоинт пришёл запрос. Раньше кулдаун ставился только своей области, и
+    это было видно в логах как абсурд: prewarm заваливал pricing, Steam банил
+    IP, а вотчлист следом делал СВОЙ ПЕРВЫЙ запрос за весь процесс и мгновенно
+    получал 429 — диагностика показывала "запросов этой области 24ч=1". То есть
+    listings не заработал бан, а унаследовал чужой, но всё равно наращивал себе
+    счётчик и удваивал кулдаун, а сама попытка ещё и продлевала реальный бан.
+
+    Поэтому остальным областям ставится "сопутствующий" кулдаун — базовый
+    COOLDOWN_AFTER_429_SECONDS, БЕЗ роста и БЕЗ увеличения их счётчика: они ни
+    в чём не виноваты, наказывать их эскалацией не за что, но и лезть на
+    забаненный IP им нельзя.
     """
     state = _cooldown_state(scope)
     state["consecutive_429"] += 1
@@ -268,7 +285,31 @@ async def note_steam_429(scope: str = "listings", headers: dict | None = None) -
     state["cooldown_until"] = max(state["cooldown_until"], time.time() + seconds)
     state["last_429_at"] = time.time()
     await _persist_cooldown(scope)
+
+    await _apply_collateral_cooldown(scope)
     return seconds
+
+
+async def _apply_collateral_cooldown(banned_scope: str) -> None:
+    """
+    Придержать остальные области после 429 — бан у Steam по IP, а не по эндпоинту.
+    Счётчик 429 подряд им НЕ трогаем: он отражает "сколько раз эта область
+    провинилась", а она не провинилась.
+    """
+    until = time.time() + COOLDOWN_AFTER_429_SECONDS
+    for other in KNOWN_SCOPES:
+        if other == banned_scope:
+            continue
+        other_state = _cooldown_state(other)
+        if other_state["cooldown_until"] >= until:
+            continue  # там уже стоит кулдаун подлиннее — не укорачиваем
+        other_state["cooldown_until"] = until
+        log.warning(
+            "Steam: область %s придержана на %.0f мин заодно с %s — бан у Steam по IP, "
+            "а не по эндпоинту",
+            other, COOLDOWN_AFTER_429_SECONDS / 60, banned_scope,
+        )
+        await _persist_cooldown(other)
 
 
 async def note_steam_ok(scope: str = "listings") -> None:
