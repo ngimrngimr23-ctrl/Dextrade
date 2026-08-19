@@ -143,7 +143,7 @@ WATCHLIST_ITEM_DELAY_SECONDS = 3  # пауза между предметами �
 # цена Steam приходит внутри ответа CSFloat (см. csfloat_client.py).
 ARB_JOB_PREFIX = "arb_scan_"
 ARB_INTERVAL_MINUTES = 5.0
-ARB_PAGES_PER_SCAN = 4  # 4 страницы по 50 = до 200 свежих лотов за прогон
+ARB_PAGES_PER_SCAN = 4  # 4 страницы по 50 = до 200 лотов за прогон, самых дешёвых относительно Steam
 _arb_running: set[int] = set()
 
 # chat_id -> идёт прогон вотчлиста прямо сейчас — защита от наложения тиков,
@@ -1335,6 +1335,7 @@ async def _run_arb_scan(bot, chat_id: int) -> int | None:
     try:
         listings = await csfloat_client.fetch_market(
             pages=ARB_PAGES_PER_SCAN,
+            sort_by="highest_discount",
             min_price=settings["min_price"],
             max_price=settings["max_price"],
         )
