@@ -52,6 +52,7 @@ import time
 from dataclasses import dataclass, field
 
 import aiohttp
+import yarl
 
 log = logging.getLogger("steam_bot.csfloat")
 
@@ -82,6 +83,19 @@ _API_HEADERS = {
     "User-Agent": CSFLOAT_USER_AGENT,
     "Accept": "application/json",
 }
+
+# Прокси через Cloudflare Worker — ровно тот же приём, которым уже решена
+# ТА ЖЕ САМАЯ проблема со Steam (см. steam_client.STEAM_PROXY_URL): у Render
+# датацентровый IP, который у площадки в чёрном списке, а у воркера — нет.
+# Интерфейс воркера общий: GET <прокси>/proxy?url=<полный целевой URL>,
+# поэтому можно переиспользовать уже развёрнутый воркер, указав здесь его же
+# адрес. Пусто (по умолчанию) — ходим напрямую, как раньше.
+#
+# ВАЖНО: заголовки (в т.ч. Authorization) при таком запросе уходят ВОРКЕРУ.
+# Чтобы ключ дошёл до CSFloat, воркер должен пересылать заголовок дальше —
+# ровно та же оговорка, что про куки Steam. Для GET /listings это, впрочем,
+# скорее всего неважно: по документации этот эндпоинт ключа не требует.
+CSFLOAT_PROXY_URL = os.environ.get("CSFLOAT_PROXY_URL", "").rstrip("/")
 
 COOLDOWN_AFTER_429_SECONDS = 10 * 60
 COOLDOWN_MAX_SECONDS = 2 * 60 * 60
@@ -147,6 +161,11 @@ def key_fingerprint() -> str:
     if len(k) <= 6:
         return f"длина {len(k)}, подозрительно короткий"
     return f"длина {len(k)}, {k[:2]}…{k[-2:]}"
+
+
+def route_description() -> str:
+    """Через что идём в CSFloat — для логов и /arbreset."""
+    return f"воркер {CSFLOAT_PROXY_URL}" if CSFLOAT_PROXY_URL else "напрямую (без прокси)"
 
 
 async def reset_cooldown() -> None:
@@ -244,8 +263,8 @@ async def _note_429(retry_after: str | None, headers: dict, body: str = "") -> t
     # стучались. По документации GET /listings ключ не требует, так что его
     # наличие тут скорее всего ни на что не влияет, но видеть это надо.
     log.warning(
-        "CSFloat 429: наш запрос — User-Agent=%r, ключ: %s",
-        CSFLOAT_USER_AGENT, key_fingerprint(),
+        "CSFloat 429: наш запрос — User-Agent=%r, ключ: %s, маршрут: %s",
+        CSFLOAT_USER_AGENT, key_fingerprint(), route_description(),
     )
 
     await _persist_cooldown()
@@ -351,6 +370,22 @@ def _parse_listing(raw: dict) -> CSFloatListing | None:
         return None
 
 
+def _build_request(path: str, params: dict[str, str]) -> tuple[str, dict[str, str]]:
+    """
+    Куда реально слать запрос. Без CSFLOAT_PROXY_URL — напрямую в CSFloat.
+    С ним — в воркер, а настоящий адрес уезжает параметром url.
+
+    Целевой URL собираем через yarl.URL.with_query, а наружу отдаём его одной
+    строкой в params — так aiohttp закодирует его РОВНО ОДИН раз. Ровно на этом
+    в steam_client уже обжигались: если склеить закодированную строку руками,
+    yarl кодирует её повторно (%20 -> %2520) и прокси получает мусор.
+    """
+    if not CSFLOAT_PROXY_URL:
+        return f"{CSFLOAT_BASE_URL}{path}", params
+    target = yarl.URL(f"{CSFLOAT_BASE_URL}{path}").with_query(params)
+    return f"{CSFLOAT_PROXY_URL}/proxy", {"url": str(target)}
+
+
 async def fetch_listings_page(
     session: aiohttp.ClientSession,
     *,
@@ -384,9 +419,9 @@ async def fetch_listings_page(
         params["max_price"] = str(int(max_price * 100))
 
     await _throttle()
-    url = f"{CSFLOAT_BASE_URL}/listings"
+    url, request_params = _build_request("/listings", params)
     async with session.get(
-        url, params=params, headers={**_API_HEADERS, "Authorization": CSFLOAT_API_KEY}
+        url, params=request_params, headers={**_API_HEADERS, "Authorization": CSFLOAT_API_KEY}
     ) as resp:
         if resp.status == 429:
             body = ""
