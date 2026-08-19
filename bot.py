@@ -953,6 +953,29 @@ async def watchclear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Вотчлист очищен — удалено {len(current)} предмет(ов).")
 
 
+def _chunk_lines(lines: list[str], limit: int = 3800, sep: str = "\n") -> list[str]:
+    """
+    Склеивает строки через sep в куски не длиннее limit — Telegram обрывает
+    сообщения длиннее 4096 символов ошибкой "Message is too long", а не сам
+    режет их на части. Нужно везде, где число строк растёт вместе со списком
+    пользователя (вотчлист, список охоты за флоатом) — на фиксированном
+    маленьком числе строк лимит не грозит, но проверено на живом инциденте:
+    при 110 предметах в вотчлисте /watchlist падал именно с этой ошибкой.
+    """
+    chunks, chunk = [], ""
+    for line in lines:
+        candidate = (chunk + sep + line) if chunk else line
+        if len(candidate) > limit:
+            if chunk:
+                chunks.append(chunk)
+            chunk = line
+        else:
+            chunk = candidate
+    if chunk:
+        chunks.append(chunk)
+    return chunks
+
+
 async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/watchlist — показать текущий вотчлист и интервал автоскана."""
     chat_id = update.effective_chat.id
@@ -969,7 +992,8 @@ async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"📋 Вотчлист ({len(items)}), следующий прогон — через {interval:g} мин после конца текущего/предыдущего:"]
     for i, name in enumerate(items, start=1):
         lines.append(f"{i}. {name}")
-    await update.message.reply_text("\n".join(lines))
+    for chunk in _chunk_lines(lines):
+        await update.message.reply_text(chunk)
 
 
 # --- Отдельный список под охоту за редким флоатом (/floatadd) ---------------
@@ -1118,7 +1142,8 @@ async def floatlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"🔍 Охота за флоатом ({len(items)}), условие: {threshold}"]
     for i, name in enumerate(items, start=1):
         lines.append(f"{i}. {name}")
-    await update.message.reply_text("\n".join(lines))
+    for chunk in _chunk_lines(lines):
+        await update.message.reply_text(chunk)
 
 
 def _offer_key(market_hash_name: str, offer: Offer) -> str:
@@ -1300,17 +1325,7 @@ def _format_arb_chunks(offers) -> list[str]:
         block += f'\n  <a href="{o.url}">Открыть на CSFloat</a>'
         lines.append(block)
 
-    chunks, chunk = [], ""
-    for line in lines:
-        candidate = (chunk + "\n\n" + line) if chunk else line
-        if len(candidate) > 3800:
-            chunks.append(chunk)
-            chunk = line
-        else:
-            chunk = candidate
-    if chunk:
-        chunks.append(chunk)
-    return chunks
+    return _chunk_lines(lines, sep="\n\n")
 
 
 async def _run_arb_scan(bot, chat_id: int) -> int | None:
