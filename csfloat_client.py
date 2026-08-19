@@ -106,6 +106,33 @@ _API_HEADERS = {
 # Чтобы ключ дошёл до CSFloat, воркер должен пересылать заголовок дальше —
 # ровно та же оговорка, что про куки Steam. Для GET /listings это, впрочем,
 # скорее всего неважно: по документации этот эндпоинт ключа не требует.
+#
+# ПОДОЗРЕНИЕ НА ВОРКЕР (не проверено вживую, проверять по инструкции ниже).
+# Воркер, похоже, ПОМЕНЯЛ проблему, а не убрал её. Что видно из логов:
+#
+#   * Через воркер 429 приходит С заголовками лимита и телом «too many
+#     requests» — то есть до CSFloat мы доезжаем и ключ он видит (аноним
+#     получил бы limit 50000, а мы видим 200). Это уже не тот отказ, что был
+#     напрямую: там было «disable your VPN» и заголовков лимита не было вовсе.
+#   * Но x-ratelimit-remaining = 0 приходил на ПЕРВЫЙ же запрос свежего
+#     процесса. Своих запросов мы столько потратить не могли: единственный
+#     потребитель — арбитражный скан, это 48 запросов в час при лимите 200.
+#
+# Сойтись это может только если счётчик считает не одних нас, то есть окно
+# лимита привязано к IP, а не к ключу. Исходящий адрес у Cloudflare Workers
+# общий на всех арендаторов — тогда бюджет CSFloat на этот адрес выжигают
+# чужие запросы, и наши 24% бюджета роли уже не играют. Проще говоря: с
+# датацентрового IP нас резали по репутации, с адреса воркера — режут по
+# чужой квоте.
+#
+# КАК ПРОВЕРИТЬ (одна минута, кода не требует): убрать CSFLOAT_PROXY_URL из
+# переменных на Render, дождаться передеплоя, вызвать /arbreset и /arbnow.
+#   - если пришёл 200 и /status показывает квоту вида «199 из 200» — счётчик
+#     привязан к IP, воркер был причиной, и его тут быть не должно;
+#   - если пришёл 429 с телом про VPN и БЕЗ заголовков лимита — вернулся
+#     старый бан по репутации адреса, воркер решал реальную задачу, и тогда
+#     нужен не общий edge-адрес Cloudflare, а выделенный исходящий IP.
+# Ответ различает два случая однозначно, поэтому гадать дальше не надо.
 CSFLOAT_PROXY_URL = os.environ.get("CSFLOAT_PROXY_URL", "").rstrip("/")
 
 COOLDOWN_AFTER_429_SECONDS = 10 * 60
@@ -149,6 +176,14 @@ _request_lock = asyncio.Lock()
 _last_request_at = 0.0
 _cooldown_until = 0.0  # epoch-секунды: переживает рестарт через storage
 _consecutive_429 = 0
+
+# Последний увиденный остаток квоты (x-ratelimit-*). Раньше эти числа только
+# уходили в лог одной строкой на успешный ответ — а успешных ответов как раз и
+# не было, так что единственный момент, когда мы узнавали про бюджет, был уже
+# постфактум, в 429. Из-за этого несколько дней держалась версия «фильтр
+# слишком строгий, поэтому ничего не находится», хотя скан ни разу не дошёл до
+# данных. Держим последнее замеренное значение и показываем его в /status.
+_last_budget: dict | None = None
 
 
 def csfloat_enabled() -> bool:
@@ -251,9 +286,61 @@ def _seconds_until_reset(headers: dict) -> float | None:
     return delta + 5  # +5 сек, чтобы не проснуться ровно на границе окна
 
 
+def _note_budget(headers: dict) -> None:
+    """
+    Запомнить остаток квоты из заголовков ЛЮБОГО ответа — и успешного, и 429.
+    Смысл именно в «любого»: пока мы читали их только на 200, при постоянном
+    429 бюджет оставался невидимым ровно тогда, когда он и был причиной.
+    """
+    global _last_budget
+
+    remaining = _header(headers, "x-ratelimit-remaining")
+    if remaining is None:
+        return
+    try:
+        remaining_n = int(float(remaining))
+    except (TypeError, ValueError):
+        return
+
+    limit = _header(headers, "x-ratelimit-limit")
+    try:
+        limit_n = int(float(limit)) if limit else None
+    except (TypeError, ValueError):
+        limit_n = None
+
+    _last_budget = {
+        "remaining": remaining_n,
+        "limit": limit_n,
+        "reset_in": _seconds_until_reset(headers),
+        "seen_at": time.time(),
+    }
+
+
+def budget_description() -> str | None:
+    """
+    Человекочитаемый остаток квоты для /status. None — мы ещё ни одного ответа
+    с заголовками лимита не видели.
+
+    Зачем в /status: это единственное число, которое отличает «фильтр слишком
+    строгий» от «мы вообще не доходим до данных». Без него обе ситуации
+    выглядят одинаково — бот молчит.
+    """
+    if not _last_budget:
+        return None
+    b = _last_budget
+    age_min = (time.time() - b["seen_at"]) / 60
+    out = f"{b['remaining']} из {b['limit'] or '?'}"
+    if b["reset_in"]:
+        out += f", окно сбросится через {b['reset_in'] / 60:.0f} мин"
+    out += f" (замер {age_min:.0f} мин назад)"
+    return out
+
+
 async def _note_429(retry_after: str | None, headers: dict, body: str = "") -> tuple[float, bool]:
     """Возвращает (пауза_в_секундах, is_ip_block)."""
     global _cooldown_until, _consecutive_429
+
+    _note_budget(headers)
 
     # Настоящий рейт-лимит всегда сообщает Retry-After или X-RateLimit-*.
     has_limit_headers = any(
@@ -543,15 +630,10 @@ async def fetch_listings_page(
         await _note_ok()
         # Остаток лимита логируем — это то, чего так не хватало со Steam:
         # там мы про лимит узнавали только по факту бана.
-        remaining = _header(dict(resp.headers), "x-ratelimit-remaining")
-        if remaining is not None:
-            limit = _header(dict(resp.headers), "x-ratelimit-limit")
-            reset_in = _seconds_until_reset(dict(resp.headers))
-            log.info(
-                "csfloat: остаток лимита %s из %s%s",
-                remaining, limit or "?",
-                f", окно сбросится через {reset_in / 60:.0f} мин" if reset_in else "",
-            )
+        _note_budget(dict(resp.headers))
+        budget = budget_description()
+        if budget:
+            log.info("csfloat: остаток лимита %s", budget)
 
         data = await resp.json()
 
