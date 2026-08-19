@@ -16,15 +16,15 @@ Community Market, в центах) и item.scm.volume (объём продаж, 
 Ключ берётся в профиле csfloat.com на вкладке developer и задаётся переменной
 окружения CSFLOAT_API_KEY (в код не зашивается).
 
-ВАЖНО про ключ и GET /listings. По документации CSFloat ключ нужен только тем
-эндпоинтам, которые это прямо заявляют ("Endpoints that require an API Key will
-state so"): у POST /v1/listings в примере стоит "Authorization: <API-KEY>" и
-подпись "Requires an authorization header", а у GET /v1/listings пример — голый
-`curl "https://csfloat.com/api/v1/listings"` без всякой авторизации. То есть
-список лотов публичный, и наш ключ на нём, скорее всего, вообще не смотрят:
-для CSFloat мы тут анонимный трафик. Заголовок всё равно шлём (не мешает и
-может давать headroom), но рассчитывать, что ключ снимет ограничения именно
-здесь, нельзя — упираемся мы не в ключ, а в защиту публичного эндпоинта.
+ВАЖНО про ключ и GET /listings: ДОКУМЕНТАЦИЯ УСТАРЕЛА, ключ обязателен.
+В доке пример голый — `curl "https://csfloat.com/api/v1/listings"` без всякой
+авторизации, и раздел Authentication говорит "Endpoints that require an API Key
+will state so", а /listings этого не заявляет. По этому я и заключил, что
+эндпоинт публичный. На практике запрос без ключа получает
+403 {"code":1,"message":"You need to be logged in to search listings"}.
+Квоты у авторизованных и анонимных тоже разные: с ключом приходит
+x-ratelimit-limit: 200, без ключа — 50000 (но с отказом по существу).
+Вывод: ключ здесь нужен, он проверяется, и лимит 200 — это лимит НА КЛЮЧ.
 
 ВАЖНО про лимиты: заголовки остатка лимита CSFloat присылает не всегда. 429 без
 них — это НЕ обязательно квота: как минимум один раз тело ответа прямым текстом
@@ -222,6 +222,35 @@ async def load_persisted_cooldown() -> None:
         )
 
 
+def _header(headers: dict, name: str) -> str | None:
+    """Заголовок без оглядки на регистр — CSFloat шлёт их в разном виде."""
+    lowered = name.lower()
+    for k, v in headers.items():
+        if k.lower() == lowered:
+            return v
+    return None
+
+
+def _seconds_until_reset(headers: dict) -> float | None:
+    """
+    Сколько ждать до сброса окна по x-ratelimit-reset (epoch-секунды).
+    None — заголовка нет или он бессмысленный (в прошлом, слишком далеко).
+    Потолок тот же COOLDOWN_MAX_SECONDS: доверять чужому числу без границы
+    нельзя, опечатка на их стороне усыпила бы бота на сутки.
+    """
+    raw = _header(headers, "x-ratelimit-reset")
+    if not raw:
+        return None
+    try:
+        reset_at = float(raw)
+    except (TypeError, ValueError):
+        return None
+    delta = reset_at - time.time()
+    if delta <= 0 or delta > COOLDOWN_MAX_SECONDS:
+        return None
+    return delta + 5  # +5 сек, чтобы не проснуться ровно на границе окна
+
+
 async def _note_429(retry_after: str | None, headers: dict, body: str = "") -> tuple[float, bool]:
     """Возвращает (пауза_в_секундах, is_ip_block)."""
     global _cooldown_until, _consecutive_429
@@ -245,12 +274,21 @@ async def _note_429(retry_after: str | None, headers: dict, body: str = "") -> t
         seconds = min(
             COOLDOWN_AFTER_429_SECONDS * (2 ** (_consecutive_429 - 1)), COOLDOWN_MAX_SECONDS
         )
-        if retry_after:  # сервис прямо сказал, сколько ждать — верим ему, а не формуле
+        verdict = "похоже на реальную квоту"
+
+        # x-ratelimit-reset — точный момент сброса окна, epoch-секунды. Это
+        # лучший источник, чем наша формула: в первом же живом случае формула
+        # дала 10 минут, а окно сбрасывалось через 46, то есть бот пошёл бы
+        # долбиться в заведомо пустую квоту ещё четыре раза подряд.
+        reset_in = _seconds_until_reset(headers)
+        if reset_in is not None:
+            seconds = reset_in
+            verdict = f"квота исчерпана, окно сбросится через {reset_in / 60:.0f} мин (x-ratelimit-reset)"
+        elif retry_after:  # сервис прямо сказал, сколько ждать — верим ему, а не формуле
             try:
                 seconds = max(seconds, float(retry_after))
             except ValueError:
                 pass
-        verdict = "похоже на реальную квоту"
     else:
         # Антибот-защита: ожидание НЕ помогает, лечится только изменением
         # запроса (заголовки, IP). Поэтому короткая фиксированная пауза без
@@ -476,6 +514,16 @@ async def fetch_listings_page(
                     f"Это ответ прокси, а не CSFloat — ключ ни при чём. "
                     f"Добавь csfloat.com в белый список хостов воркера. Маршрут: {route_description()}"
                 )
+            # "You need to be logged in" (code 1) значит не "ключ плохой", а
+            # "ключа не было вовсе": до CSFloat он не доехал. Через прокси это
+            # чаще всего воркер, не пересылающий Authorization.
+            if "logged in" in body.lower():
+                raise CSFloatError(
+                    f"CSFloat не увидел ключ (HTTP {resp.status}): {body!r}. "
+                    f"Ключ у нас {key_fingerprint()}, маршрут: {route_description()}. "
+                    "Если идём через прокси — проверь, что воркер пересылает заголовок "
+                    "Authorization (см. cloudflare-worker/worker.js)."
+                )
             raise CSFloatError(
                 f"CSFloat отклонил ключ (HTTP {resp.status}). Проверь CSFLOAT_API_KEY "
                 f"на Render — он берётся в профиле csfloat.com, вкладка developer. "
@@ -495,9 +543,15 @@ async def fetch_listings_page(
         await _note_ok()
         # Остаток лимита логируем — это то, чего так не хватало со Steam:
         # там мы про лимит узнавали только по факту бана.
-        remaining = resp.headers.get("x-ratelimit-remaining") or resp.headers.get("X-RateLimit-Remaining")
+        remaining = _header(dict(resp.headers), "x-ratelimit-remaining")
         if remaining is not None:
-            log.info("csfloat: остаток лимита по заголовку = %s", remaining)
+            limit = _header(dict(resp.headers), "x-ratelimit-limit")
+            reset_in = _seconds_until_reset(dict(resp.headers))
+            log.info(
+                "csfloat: остаток лимита %s из %s%s",
+                remaining, limit or "?",
+                f", окно сбросится через {reset_in / 60:.0f} мин" if reset_in else "",
+            )
 
         data = await resp.json()
 
