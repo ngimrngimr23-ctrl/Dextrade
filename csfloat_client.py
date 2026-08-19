@@ -16,14 +16,31 @@ Community Market, в центах) и item.scm.volume (объём продаж, 
 Ключ берётся в профиле csfloat.com на вкладке developer и задаётся переменной
 окружения CSFLOAT_API_KEY (в код не зашивается).
 
-ВАЖНО про лимиты: на практике заголовки остатка лимита CSFloat присылает не
-всегда. 429 без них — это НЕ обязательно квота: как минимум один раз тело
-ответа прямым текстом говорило "Please disable your VPN or try a different
-network" — это собственная блокировка CSFloat по репутации IP (Render сидит
-на датацентровых адресах, которые Cloudflare/CSFloat помечают как VPN).
-Такую блокировку время не лечит — она снимается только сменой исходящего IP,
-поэтому для неё отдельный, куда более длинный и не растущий кулдаун: частые
-ретраи против нерешаемой блокировки бессмысленны и только зря дёргают чат.
+ВАЖНО про ключ и GET /listings. По документации CSFloat ключ нужен только тем
+эндпоинтам, которые это прямо заявляют ("Endpoints that require an API Key will
+state so"): у POST /v1/listings в примере стоит "Authorization: <API-KEY>" и
+подпись "Requires an authorization header", а у GET /v1/listings пример — голый
+`curl "https://csfloat.com/api/v1/listings"` без всякой авторизации. То есть
+список лотов публичный, и наш ключ на нём, скорее всего, вообще не смотрят:
+для CSFloat мы тут анонимный трафик. Заголовок всё равно шлём (не мешает и
+может давать headroom), но рассчитывать, что ключ снимет ограничения именно
+здесь, нельзя — упираемся мы не в ключ, а в защиту публичного эндпоинта.
+
+ВАЖНО про лимиты: заголовки остатка лимита CSFloat присылает не всегда. 429 без
+них — это НЕ обязательно квота: как минимум один раз тело ответа прямым текстом
+говорило "Please disable your VPN or try a different network" — то есть нас
+отсекли по репутации адреса (Render сидит на датацентровых IP, которые
+Cloudflare/CSFloat помечают как VPN), а не по исчерпанной квоте. Такое время не
+лечит, поэтому для этого случая отдельный длинный и не растущий кулдаун.
+
+ВАЖНО про заголовки — тут была ошибка, не повторять. Сначала мы слали обрезанный
+"Mozilla/5.0" (явная подпись бота), потом — полный набор заголовков Chrome с
+Origin/Referer/Sec-Fetch-Site: same-origin. Второе, судя по всему, только
+ухудшило дело: заголовки заявляют вкладку браузера на csfloat.com, а TLS-отпечаток
+у aiohttp питоновский, кук и cf_clearance нет — это противоречие антибот-защита
+ловит надёжнее, чем честного клиента. В документации показан обычный curl, то
+есть честный не-браузерный клиент для их API — норма. Поэтому здесь МИНИМАЛЬНЫЙ
+честный набор заголовков и никакой имитации браузера.
 """
 
 from __future__ import annotations
@@ -38,7 +55,10 @@ import aiohttp
 
 log = logging.getLogger("steam_bot.csfloat")
 
-CSFLOAT_API_KEY = os.environ.get("CSFLOAT_API_KEY", "")
+# .strip() не косметика: лишний пробел или перевод строки, случайно попавший в
+# значение переменной окружения на Render, делает заголовок невалидным — aiohttp
+# в этом случае падает с ValueError, и выглядело бы это как загадочная поломка.
+CSFLOAT_API_KEY = os.environ.get("CSFLOAT_API_KEY", "").strip()
 CSFLOAT_BASE_URL = "https://csfloat.com/api/v1"
 
 # Пауза между запросами. Точного публичного числа у CSFloat нет (в доке лимиты
@@ -47,27 +67,20 @@ CSFLOAT_BASE_URL = "https://csfloat.com/api/v1"
 MIN_REQUEST_INTERVAL = 1.5
 MAX_LIMIT = 50  # жёсткий потолок эндпоинта, больше он всё равно не отдаст
 
-# CSFloat стоит за Cloudflare, а запросы идут с датацентрового IP Render —
-# то есть мы и так в группе риска по антибот-защите. Урезанный "Mozilla/5.0"
-# в User-Agent (как было в первой версии) для неё явная подпись бота, поэтому
-# представляемся полноценным браузером и шлём тот же набор заголовков, что и
-# реальная вкладка. Это не обход защиты, а отказ от заведомо подозрительного
-# минимализма: запросы всё равно идут по документированному API со своим ключом.
-_BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Origin": "https://csfloat.com",
-    "Referer": "https://csfloat.com/search",
-    "sec-ch-ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
+# Честный API-клиент: ровно то, что шлёт curl из примера в документации, плюс
+# осмысленный User-Agent, по которому нас можно опознать. Никаких Origin,
+# Referer и Sec-Fetch-* — см. предупреждение в докстринге модуля: имитация
+# браузера с питоновским TLS-отпечатком выглядит подозрительнее честного бота.
+# UA вынесен в переменную окружения, чтобы перебирать варианты без правки кода
+# и передеплоя логики — это чисто диагностическая ручка.
+CSFLOAT_USER_AGENT = os.environ.get(
+    "CSFLOAT_USER_AGENT",
+    "Dextrade/1.0 (+https://github.com/ngimrngimr23-ctrl/Dextrade)",
+)
+
+_API_HEADERS = {
+    "User-Agent": CSFLOAT_USER_AGENT,
+    "Accept": "application/json",
 }
 
 COOLDOWN_AFTER_429_SECONDS = 10 * 60
@@ -120,6 +133,33 @@ def csfloat_enabled() -> bool:
 
 def cooldown_remaining() -> float:
     return max(0.0, _cooldown_until - time.time())
+
+
+def key_fingerprint() -> str:
+    """
+    Безопасное описание ключа для логов и диагностики: длина и по два символа
+    с краёв. Сам ключ в логи не попадает НИКОГДА — а понять, доехал ли он до
+    Render целиком и тот ли он, что ожидался, этого достаточно.
+    """
+    if not CSFLOAT_API_KEY:
+        return "не задан"
+    k = CSFLOAT_API_KEY
+    if len(k) <= 6:
+        return f"длина {len(k)}, подозрительно короткий"
+    return f"длина {len(k)}, {k[:2]}…{k[-2:]}"
+
+
+async def reset_cooldown() -> None:
+    """
+    Снять кулдаун вручную. Нужно потому, что кулдаун при IP-блоке длинный (3 ч)
+    и переживает передеплой: без этой ручки любая проверка изменений в запросе
+    упиралась бы в ожидание, которое к самому изменению отношения не имеет.
+    """
+    global _cooldown_until, _consecutive_429
+    _cooldown_until = 0.0
+    _consecutive_429 = 0
+    await _persist_cooldown()
+    log.info("csfloat: кулдаун сброшен вручную")
 
 
 async def _persist_cooldown() -> None:
@@ -200,6 +240,13 @@ async def _note_429(retry_after: str | None, headers: dict, body: str = "") -> t
     log.warning("CSFloat 429: все заголовки ответа: %s", dict(headers))
     if body:
         log.warning("CSFloat 429: начало тела ответа: %r", body[:400])
+    # Что мы сами отправили — чтобы не гадать, доехал ли ключ и с каким UA
+    # стучались. По документации GET /listings ключ не требует, так что его
+    # наличие тут скорее всего ни на что не влияет, но видеть это надо.
+    log.warning(
+        "CSFloat 429: наш запрос — User-Agent=%r, ключ: %s",
+        CSFLOAT_USER_AGENT, key_fingerprint(),
+    )
 
     await _persist_cooldown()
     return seconds, is_ip_block
@@ -339,7 +386,7 @@ async def fetch_listings_page(
     await _throttle()
     url = f"{CSFLOAT_BASE_URL}/listings"
     async with session.get(
-        url, params=params, headers={**_BROWSER_HEADERS, "Authorization": CSFLOAT_API_KEY}
+        url, params=params, headers={**_API_HEADERS, "Authorization": CSFLOAT_API_KEY}
     ) as resp:
         if resp.status == 429:
             body = ""
@@ -412,7 +459,7 @@ async def fetch_market(
     cursor = None
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=30),
-        headers=_BROWSER_HEADERS,
+        headers=_API_HEADERS,
     ) as session:
         for page in range(pages):
             listings, cursor = await fetch_listings_page(

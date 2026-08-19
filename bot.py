@@ -1644,7 +1644,10 @@ async def arbnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cooldown = csfloat_client.cooldown_remaining()
     if cooldown > 0:
-        await update.message.reply_text(f"CSFloat на кулдауне после 429 — ещё {cooldown / 60:.0f} мин.")
+        await update.message.reply_text(
+            f"CSFloat на кулдауне после 429 — ещё {cooldown / 60:.0f} мин.\n"
+            "Сбросить и попробовать сразу: /arbreset"
+        )
         return
 
     await update.message.reply_text("Смотрю рынок CSFloat…")
@@ -1666,6 +1669,25 @@ async def arbnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not sent:
         await update.message.reply_text("Готово, ничего подходящего не нашлось.")
+
+
+async def arbreset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /arbreset — снять кулдаун CSFloat вручную и показать, с чем мы к нему ходим.
+
+    Кулдаун при блокировке по IP длинный (3 ч) и переживает передеплой, поэтому
+    без ручного сброса нельзя проверить, помогла ли правка запроса: ждёшь не
+    результат правки, а истечение таймера, который к ней отношения не имеет.
+    """
+    cooldown = csfloat_client.cooldown_remaining()
+    await csfloat_client.reset_cooldown()
+    was = f"был {cooldown / 60:.0f} мин" if cooldown > 0 else "кулдауна и не было"
+    await update.message.reply_text(
+        f"✅ Кулдаун CSFloat сброшен ({was}).\n"
+        f"Ключ: {csfloat_client.key_fingerprint()}\n"
+        f"User-Agent: {csfloat_client.CSFLOAT_USER_AGENT}\n\n"
+        "Проверить прямо сейчас: /arbnow"
+    )
 
 
 async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1958,6 +1980,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/setarbvolume <шт> — только ликвидное (сколько продаётся на Steam)\n"
         "/setarbstickers <макс%> — ещё и лоты, где наклейки достаются почти даром\n"
         "/arbnow — проверить прямо сейчас\n"
+        "/arbreset — снять кулдаун CSFloat и показать, чем мы к нему стучимся\n"
         f"Учти: выручка от продажи в Steam приходит на кошелёк и не выводится, "
         f"поэтому в сообщениях показываю «чистыми» с учётом комиссии "
         f"~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%."
@@ -1981,6 +2004,7 @@ BOT_COMMANDS = [
     BotCommand("scanall", "Сканировать весь вотчлист прямо сейчас"),
     BotCommand("setarb", "Арбитраж: CSFloat дешевле Steam на N%"),
     BotCommand("arbnow", "Проверить арбитраж прямо сейчас"),
+    BotCommand("arbreset", "Снять кулдаун CSFloat"),
     BotCommand("setarbprice", "Арбитраж: диапазон цены лота"),
     BotCommand("setarbvolume", "Арбитраж: фильтр ликвидности"),
     BotCommand("setarbstickers", "Арбитраж: наклейки почти даром"),
@@ -2098,6 +2122,7 @@ def main():
     app.add_handler(CommandHandler("setarbvolume", setarbvolume))
     app.add_handler(CommandHandler("setarbstickers", setarbstickers))
     app.add_handler(CommandHandler("arbnow", arbnow))
+    app.add_handler(CommandHandler("arbreset", arbreset))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_selection))
     app.run_polling()
