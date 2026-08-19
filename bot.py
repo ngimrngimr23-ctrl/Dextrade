@@ -1769,13 +1769,21 @@ async def arbreset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cooldown = csfloat_client.cooldown_remaining()
     await csfloat_client.reset_cooldown()
     was = f"был {cooldown / 60:.0f} мин" if cooldown > 0 else "кулдауна и не было"
-    await update.message.reply_text(
-        f"✅ Кулдаун CSFloat сброшен ({was}).\n"
-        f"Ключ: {csfloat_client.key_fingerprint()}\n"
-        f"User-Agent: {csfloat_client.CSFLOAT_USER_AGENT}\n"
-        f"Маршрут: {csfloat_client.route_description()}\n\n"
-        "Проверить прямо сейчас: /arbnow"
-    )
+    lines = [
+        f"✅ Кулдаун CSFloat сброшен ({was}).",
+        f"Ключ: {csfloat_client.key_fingerprint()}",
+        f"User-Agent: {csfloat_client.CSFLOAT_USER_AGENT}",
+        f"Маршрут: {csfloat_client.route_description()}",
+    ]
+    # Сброс кулдауна не добавляет квоты. Если в прошлый раз остаток был нулевой,
+    # а окно ещё не сбросилось, то /arbnow сразу упрётся в тот же 429 — лучше
+    # сказать это здесь, чем дать потыкать вслепую.
+    budget = csfloat_client.budget_description()
+    if budget:
+        lines.append(f"Квота в прошлый замер: {budget}")
+    lines.append("")
+    lines.append("Проверить прямо сейчас: /arbnow")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):

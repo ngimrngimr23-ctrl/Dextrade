@@ -167,6 +167,29 @@ _IP_BLOCK_MARKERS = ("vpn", "different network")
 
 _COOLDOWN_SCOPE = "csfloat"
 
+# Повтор при 429 «квота исчерпана» — ДО ухода в кулдаун.
+#
+# Обоснование от 2026-08-19: остаток шёл ровно по нашим запросам (199..194) с
+# якорем окна ~:32, а через шесть минут, без единого нашего запроса, пришёл
+# остаток 0 с якорем :30:01. Разные якоря — разные счётчики, то есть запросы
+# уходят не с одного исходящего адреса (Cloudflare берёт его из пула), и часть
+# адресов приходит уже выжженной чужими.
+#
+# Если так, то уходить на 44 минуты в кулдаун после ОДНОГО отказа — ошибка:
+# следующая попытка вполне может уехать с другого адреса, где бюджет целый.
+# Цена проверки ограничена парой запросов, а выигрыш — рабочий скан вместо
+# часа простоя. Если повторы стабильно упираются в один и тот же якорь, значит
+# счётчик всё-таки общий и один — это будет видно в логе.
+QUOTA_429_RETRIES = 2
+QUOTA_429_RETRY_DELAY = 4.0
+
+
+def _is_quota_429(headers: dict, body: str) -> bool:
+    """429 про исчерпанную квоту, а не бан по репутации адреса и не антибот."""
+    if any(marker in body.lower() for marker in _IP_BLOCK_MARKERS):
+        return False
+    return any("ratelimit" in k.lower() or k.lower() == "retry-after" for k in headers)
+
 
 class CSFloatError(RuntimeError):
     """Что-то не так с запросом к CSFloat (кроме рейт-лимита)."""
@@ -320,10 +343,24 @@ def _note_budget(headers: dict) -> None:
     except (TypeError, ValueError):
         limit_n = None
 
+    # Абсолютный якорь окна, а не только «через сколько». Без него нельзя
+    # отличить одно окно от другого, а это ровно тот вопрос, который сейчас
+    # открыт: 2026-08-19 остаток шёл ровно по нашим запросам (199..194) с
+    # якорем ~:32, а через шесть минут БЕЗ единого нашего запроса пришёл 0 с
+    # якорем :30:01. Два разных якоря — это два разных счётчика, то есть мы
+    # ходим не через один исходящий адрес. Пока якорь не логировался, такие
+    # переключения выглядели как «лимит ведёт себя необъяснимо».
+    raw_reset = _header(headers, "x-ratelimit-reset")
+    try:
+        reset_at = float(raw_reset) if raw_reset else None
+    except (TypeError, ValueError):
+        reset_at = None
+
     _last_budget = {
         "remaining": remaining_n,
         "limit": limit_n,
         "reset_in": _seconds_until_reset(headers),
+        "reset_at": reset_at,
         "seen_at": time.time(),
     }
 
@@ -344,7 +381,10 @@ def budget_description() -> str | None:
     out = f"{b['remaining']} из {b['limit'] or '?'}"
     if b["reset_in"]:
         out += f", окно сбросится через {b['reset_in'] / 60:.0f} мин"
-    out += f" (замер {age_min:.0f} мин назад)"
+    if b.get("reset_at"):
+        # Якорь окна в UTC — по нему видно, тот же это счётчик или уже другой.
+        out += f" (окно до {time.strftime('%H:%M:%S', time.gmtime(b['reset_at']))} UTC)"
+    out += f", замер {age_min:.0f} мин назад"
     return out
 
 
@@ -551,40 +591,26 @@ def _build_request(path: str, params: dict[str, str]) -> tuple[str, dict[str, st
     return f"{CSFLOAT_PROXY_URL}/proxy", {"url": str(target)}
 
 
-async def fetch_listings_page(
-    session: aiohttp.ClientSession,
-    *,
-    cursor: str | None = None,
-    limit: int = MAX_LIMIT,
-    sort_by: str = "most_recent",
-    min_price: float | None = None,
-    max_price: float | None = None,
-) -> tuple[list[CSFloatListing], str | None]:
+class _QuotaRetry(Exception):
     """
-    Одна страница лотов CSFloat. Возвращает (лоты, курсор_следующей_страницы).
-    Цены на вход — в долларах, наружу в API уходят центами.
+    Внутренний сигнал «429 по квоте, но кулдаун ещё не ставили».
+
+    Нужен, чтобы решение о повторе принимал вызывающий код, а сам запрос
+    оставался одной прямой функцией без ветки «а это уже последняя попытка?».
+    Наружу не выходит: либо повторяем, либо превращаем в CSFloatRateLimited.
     """
-    if not csfloat_enabled():
-        raise CSFloatError("CSFLOAT_API_KEY не задан")
-    if cooldown_remaining() > 0:
-        raise CSFloatRateLimited(
-            f"CSFloat на кулдауне после 429 — ещё {cooldown_remaining() / 60:.0f} мин."
-        )
 
-    params: dict[str, str] = {
-        "limit": str(min(limit, MAX_LIMIT)),
-        "sort_by": sort_by,
-        "type": "buy_now",  # аукционы для мгновенного арбитража не годятся
-    }
-    if cursor:
-        params["cursor"] = cursor
-    if min_price is not None:
-        params["min_price"] = str(int(min_price * 100))
-    if max_price is not None:
-        params["max_price"] = str(int(max_price * 100))
+    def __init__(self, headers: dict, body: str):
+        super().__init__("429 quota")
+        self.headers = headers
+        self.body = body
 
+
+async def _request_listings(
+    session: aiohttp.ClientSession, url: str, request_params: dict[str, str]
+):
+    """Один запрос за страницей лотов. Возвращает разобранный JSON."""
     await _throttle()
-    url, request_params = _build_request("/listings", params)
     async with session.get(
         url, params=request_params, headers={**_API_HEADERS, "Authorization": CSFLOAT_API_KEY}
     ) as resp:
@@ -594,8 +620,13 @@ async def fetch_listings_page(
                 body = await resp.text()
             except Exception:
                 pass
+            headers = dict(resp.headers)
+            if _is_quota_429(headers, body):
+                raise _QuotaRetry(headers, body)
+            # Бан по репутации адреса или антибот — повторять бессмысленно,
+            # кулдаун ставим сразу.
             seconds, is_ip_block = await _note_429(
-                resp.headers.get("Retry-After"), dict(resp.headers), body
+                _header(headers, "Retry-After"), headers, body
             )
             raise CSFloatRateLimited(
                 f"CSFloat ответил 429 — запросы приостановлены на {seconds / 60:.0f} мин.",
@@ -647,7 +678,70 @@ async def fetch_listings_page(
         if budget:
             log.info("csfloat: остаток лимита %s", budget)
 
-        data = await resp.json()
+        return await resp.json()
+
+
+async def fetch_listings_page(
+    session: aiohttp.ClientSession,
+    *,
+    cursor: str | None = None,
+    limit: int = MAX_LIMIT,
+    sort_by: str = "most_recent",
+    min_price: float | None = None,
+    max_price: float | None = None,
+) -> tuple[list[CSFloatListing], str | None]:
+    """
+    Одна страница лотов CSFloat. Возвращает (лоты, курсор_следующей_страницы).
+    Цены на вход — в долларах, наружу в API уходят центами.
+    """
+    if not csfloat_enabled():
+        raise CSFloatError("CSFLOAT_API_KEY не задан")
+    if cooldown_remaining() > 0:
+        raise CSFloatRateLimited(
+            f"CSFloat на кулдауне после 429 — ещё {cooldown_remaining() / 60:.0f} мин."
+        )
+
+    params: dict[str, str] = {
+        "limit": str(min(limit, MAX_LIMIT)),
+        "sort_by": sort_by,
+        "type": "buy_now",  # аукционы для мгновенного арбитража не годятся
+    }
+    if cursor:
+        params["cursor"] = cursor
+    if min_price is not None:
+        params["min_price"] = str(int(min_price * 100))
+    if max_price is not None:
+        params["max_price"] = str(int(max_price * 100))
+
+    url, request_params = _build_request("/listings", params)
+
+    # Повторяем только квотный 429 — см. QUOTA_429_RETRIES. Кулдаун ставится
+    # ОДИН раз, после последней неудачной попытки: иначе первый же отказ
+    # запирает бота на час, даже если следующий запрос уехал бы с другого,
+    # не выжженного адреса.
+    attempt = 0
+    while True:
+        try:
+            data = await _request_listings(session, url, request_params)
+            break
+        except _QuotaRetry as retry:
+            attempt += 1
+            _note_budget(retry.headers)
+            if attempt > QUOTA_429_RETRIES:
+                seconds, is_ip_block = await _note_429(
+                    _header(retry.headers, "Retry-After"), retry.headers, retry.body
+                )
+                raise CSFloatRateLimited(
+                    f"CSFloat ответил 429 — запросы приостановлены на {seconds / 60:.0f} мин.",
+                    is_ip_block=is_ip_block,
+                ) from None
+            log.warning(
+                "csfloat: 429 по квоте (%s). Попытка %d из %d — повторяю через %.0f с, "
+                "вдруг следующий запрос уедет с другого исходящего адреса",
+                budget_description() or "остаток неизвестен",
+                attempt, QUOTA_429_RETRIES, QUOTA_429_RETRY_DELAY,
+            )
+            await asyncio.sleep(QUOTA_429_RETRY_DELAY)
 
     # Формат ответа документирован как массив, но встречались обёртки вида
     # {"data": [...]} — поддерживаем оба, чтобы не падать на ровном месте.
