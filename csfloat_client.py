@@ -370,6 +370,23 @@ def _parse_listing(raw: dict) -> CSFloatListing | None:
         return None
 
 
+# Ответы, которые генерирует сам воркер-прокси, а не CSFloat. Список короткий и
+# по делу: воркер отдаёт короткий текст, CSFloat — JSON с полем error.
+_PROXY_ERROR_MARKERS = ("host not allowed", "missing url", "invalid url", "bad url")
+
+
+def _looks_like_proxy_error(body: str) -> bool:
+    """
+    Похоже ли, что этот ответ сочинил наш воркер, а не CSFloat. Нужно, чтобы не
+    выдавать ошибку прокси за ошибку площадки: один раз бот уже доложил
+    "CSFloat отклонил ключ" на воркерское "host not allowed: csfloat.com",
+    и это увело диагностику совсем не туда.
+    """
+    if not CSFLOAT_PROXY_URL:
+        return False  # без прокси сочинять такое некому
+    return any(marker in body.lower() for marker in _PROXY_ERROR_MARKERS)
+
+
 def _build_request(path: str, params: dict[str, str]) -> tuple[str, dict[str, str]]:
     """
     Куда реально слать запрос. Без CSFLOAT_PROXY_URL — напрямую в CSFloat.
@@ -438,13 +455,31 @@ async def fetch_listings_page(
             )
         if resp.status in (401, 403):
             body = (await resp.text())[:200]
+            # Через прокси 4xx может прийти ОТ ВОРКЕРА, а не от CSFloat, и тогда
+            # совет "проверь ключ" уводит в сторону — так и вышло: воркер отдал
+            # "host not allowed: csfloat.com" (в его белом списке был только
+            # steamcommunity.com), а бот доложил про отклонённый ключ.
+            if _looks_like_proxy_error(body):
+                raise CSFloatError(
+                    f"Воркер-прокси не пропустил запрос (HTTP {resp.status}): {body!r}. "
+                    f"Это ответ прокси, а не CSFloat — ключ ни при чём. "
+                    f"Добавь csfloat.com в белый список хостов воркера. Маршрут: {route_description()}"
+                )
             raise CSFloatError(
                 f"CSFloat отклонил ключ (HTTP {resp.status}). Проверь CSFLOAT_API_KEY "
-                f"на Render — он берётся в профиле csfloat.com, вкладка developer. Ответ: {body!r}"
+                f"на Render — он берётся в профиле csfloat.com, вкладка developer. "
+                f"Ответ: {body!r}. Маршрут: {route_description()}"
             )
         if resp.status != 200:
             body = (await resp.text())[:200]
-            raise CSFloatError(f"CSFloat вернул HTTP {resp.status}: {body!r}")
+            if _looks_like_proxy_error(body):
+                raise CSFloatError(
+                    f"Воркер-прокси вернул HTTP {resp.status}: {body!r} "
+                    f"(это ответ прокси, а не CSFloat). Маршрут: {route_description()}"
+                )
+            raise CSFloatError(
+                f"CSFloat вернул HTTP {resp.status}: {body!r}. Маршрут: {route_description()}"
+            )
 
         await _note_ok()
         # Остаток лимита логируем — это то, чего так не хватало со Steam:
