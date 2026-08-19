@@ -1724,12 +1724,20 @@ async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     cooldown = steam_cooldown_remaining()
     if cooldown > 0:
+        # Без этого лога отказ был неотличим в Render от штатного sendMessage —
+        # ровно то, что сбивало с толку при разборе "почему /scanall ничего не
+        # делает": в логе не было ни слова "Steam", ни слова "кулдаун".
+        log.info(
+            "scanall: chat_id=%s отказ — кулдаун Steam (listings) ещё %.0f мин",
+            chat_id, cooldown / 60,
+        )
         await update.message.reply_text(
             f"Steam на кулдауне после 429 (это временный бан IP, который продлевается от новых "
             f"попыток) — ещё {cooldown / 60:.0f} мин. Попробуй после этого."
         )
         return
 
+    log.info("scanall: chat_id=%s начинаю скан %s предмет(ов)", chat_id, len(items))
     await update.message.reply_text(f"Начинаю скан {len(items)} предмет(ов) из вотчлиста…")
     found_any = await _run_watchlist_scan(context.bot, chat_id)
     await update.message.reply_text(
