@@ -62,6 +62,7 @@ from pricing import (
     clear_manual_prices,
     manual_prices_count,
     get_csgotrader_price_details,
+    get_steam_market_price,
     STEAM_POOL,
 )
 from analyzer import (
@@ -202,6 +203,11 @@ ARB_SORT_BY = os.environ.get("ARB_SORT_BY", "most_recent")
 # 25% выбрано так, чтобы обычная разница в методике не мешала, а случай
 # «$28.18 против $12» отсекался гарантированно.
 ARB_SOURCE_GAP_PCT = 25.0
+
+# Сколько кандидатов проверять живым запросом к Steam за прогон.
+# priceoverview отвечает по одному предмету, поэтому потолок нужен: пятнадцать
+# — ровно столько влезает в сообщение, так что ниже по коду ничего не теряется.
+ARB_VERIFY_LIMIT = 15
 _arb_running: set[int] = set()
 
 # chat_id -> идёт прогон вотчлиста прямо сейчас — защита от наложения тиков,
@@ -1416,6 +1422,82 @@ def _format_arb_chunks(offers) -> list[str]:
     return _chunk_lines(lines, sep="\n\n")
 
 
+async def _verify_against_steam(offers, min_discount_pct: float) -> list:
+    """
+    Проверить кандидатов живой ценой Steam и пересчитать по ней.
+
+    Зачем понадобилось. Двух источников не хватило: прайс-лист csgotrader и
+    справка CSFloat расходятся вдвое и систематически. На находках 2026-08-20
+    отношение держалось около 2.3 у всех подряд, причём справка почти точно
+    совпадала с ценой лота — она и считается по рынку CSFloat, это не цена
+    Steam. По двум источникам такое не разрешается: нужен третий, настоящий.
+
+    Дорого это только по запросам — priceoverview отвечает по одному предмету,
+    пакетного эндпоинта у Steam нет. Поэтому проверяем ТОЛЬКО то, что уже
+    прошло отбор: десяток кандидатов вместо тысячи просмотренных лотов.
+
+    Лот, который не подтвердился, выбрасывается: лучше промолчать, чем звать
+    покупать по цене, которой нет.
+    """
+    if not offers:
+        return offers
+    if not STEAM_POOL.enabled() and steam_cooldown_remaining(scope="pricing") > 0:
+        log.warning(
+            "arb: Steam на кулдауне и прокси нет — цены оставлены непроверенными"
+        )
+        return offers
+
+    verified = []
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+        for o in offers[:ARB_VERIFY_LIMIT]:
+            try:
+                live = await get_steam_market_price(session, o.market_hash_name)
+            except Exception:
+                log.exception("arb: не смог проверить цену Steam для %s", o.market_hash_name)
+                live = None
+
+            if live is None or not live.lowest:
+                log.info(
+                    "arb: %s — Steam цену не подтвердил, выбрасываю (оценка была $%.2f)",
+                    o.market_hash_name, o.steam_price,
+                )
+                continue
+
+            was, was_pct = o.steam_price, o.discount_pct
+            o.steam_price = live.lowest
+            o.steam_price_window = "живая цена Steam"
+            o.steam_volume = live.volume
+            o.steam_sales_recent = bool(live.volume)
+            o.discount_pct = (live.lowest - o.csfloat_price) / live.lowest * 100
+            o.net_after_fee = live.lowest * STEAM_FEE_MULTIPLIER - o.csfloat_price
+            o.steam_price_second_opinion = (
+                f"оценка была ${was:.2f} ({was_pct:.0f}%), Steam на самом деле ${live.lowest:.2f}"
+            )
+
+            log.info(
+                "arb: %s — оценка $%.2f (%.1f%%), Steam на самом деле $%.2f "
+                "(медиана $%s, продаж за сутки %s) -> скидка %.1f%%",
+                o.market_hash_name, was, was_pct, live.lowest,
+                f"{live.median:.2f}" if live.median else "?", live.volume or 0,
+                o.discount_pct,
+            )
+
+            # Порог применяем ЗАНОВО. Отбор проходил по оценке, а она может
+            # быть завышена вдвое — тогда «скидка 58%» после проверки
+            # оказывается 4%, и слать такое нельзя: лот отобрали по числу,
+            # которого не существует.
+            if o.discount_pct < min_discount_pct:
+                log.info(
+                    "arb: %s — после проверки скидка %.1f%% ниже порога %.0f%%, выбрасываю",
+                    o.market_hash_name, o.discount_pct, min_discount_pct,
+                )
+                continue
+            verified.append(o)
+
+    verified.sort(key=lambda x: x.discount_pct, reverse=True)
+    return verified
+
+
 def _warn_if_over_budget() -> None:
     """
     Сказать при старте, влезает ли настройка скана в квоту CSFloat.
@@ -1615,6 +1697,12 @@ async def _run_arb_scan(bot, chat_id: int) -> int | None:
             return 0
 
         # Тот же дедуп, что у вотчлиста: один и тот же лот не присылаем повторно
+        # Третий источник: спрашиваем настоящую цену у Steam по кандидатам.
+        offers = await _verify_against_steam(offers, settings["min_discount"])
+        if not offers:
+            log.info("arb: chat_id=%s ни один кандидат не подтвердился ценой Steam", chat_id)
+            return 0
+
         # Ключ дедупа — предмет и цена, а НЕ listing_id.
         #
         # По listing_id дедуп почти не работал: у ходового предмета десятки

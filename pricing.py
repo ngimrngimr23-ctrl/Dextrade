@@ -470,6 +470,57 @@ def _money(raw) -> float | None:
         return None
 
 
+class SteamMarketPrice(NamedTuple):
+    """Живой ответ Steam priceoverview по одному предмету."""
+
+    lowest: float | None    # нижняя цена в стакане — столько стоит КУПИТЬ сейчас
+    median: float | None    # медиана продаж за сутки
+    volume: int | None      # сколько продано за сутки
+
+
+async def get_steam_market_price(
+    session: aiohttp.ClientSession, market_hash_name: str
+) -> SteamMarketPrice | None:
+    """
+    Настоящая цена предмета — у самого Steam, а не по чужой оценке.
+
+    Понадобилось, потому что двух источников оказалось мало. Прайс-лист
+    csgotrader и справка CSFloat расходятся ВДВОЕ и систематически: на всех
+    находках 2026-08-20 отношение держалось около 2.3, причём справка почти
+    точно совпадала с ценой лота (она и считается по рынку CSFloat, это не
+    цена Steam). Какой из двух прав, по ним самим не определить никогда —
+    нужен третий источник, и другого настоящего нет.
+
+    Пакетного эндпоинта цен у Steam нет, priceoverview отвечает по одному
+    предмету. Поэтому звать это можно ТОЛЬКО по горстке кандидатов, уже
+    прошедших дешёвый отбор, а не по всему просмотренному рынку.
+
+    lowest — то, что реально заплатишь; median — медиана продаж, то же по
+    смыслу, что даёт прайс-лист. Для арбитража нужен lowest.
+    """
+    data = await _get_with_retry(
+        session,
+        "https://steamcommunity.com/market/priceoverview/",
+        {"appid": 730, "currency": 1, "market_hash_name": market_hash_name},
+        "priceoverview",
+    )
+    if not data or not data.get("success"):
+        return None
+
+    volume = None
+    if data.get("volume"):
+        try:
+            volume = int(str(data["volume"]).replace(",", "").replace(" ", ""))
+        except ValueError:
+            volume = None
+
+    return SteamMarketPrice(
+        lowest=_money(data.get("lowest_price")),
+        median=_money(data.get("median_price")),
+        volume=volume,
+    )
+
+
 async def _price_overview(session: aiohttp.ClientSession, market_hash_name: str) -> float | None:
     url = "https://steamcommunity.com/market/priceoverview/"
     params = {"appid": 730, "currency": 1, "market_hash_name": market_hash_name}
