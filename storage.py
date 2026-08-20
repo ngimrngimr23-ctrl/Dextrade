@@ -324,6 +324,34 @@ async def set_arb_setting(chat_id: int, key: str, value) -> None:
     await _save_chat_settings(chat_id, settings)
 
 
+async def get_market_settings(chat_id: int) -> dict:
+    """
+    Настройки сравнения с площадками (/markets).
+
+    Значение None означает «не задано», и тогда действует значение по
+    умолчанию из кода — так настройка отличается от осознанно выставленного
+    нуля, что для порогов важно.
+    """
+    s = await _get_chat_settings(chat_id)
+    return {
+        "min_discount": s.get("mk_min_discount"),
+        "max_discount": s.get("mk_max_discount"),
+        "min_price": s.get("mk_min_price"),
+        "min_profit": s.get("mk_min_profit"),
+        "min_volume": s.get("mk_min_volume"),
+    }
+
+
+async def set_market_setting(chat_id: int, key: str, value) -> None:
+    """key — одно из: min_discount, max_discount, min_price, min_profit, min_volume."""
+    allowed = {"min_discount", "max_discount", "min_price", "min_profit", "min_volume"}
+    if key not in allowed:
+        raise ValueError(f"неизвестная настройка площадок: {key}")
+    settings = await _get_chat_settings(chat_id)
+    settings[f"mk_{key}"] = value
+    await _save_chat_settings(chat_id, settings)
+
+
 async def all_chat_ids_with_settings() -> list[int]:
     """
     Чаты, у которых вообще есть сохранённые настройки — нужно, чтобы понять,

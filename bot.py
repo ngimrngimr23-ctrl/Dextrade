@@ -92,6 +92,8 @@ from storage import (
     all_watchlist_chat_ids,
     was_offer_sent_recently,
     SENT_OFFER_TTL_SECONDS,
+    get_market_settings,
+    set_market_setting,
     mark_offer_sent,
     get_arb_settings,
     set_arb_setting,
@@ -220,12 +222,15 @@ ARB_SOURCE_GAP_PCT = 25.0
 ARB_VERIFY_LIMIT = int(os.environ.get("ARB_VERIFY_LIMIT", "80"))
 
 # Сколько находок с площадок проверять живой ценой Steam за раз.
-MARKETS_VERIFY_LIMIT = int(os.environ.get("MARKETS_VERIFY_LIMIT", "60"))
+MARKETS_VERIFY_LIMIT = int(os.environ.get("MARKETS_VERIFY_LIMIT", "25"))
 
 # Минимум продаж в Steam за сутки, чтобы находка считалась реализуемой.
 # Без этого «выгода» бумажная: предмет, который не продаётся, не перепродать
 # ни за какую цену. Объёма продаж в прайс-листах нет вовсе — только у Steam.
 MARKETS_MIN_VOLUME = int(os.environ.get("MARKETS_MIN_VOLUME", "5"))
+
+# Порог спреда по умолчанию, пока пользователь не задал свой через /setmarkets.
+MARKETS_DEFAULT_DISCOUNT = float(os.environ.get("MARKETS_DEFAULT_DISCOUNT", "20"))
 _arb_running: set[int] = set()
 
 # chat_id -> идёт прогон вотчлиста прямо сейчас — защита от наложения тиков,
@@ -2063,7 +2068,74 @@ async def arbnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Готово, ничего подходящего не нашлось.")
 
 
-async def _verify_markets_against_steam(offers, min_discount_pct: float):
+async def setmarkets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /setmarkets — пороги для сравнения с площадками, по-человечески.
+
+    Без аргументов показывает текущие значения. Дальше — пара «что» и
+    «сколько», например:
+        /setmarkets спред 30
+        /setmarkets продажи 20
+        /setmarkets прибыль 5
+        /setmarkets потолок 60
+        /setmarkets цена 10
+    """
+    chat_id = update.effective_chat.id
+    current = await get_market_settings(chat_id)
+
+    def value_of(key, default):
+        return current[key] if current[key] is not None else default
+
+    if not context.args:
+        await update.message.reply_text(
+            "<b>Пороги для /markets</b>\n"
+            f"  спред: от {value_of('min_discount', MARKETS_DEFAULT_DISCOUNT):g}%\n"
+            f"  потолок спреда: {value_of('max_discount', market_prices.MAX_SANE_DISCOUNT_PCT):g}% "
+            f"<i>(выше — почти всегда дефект данных)</i>\n"
+            f"  продажи в Steam за сутки: от {value_of('min_volume', MARKETS_MIN_VOLUME)}\n"
+            f"  прибыль: от ${value_of('min_profit', market_prices.MIN_NET_PROFIT):g}\n"
+            f"  цена предмета: от ${value_of('min_price', market_prices.MIN_MARKET_PRICE):g}\n\n"
+            "Поменять: <code>/setmarkets спред 30</code>\n"
+            "Что можно: спред, потолок, продажи, прибыль, цена",
+            parse_mode="HTML",
+        )
+        return
+
+    aliases = {
+        "спред": ("min_discount", "%"), "скидка": ("min_discount", "%"),
+        "потолок": ("max_discount", "%"),
+        "продажи": ("min_volume", "шт"), "объём": ("min_volume", "шт"),
+        "прибыль": ("min_profit", "$"),
+        "цена": ("min_price", "$"),
+    }
+    name = context.args[0].lower()
+    if name not in aliases:
+        await update.message.reply_text(
+            f"Не знаю настройку {name!r}. Доступны: {', '.join(sorted(set(aliases)))}"
+        )
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Не хватает значения. Пример: /setmarkets спред 30")
+        return
+
+    key, unit = aliases[name]
+    try:
+        raw = context.args[1].replace("%", "").replace("$", "").replace(",", ".")
+        value = int(float(raw)) if key == "min_volume" else float(raw)
+    except ValueError:
+        await update.message.reply_text(f"{context.args[1]!r} — не число.")
+        return
+    if value < 0:
+        await update.message.reply_text("Отрицательное значение не имеет смысла.")
+        return
+
+    await set_market_setting(chat_id, key, value)
+    await update.message.reply_text(
+        f"✅ {name}: {value:g} {unit}\n\nПроверить прямо сейчас: /markets"
+    )
+
+
+async def _verify_markets_against_steam(offers, min_discount_pct: float, min_volume: int):
     """
     Проверить находки с площадок живой ценой Steam и отсеять неликвид.
 
@@ -2080,9 +2152,12 @@ async def _verify_markets_against_steam(offers, min_discount_pct: float):
     """
     if not offers:
         return []
+    if STEAM_POOL.enabled() and STEAM_POOL.all_exhausted():
+        log.warning("markets: все адреса пула на кулдауне после 429 — проверять нечем")
+        return [], 0, len(offers)
     if not STEAM_POOL.enabled() and steam_cooldown_remaining(scope="pricing") > 0:
         log.warning("markets: Steam на кулдауне и прокси нет — проверить цены нечем")
-        return []
+        return [], 0, len(offers)
 
     lanes = max(1, len(STEAM_POOL))
     semaphore = asyncio.Semaphore(lanes)
@@ -2097,19 +2172,24 @@ async def _verify_markets_against_steam(offers, min_discount_pct: float):
                 return offer, None
 
     verified = []
+    unavailable = 0   # не смогли проверить: Steam не ответил
+    rejected = 0      # проверили и отбраковали — это разные вещи
+
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
         for offer, live in await asyncio.gather(*(check(o, session) for o in offers)):
             if live is None or not live.lowest:
+                unavailable += 1
                 continue
 
             was = offer.steam_price
             offer.apply_live_steam(live.lowest, live.volume)
 
-            if (live.volume or 0) < MARKETS_MIN_VOLUME:
+            if (live.volume or 0) < min_volume:
                 log.info(
                     "markets: %s — продаж за сутки %s, меньше %d: перепродать будет некому",
-                    offer.market_hash_name, live.volume or 0, MARKETS_MIN_VOLUME,
+                    offer.market_hash_name, live.volume or 0, min_volume,
                 )
+                rejected += 1
                 continue
             if offer.discount_pct < min_discount_pct:
                 log.info(
@@ -2117,11 +2197,19 @@ async def _verify_markets_against_steam(offers, min_discount_pct: float):
                     "скидка %.1f%% ниже порога",
                     offer.market_hash_name, was, live.lowest, offer.discount_pct,
                 )
+                rejected += 1
                 continue
             verified.append(offer)
 
-    log.info("markets: подтвердилось %d из %d проверенных", len(verified), len(offers))
-    return verified
+    log.info(
+        "markets: подтвердилось %d, отбраковано %d, НЕ УДАЛОСЬ проверить %d из %d",
+        len(verified), rejected, unavailable, len(offers),
+    )
+    # Возвращаем и то, что не удалось проверить: смешивать «проверили и не
+    # подошло» с «не смогли проверить» нельзя. На проде из-за этого бот заявил
+    # «ни один не подтвердился, значит это расхождения в прайс-листах» при том,
+    # что все 60 запросов упали на кулдауне Steam и не проверялся никто.
+    return verified, rejected, unavailable
 
 
 async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2138,14 +2226,33 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     дальше человек открывает площадку сам.
     """
     chat_id = update.effective_chat.id
+    saved = await get_market_settings(chat_id)
+
+    def setting(key, default):
+        return saved[key] if saved[key] is not None else default
+
+    # Аргумент команды перебивает сохранённый порог на один раз — удобно
+    # быстро пощупать другое значение, не меняя настройку.
     try:
-        threshold = float(context.args[0].replace("%", "").replace(",", ".")) if context.args else 20.0
-    except (ValueError, IndexError):
+        threshold = (
+            float(context.args[0].replace("%", "").replace(",", "."))
+            if context.args
+            else setting("min_discount", MARKETS_DEFAULT_DISCOUNT)
+        )
+    except ValueError:
         await update.message.reply_text("Порог не разобрал. Пример: /markets 25")
         return
 
+    min_volume = int(setting("min_volume", MARKETS_MIN_VOLUME))
+    max_discount = setting("max_discount", market_prices.MAX_SANE_DISCOUNT_PCT)
+    min_profit = setting("min_profit", market_prices.MIN_NET_PROFIT)
+    min_item_price = setting("min_price", market_prices.MIN_MARKET_PRICE)
+
     await update.message.reply_text(
-        f"Сравниваю Steam с площадками, порог {threshold:g}%. Это несколько файлов, займёт с полминуты…"
+        f"Сравниваю Steam с площадками.\n"
+        f"Спред от {threshold:g}% до {max_discount:g}%, прибыль от ${min_profit:g}, "
+        f"продаж в Steam от {min_volume} за сутки.\n"
+        f"Пороги: /setmarkets"
     )
 
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
@@ -2167,7 +2274,12 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for market, prices in by_market.items():
             found.extend(
                 market_prices.compare(
-                    steam_prices, prices, market, min_discount_pct=threshold,
+                    steam_prices, prices, market,
+                    min_discount_pct=threshold,
+                    max_discount_pct=max_discount,
+                    min_price=min_item_price,
+                    min_net_profit=min_profit,
+                    fee_multiplier=STEAM_FEE_MULTIPLIER,
                 )
             )
 
@@ -2185,12 +2297,28 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # списка была со скидками 90-95%, которых не существует. Заодно только так
     # и узнаётся ликвидность: объёма продаж в прайс-листе нет вовсе.
     before = len(found)
-    found = await _verify_markets_against_steam(found[:MARKETS_VERIFY_LIMIT], threshold)
+    found, rejected, unavailable = await _verify_markets_against_steam(
+        found[:MARKETS_VERIFY_LIMIT], threshold, min_volume
+    )
     if not found:
-        await update.message.reply_text(
-            f"Кандидатов было {before}, но ни один не подтвердился живой ценой Steam. "
-            "Значит это были расхождения в прайс-листах, а не выгода."
-        )
+        if unavailable and not rejected:
+            # Ничего не проверено — значит и сказать про находки нечего.
+            # Заявлять "это были расхождения в прайс-листах" тут нельзя: мы их
+            # не опровергли, мы до них не дошли.
+            await update.message.reply_text(
+                f"Кандидатов {before}, но проверить цены у Steam не удалось "
+                f"({unavailable} из {min(before, MARKETS_VERIFY_LIMIT)} запросов не прошли — "
+                "Steam ограничил доступ). Это НЕ значит, что находок нет: их просто "
+                "не с чем было сверить.\n\nПопробуй через несколько минут — "
+                "адреса освободятся."
+            )
+        else:
+            await update.message.reply_text(
+                f"Кандидатов было {before}. Проверено у Steam: {rejected} отбраковано"
+                + (f", {unavailable} не удалось проверить" if unavailable else "")
+                + ".\nНи одна находка не подтвердилась живой ценой — значит это были "
+                "расхождения в прайс-листах, а не выгода."
+            )
         return
     found.sort(key=lambda o: o.discount_pct, reverse=True)
     lines = [
@@ -2722,6 +2850,7 @@ BOT_COMMANDS = [
     BotCommand("watchresume", "Возобновить автоскан"),
     BotCommand("arbnow", "Проверить арбитраж CSFloat прямо сейчас"),
     BotCommand("markets", "Сравнить Steam с другими площадками (весь каталог)"),
+    BotCommand("setmarkets", "Пороги для /markets: спред, продажи, прибыль"),
     BotCommand("setarb", "Арбитраж: CSFloat дешевле Steam на N%"),
     BotCommand("help", "Полный справочник по всем командам"),
 ]
@@ -3045,6 +3174,7 @@ def _build_application(token: str):
     app.add_handler(CommandHandler("setarbstickers", setarbstickers))
     app.add_handler(CommandHandler("arbnow", arbnow))
     app.add_handler(CommandHandler("markets", markets))
+    app.add_handler(CommandHandler("setmarkets", setmarkets))
     app.add_handler(CommandHandler("arbreset", arbreset))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_selection))
