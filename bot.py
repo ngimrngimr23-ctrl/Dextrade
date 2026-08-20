@@ -2129,6 +2129,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         lines.append("  CSFloat: " + (f"⏸ кулдаун ещё {_fmt_mins(cf)} (/arbreset)" if cf > 0 else "✅ свободен"))
         lines.append(f"  маршрут CSFloat: {csfloat_client.route_description()}")
+        proxy_problem = csfloat_client.http_proxy_problem()
+        if proxy_problem:
+            lines.append(f"  ⚠️ прокси настроен неверно: {proxy_problem}")
         # Остаток квоты — то самое число, которое отличает «порог слишком
         # строгий» от «скан не дошёл до данных». Пока его не было видно, эти
         # два случая выглядели в чате одинаково: бот просто молчал.
@@ -2283,6 +2286,11 @@ async def _on_startup(app: Application):
     # процесса и тут же пробовал снова, продлевая реальный бан.
     await load_persisted_cooldown()
     await csfloat_client.load_persisted_cooldown()
+    if csfloat_client.csfloat_enabled():
+        log.info("csfloat: маршрут — %s", csfloat_client.route_description())
+        proxy_problem = csfloat_client.http_proxy_problem()
+        if proxy_problem:
+            log.error("csfloat: CSFLOAT_HTTP_PROXY задан неверно — %s", proxy_problem)
 
     asyncio.create_task(prewarm_loop())
 

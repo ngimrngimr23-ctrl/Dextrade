@@ -71,6 +71,8 @@ import os
 import time
 from dataclasses import dataclass, field
 
+from urllib.parse import urlsplit, urlunsplit
+
 import aiohttp
 import yarl
 
@@ -127,7 +129,14 @@ _API_HEADERS = {
 # ровно та же оговорка, что про куки Steam. Для GET /listings это, впрочем,
 # скорее всего неважно: по документации этот эндпоинт ключа не требует.
 #
-# ПРОВЕРЕНО ОПЫТОМ 2026-08-19 — воркер нужен, снимать его нельзя.
+# ВОРКЕР ТЕПЕРЬ ЗАПАСНОЙ ВАРИАНТ. Основной маршрут — CSFLOAT_HTTP_PROXY
+# (резидентный прокси, см. ниже): у воркера исходящий адрес берётся из общего
+# пула Cloudflare, и часть адресов приходит уже выжженной чужими запросами,
+# из-за чего скан проходит через раз. Воркер оставлен рабочим и включается
+# сам, если резидентный прокси не задан, — он всё равно лучше прямого
+# запроса. Ниже история, из-за которой он вообще появился.
+#
+# ПРОВЕРЕНО ОПЫТОМ 2026-08-19 — без прокси вообще CSFloat недоступен.
 # Переменную убирали и гоняли /arbnow напрямую: пришёл 429 с телом
 # {"error": "Please disable your VPN or try a different network, too many
 # requests"} и БЕЗ единого заголовка лимита. Это бан по репутации адреса, и он
@@ -146,6 +155,67 @@ _API_HEADERS = {
 # передеплоями, каждый из которых восстанавливал джобы и заново сканировал.
 # Лечится не сменой маршрута, а экономией запросов — см. ARB_PAGES_PER_SCAN.
 CSFLOAT_PROXY_URL = os.environ.get("CSFLOAT_PROXY_URL", "").rstrip("/")
+
+# Обычный HTTP-прокси — то, что продают под видом «резидентных прокси»
+# (Bright Data, Oxylabs, IPRoyal, Webshare и прочие). Формат стандартный:
+# http://логин:пароль@хост:порт
+#
+# Это ДРУГОЙ механизм, не путать с воркером выше. Воркер — это наш собственный
+# сервис, которому мы отдаём целевой адрес параметром url. Здесь же прокси
+# работает на транспортном уровне: запрос уходит по настоящему адресу
+# csfloat.com, а прокси лишь подменяет исходящий IP (aiohttp делает CONNECT).
+# Поэтому при заданном CSFLOAT_HTTP_PROXY воркер не используется вовсе —
+# городить два прокси друг за другом незачем.
+#
+# Зачем это вообще: датацентровый адрес Render CSFloat режет по репутации
+# («disable your VPN»), а у воркера исходящий адрес берётся из общего пула
+# Cloudflare, и часть адресов приходит уже выжженной чужими запросами — оба
+# случая подтверждены логами 2026-08-19. Резидентный адрес снимает обе
+# причины сразу: он не помечен как VPN и квота на нём наша.
+#
+# ВАЖНО: в этой строке лежит пароль. В логи она попадает ТОЛЬКО через
+# _mask_proxy() — не логировать её как есть.
+CSFLOAT_HTTP_PROXY = os.environ.get("CSFLOAT_HTTP_PROXY", "").strip()
+
+
+def http_proxy_problem() -> str | None:
+    """
+    Что не так с CSFLOAT_HTTP_PROXY, если не так. None — всё в порядке.
+
+    Проверяем схему отдельно и заранее, потому что aiohttp умеет только
+    http/https-прокси: SOCKS5 ему нужен через отдельный пакет aiohttp-socks,
+    которого в requirements нет. Продавцы резидентных прокси обычно дают и то
+    и другое, и молча купить SOCKS5-порт очень легко — а проявилось бы это
+    невнятной ошибкой соединения уже после оплаты.
+    """
+    if not CSFLOAT_HTTP_PROXY:
+        return None
+    parsed = urlsplit(CSFLOAT_HTTP_PROXY)
+    if parsed.scheme not in ("http", "https"):
+        return (
+            f"схема {parsed.scheme or 'не указана'!r} не поддерживается — aiohttp умеет "
+            "только http/https-прокси. Возьми у провайдера HTTP-порт "
+            "(обычно тот же хост, другой номер порта)"
+        )
+    if not parsed.hostname or not parsed.port:
+        return "не разобрать хост и порт — нужен формат http://логин:пароль@хост:порт"
+    return None
+
+
+def _mask_proxy(url: str) -> str:
+    """Адрес прокси без логина и пароля — для логов и /status."""
+    try:
+        parsed = urlsplit(url)
+        if not parsed.hostname:
+            # urlsplit на мусоре не падает, а возвращает пустые части — без этой
+            # проверки в лог уехала бы пустая строка вместо внятного «неверный
+            # формат», и настройка выглядела бы применённой.
+            return "адрес не разобрался (ожидается http://логин:пароль@хост:порт)"
+        if parsed.username or parsed.password:
+            return urlunsplit((parsed.scheme, f"***@{parsed.hostname}:{parsed.port}", "", "", ""))
+        return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+    except Exception:
+        return "адрес не разобрался (ожидается http://логин:пароль@хост:порт)"
 
 COOLDOWN_AFTER_429_SECONDS = 10 * 60
 COOLDOWN_MAX_SECONDS = 2 * 60 * 60
@@ -246,7 +316,11 @@ def key_fingerprint() -> str:
 
 def route_description() -> str:
     """Через что идём в CSFloat — для логов и /arbreset."""
-    return f"воркер {CSFLOAT_PROXY_URL}" if CSFLOAT_PROXY_URL else "напрямую (без прокси)"
+    if CSFLOAT_HTTP_PROXY:
+        return f"резидентный прокси {_mask_proxy(CSFLOAT_HTTP_PROXY)}"
+    if CSFLOAT_PROXY_URL:
+        return f"воркер {CSFLOAT_PROXY_URL}"
+    return "напрямую (без прокси)"
 
 
 async def reset_cooldown() -> None:
@@ -570,8 +644,10 @@ def _looks_like_proxy_error(body: str) -> bool:
     "CSFloat отклонил ключ" на воркерское "host not allowed: csfloat.com",
     и это увело диагностику совсем не туда.
     """
-    if not CSFLOAT_PROXY_URL:
-        return False  # без прокси сочинять такое некому
+    # Резидентный прокси таких ответов не сочиняет — он вообще не читает тело,
+    # а только пробрасывает соединение. Сочинять их может только наш воркер.
+    if CSFLOAT_HTTP_PROXY or not CSFLOAT_PROXY_URL:
+        return False
     return any(marker in body.lower() for marker in _PROXY_ERROR_MARKERS)
 
 
@@ -585,7 +661,9 @@ def _build_request(path: str, params: dict[str, str]) -> tuple[str, dict[str, st
     в steam_client уже обжигались: если склеить закодированную строку руками,
     yarl кодирует её повторно (%20 -> %2520) и прокси получает мусор.
     """
-    if not CSFLOAT_PROXY_URL:
+    # С резидентным прокси идём по настоящему адресу: подмена IP там на
+    # транспортном уровне (см. CSFLOAT_HTTP_PROXY), переписывать URL не нужно.
+    if CSFLOAT_HTTP_PROXY or not CSFLOAT_PROXY_URL:
         return f"{CSFLOAT_BASE_URL}{path}", params
     target = yarl.URL(f"{CSFLOAT_BASE_URL}{path}").with_query(params)
     return f"{CSFLOAT_PROXY_URL}/proxy", {"url": str(target)}
@@ -611,8 +689,31 @@ async def _request_listings(
 ):
     """Один запрос за страницей лотов. Возвращает разобранный JSON."""
     await _throttle()
+    try:
+        return await _do_request(session, url, request_params)
+    except aiohttp.ClientHttpProxyError as e:
+        # 407 и подобное от самого прокси: логин/пароль или тариф, а не CSFloat.
+        # Без этой ветки наружу летел бы голый трейсбек, и было бы неочевидно,
+        # что площадка тут вообще ни при чём.
+        raise CSFloatError(
+            f"Резидентный прокси отклонил запрос (HTTP {e.status}): проверь логин, пароль "
+            f"и остаток трафика в личном кабинете. Маршрут: {route_description()}"
+        ) from None
+    except aiohttp.ClientProxyConnectionError as e:
+        raise CSFloatError(
+            f"Не удалось подключиться к резидентному прокси ({e}). Проверь хост и порт "
+            f"в CSFLOAT_HTTP_PROXY. Маршрут: {route_description()}"
+        ) from None
+
+
+async def _do_request(
+    session: aiohttp.ClientSession, url: str, request_params: dict[str, str]
+):
     async with session.get(
-        url, params=request_params, headers={**_API_HEADERS, "Authorization": CSFLOAT_API_KEY}
+        url,
+        params=request_params,
+        headers={**_API_HEADERS, "Authorization": CSFLOAT_API_KEY},
+        proxy=CSFLOAT_HTTP_PROXY or None,
     ) as resp:
         if resp.status == 429:
             body = ""
