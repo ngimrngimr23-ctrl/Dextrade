@@ -6,6 +6,7 @@ N% наценки сверху".
 
 import logging
 from dataclasses import dataclass
+from urllib.parse import quote
 
 from steam_client import Listing
 
@@ -235,6 +236,10 @@ class ArbOffer:
     # Согласие двух независимых оценок сильно повышает доверие к находке,
     # расхождение — прямой повод проверить предмет руками перед покупкой.
     steam_price_second_opinion: str | None = None
+    # Сколько ЕЩЁ таких же лотов нашлось в этом прогоне помимо этого.
+    # Наклейки и прочий ширпотреб продаются десятками одинаковых копий, и без
+    # схлопывания одна находка занимала всю подборку.
+    duplicate_count: int = 0
 
     def __post_init__(self):
         if self.stickers is None:
@@ -243,6 +248,42 @@ class ArbOffer:
     @property
     def url(self) -> str:
         return f"https://csfloat.com/item/{self.listing_id}"
+
+    @property
+    def steam_url(self) -> str:
+        """
+        Страница предмета на Steam Market. quote с safe="" обязателен: в именах
+        есть и пробелы, и '|', и скобки, а незакодированный '|' Telegram в
+        ссылку не превращает.
+        """
+        return (
+            "https://steamcommunity.com/market/listings/730/"
+            + quote(self.market_hash_name, safe="")
+        )
+
+
+def _collapse_duplicates(offers: list[ArbOffer]) -> list[ArbOffer]:
+    """
+    Схлопнуть лоты одного и того же предмета в одну находку.
+
+    Зачем: дедуп по listing_id ловит только повторную отправку ОДНОГО лота, а
+    одинаковых лотов у предмета бывает много — наклейки и ширпотреб продаются
+    десятками взаимозаменяемых копий по одной цене. В проде это дало 13
+    одинаковых блоков «Sticker | aliStair (Holo, Ranked)» подряд: формально
+    разные listing_id, для покупателя — один и тот же товар.
+
+    Оставляем лучший лот (список уже отсортирован по убыванию скидки), а число
+    остальных показываем рядом — оно само по себе полезно, потому что говорит о
+    глубине предложения.
+    """
+    best: dict[str, ArbOffer] = {}
+    for offer in offers:
+        existing = best.get(offer.market_hash_name)
+        if existing is None:
+            best[offer.market_hash_name] = offer
+        else:
+            existing.duplicate_count += 1
+    return list(best.values())
 
 
 def find_arbitrage_offers(
@@ -368,6 +409,7 @@ def find_arbitrage_offers(
         )
 
     offers.sort(key=lambda o: o.discount_pct, reverse=True)
+    offers = _collapse_duplicates(offers)
 
     # Логируем всегда, а не только при нуле офферов: разбивка нужна и чтобы
     # понять, что порог наконец стал разумным, и чтобы заметить перекос

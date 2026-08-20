@@ -1378,7 +1378,15 @@ def _format_arb_chunks(offers) -> list[str]:
                     block += f", наценка за них {o.sticker_markup_pct:.1f}%"
             if o.stickers_unpriced:
                 block += f" (у {o.stickers_unpriced} цена неизвестна)"
-        block += f'\n  <a href="{o.url}">Открыть на CSFloat</a>'
+        if o.duplicate_count:
+            block += (
+                f"\n  <i>таких же лотов ещё {o.duplicate_count} — "
+                f"показан самый выгодный</i>"
+            )
+        block += (
+            f'\n  <a href="{o.url}">Купить на CSFloat</a>'
+            f' · <a href="{o.steam_url}">Проверить в Steam</a>'
+        )
         lines.append(block)
 
     return _chunk_lines(lines, sep="\n\n")
@@ -1531,9 +1539,17 @@ async def _run_arb_scan(bot, chat_id: int) -> int | None:
             return 0
 
         # Тот же дедуп, что у вотчлиста: один и тот же лот не присылаем повторно
+        # Ключ дедупа — предмет и цена, а НЕ listing_id.
+        #
+        # По listing_id дедуп почти не работал: у ходового предмета десятки
+        # взаимозаменяемых лотов, схлопывание оставляет лучший, и на следующем
+        # прогоне лучшим оказывается другой лот — тот же товар по той же цене
+        # приходил снова под новым id. С ценой в ключе повторное уведомление
+        # приходит только когда предмет реально подешевел, а это как раз то,
+        # о чём стоит знать.
         new_offers = []
         for o in offers:
-            key = f"arb:{o.listing_id}"
+            key = f"arb:{o.market_hash_name}:{o.csfloat_price:.2f}"
             if not await was_offer_sent_recently(chat_id, key):
                 new_offers.append(o)
         if not new_offers:
@@ -1544,7 +1560,7 @@ async def _run_arb_scan(bot, chat_id: int) -> int | None:
                 chat_id=chat_id, text=chunk, parse_mode="HTML", disable_web_page_preview=True
             )
         for o in new_offers:
-            await mark_offer_sent(chat_id, f"arb:{o.listing_id}")
+            await mark_offer_sent(chat_id, f"arb:{o.market_hash_name}:{o.csfloat_price:.2f}")
         return len(new_offers)
     finally:
         _arb_running.discard(chat_id)
