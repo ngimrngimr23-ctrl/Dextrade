@@ -398,6 +398,11 @@ STEAM_POOL = ProxyPool(
 # наказание. Если у провайдера адреса закреплённые, значение стоит поднять.
 STEAM_PROXY_COOLDOWN_SECONDS = int(os.environ.get("STEAM_PROXY_COOLDOWN_SECONDS", "30"))
 
+# Сколько адресов перебрать, прежде чем сдаться по одному предмету. При
+# полусотне прокси перебирать все ради одной цены расточительно — дешевле
+# оставить предмет следующему прогону, кэш всё равно накапливается.
+STEAM_RETRY_CAP = int(os.environ.get("STEAM_RETRY_CAP", "4"))
+
 
 class RateLimited(Exception):
     """Внутренний маркер: Steam ответил 429 либо мы на кулдауне после недавнего 429."""
@@ -501,6 +506,33 @@ class SteamMarketPrice(NamedTuple):
     lowest: float | None    # нижняя цена в стакане — столько стоит КУПИТЬ сейчас
     median: float | None    # медиана продаж за сутки
     volume: int | None      # сколько продано за сутки
+
+
+async def get_steam_market_price_retrying(
+    session: aiohttp.ClientSession, market_hash_name: str, attempts: int | None = None
+) -> SteamMarketPrice | None:
+    """
+    То же, что get_steam_market_price, но при отказе пробует следующий адрес.
+
+    Смысл именно в смене адреса. Steam ограничивает по исходящему IP, а у нас
+    их много — значит отказ на одном не говорит ничего про остальные, и
+    сдаваться после первой же неудачи неправильно. Раньше так и было: один 429,
+    и кандидат уходил в «не проверен» до следующего прогона.
+
+    Число попыток по умолчанию — размер пула, но не больше STEAM_RETRY_CAP:
+    при полусотне адресов перебирать все ради одного предмета не стоит, дешевле
+    оставить его на потом.
+    """
+    limit = attempts if attempts is not None else min(max(1, len(STEAM_POOL)), STEAM_RETRY_CAP)
+    for attempt in range(limit):
+        try:
+            return await get_steam_market_price(session, market_hash_name)
+        except RateLimited:
+            if attempt + 1 >= limit:
+                raise
+            # Адрес уже помечен в _get_with_retry, следующий заход возьмёт другой.
+            continue
+    return None
 
 
 async def get_steam_market_price(

@@ -327,6 +327,44 @@ async def set_arb_setting(chat_id: int, key: str, value) -> None:
     await _save_chat_settings(chat_id, settings)
 
 
+# --- Прокси, добавленные через Telegram -------------------------------------
+#
+# Живут в хранилище, а не в переменных окружения, чтобы добавлять их на ходу и
+# не передеплоивать сервис ради каждого нового адреса. Список из переменной
+# окружения при этом никуда не девается — пул складывает оба.
+EXTRA_PROXIES_KEY = "extra_proxies"
+LOCAL_PROXIES_PATH = Path(__file__).parent / "extra_proxies_local.json"
+
+
+async def get_extra_proxies() -> list[str]:
+    if REDIS_ENABLED:
+        try:
+            raw = await _redis_cmd("GET", EXTRA_PROXIES_KEY)
+            return json.loads(raw) if raw else []
+        except Exception:
+            pass
+    if LOCAL_PROXIES_PATH.exists():
+        try:
+            return json.loads(LOCAL_PROXIES_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+
+async def save_extra_proxies(proxies: list[str]) -> None:
+    value = json.dumps(proxies, ensure_ascii=False)
+    if REDIS_ENABLED:
+        try:
+            await _redis_cmd("SET", EXTRA_PROXIES_KEY, value)
+            return
+        except Exception:
+            pass
+    try:
+        LOCAL_PROXIES_PATH.write_text(value, encoding="utf-8")
+    except Exception:
+        log.exception("не смог сохранить список прокси")
+
+
 # --- Кэш живых цен Steam ----------------------------------------------------
 #
 # Зачем отдельно от кэша стикеров: здесь хранится ещё и объём продаж, а он для

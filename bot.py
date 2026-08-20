@@ -63,7 +63,7 @@ from pricing import (
     manual_prices_count,
     get_csgotrader_price_details,
     get_csgotrader_prices,
-    get_steam_market_price,
+    get_steam_market_price_retrying,
     STEAM_POOL,
 )
 from analyzer import (
@@ -96,6 +96,8 @@ from storage import (
     set_market_setting,
     get_steam_prices_batch,
     set_steam_price,
+    get_extra_proxies,
+    save_extra_proxies,
     mark_offer_sent,
     get_arb_settings,
     set_arb_setting,
@@ -1518,7 +1520,7 @@ async def _verify_against_steam(offers, min_discount_pct: float) -> list:
             return offer, None
         async with semaphore:
             try:
-                live = await get_steam_market_price(session, offer.market_hash_name)
+                live = await get_steam_market_price_retrying(session, offer.market_hash_name)
             except Exception:
                 log.info("arb: %s — Steam не ответил", offer.market_hash_name)
                 return offer, None
@@ -2111,6 +2113,63 @@ async def arbnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Готово, ничего подходящего не нашлось.")
 
 
+async def proxyadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /proxyadd <адреса> — добавить прокси на ходу, без передеплоя.
+
+    Принимает сколько угодно адресов через запятую, пробел или перевод строки —
+    ровно в том виде, в каком их отдают провайдеры списком. Сохраняются в
+    хранилище, поэтому переживают редеплой; список из переменной окружения при
+    этом остаётся, пул складывает оба.
+    """
+    if not context.args:
+        stored = await get_extra_proxies()
+        await update.message.reply_text(
+            "Добавить прокси: пришли их после команды, через запятую, пробел "
+            "или с новой строки.\n\n"
+            "<code>/proxyadd http://логин:пароль@хост:порт</code>\n\n"
+            f"Сейчас добавлено через бота: {len(stored)}\n"
+            f"Всего в пуле: {len(csfloat_client.CSFLOAT_POOL)}\n\n"
+            "Убрать все добавленные: /proxyclear",
+            parse_mode="HTML",
+        )
+        return
+
+    raw = " ".join(context.args)
+    added_cs, rejected = csfloat_client.CSFLOAT_POOL.add(raw)
+    added_steam, _ = STEAM_POOL.add(raw)
+
+    if added_cs or added_steam:
+        # Сохраняем то, что реально приняли пулом, — так в хранилище не попадёт
+        # мусор, который всё равно был бы отброшен при следующем старте.
+        stored = await get_extra_proxies()
+        known = set(stored)
+        for proxy in csfloat_client.CSFLOAT_POOL.proxies:
+            if proxy not in known:
+                stored.append(proxy)
+                known.add(proxy)
+        await save_extra_proxies(stored)
+
+    lines = [f"✅ Добавлено адресов: {added_cs}"]
+    if rejected:
+        lines.append(f"\n⚠️ Не приняты ({len(rejected)}):")
+        for masked, problem in rejected[:5]:
+            lines.append(f"  {masked} — {problem}")
+    lines.append(f"\nВсего в пуле: {len(csfloat_client.CSFLOAT_POOL)}")
+    lines.append("Проверить их: /proxycheck")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def proxyclear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/proxyclear — забыть прокси, добавленные через бота (из переменной окружения останутся)."""
+    stored = await get_extra_proxies()
+    await save_extra_proxies([])
+    await update.message.reply_text(
+        f"Забыл {len(stored)} адрес(ов), добавленных через бота.\n"
+        "Адреса из переменной окружения останутся — они подхватятся при перезапуске."
+    )
+
+
 async def proxycheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /proxycheck — какой исходящий адрес даёт каждый прокси на самом деле.
@@ -2177,6 +2236,25 @@ async def proxycheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"  {proxy_pool.mask(proxy)} → <code>{first}</code> (держится)")
         else:
             lines.append(f"  {proxy_pool.mask(proxy)} → ⚠️ {html_module.escape(error or 'нет ответа')}")
+
+    working = len(ips)
+    failed = len(results) - sum(1 for _, first, _, _ in results if first)
+    on_cooldown = sum(1 for p in pool.proxies if pool.cooldown_remaining(p) > 0)
+
+    lines.append("")
+    lines.append(
+        f"<b>Итого:</b> работают {len(results) - failed} из {len(results)}"
+        + (f", не отвечают {failed}" if failed else "")
+        + (f", на кулдауне {on_cooldown}" if on_cooldown else "")
+    )
+
+    # Отметки живости держим в пуле: /status и решения о маршруте должны знать
+    # про мёртвые адреса, а не только тот, кто запустил проверку.
+    for proxy, first, _second, _err in results:
+        if first:
+            pool.mark_alive(proxy)
+        else:
+            pool.mark_dead(proxy, "не ответил при проверке")
 
     if rotating:
         lines.append("")
@@ -2329,7 +2407,7 @@ async def _verify_markets_against_steam(offers, min_discount_pct: float, min_vol
             return offer, None
         async with semaphore:
             try:
-                live = await get_steam_market_price(session, offer.market_hash_name)
+                live = await get_steam_market_price_retrying(session, offer.market_hash_name)
             except Exception:
                 # Не .exception(): при выжженном пуле это десятки одинаковых
                 # трейсбеков подряд, из-за которых настоящие ошибки не найти.
@@ -3019,7 +3097,8 @@ BOT_COMMANDS = [
     BotCommand("arbnow", "Проверить арбитраж CSFloat прямо сейчас"),
     BotCommand("markets", "Сравнить Steam с другими площадками (весь каталог)"),
     BotCommand("setmarkets", "Пороги для /markets: спред, продажи, прибыль"),
-    BotCommand("proxycheck", "Проверить, какие адреса реально дают прокси"),
+    BotCommand("proxycheck", "Проверить прокси: сколько работают, сколько отвалились"),
+    BotCommand("proxyadd", "Добавить прокси прямо из чата"),
     BotCommand("setarb", "Арбитраж: CSFloat дешевле Steam на N%"),
     BotCommand("help", "Полный справочник по всем командам"),
 ]
@@ -3043,6 +3122,22 @@ async def _on_startup(app: Application):
     # процесса и тут же пробовал снова, продлевая реальный бан.
     await load_persisted_cooldown()
     await csfloat_client.load_persisted_cooldown()
+    # Прокси, добавленные через /proxyadd, живут в хранилище — без этого они
+    # пропадали бы при каждом редеплое, а Render передеплоивает часто.
+    try:
+        stored_proxies = await get_extra_proxies()
+    except Exception:
+        log.exception("не смог прочитать сохранённые прокси")
+        stored_proxies = []
+    if stored_proxies:
+        raw = " ".join(stored_proxies)
+        added_cs, _ = csfloat_client.CSFLOAT_POOL.add(raw)
+        added_steam, _ = STEAM_POOL.add(raw)
+        log.info(
+            "прокси: из хранилища добавлено %d в пул CSFloat и %d в пул Steam",
+            added_cs, added_steam,
+        )
+
     if csfloat_client.csfloat_enabled():
         log.info("csfloat: маршрут — %s", csfloat_client.route_description())
         _warn_if_over_budget()
@@ -3345,6 +3440,8 @@ def _build_application(token: str):
     app.add_handler(CommandHandler("markets", markets))
     app.add_handler(CommandHandler("setmarkets", setmarkets))
     app.add_handler(CommandHandler("proxycheck", proxycheck))
+    app.add_handler(CommandHandler("proxyadd", proxyadd))
+    app.add_handler(CommandHandler("proxyclear", proxyclear))
     app.add_handler(CommandHandler("arbreset", arbreset))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_selection))

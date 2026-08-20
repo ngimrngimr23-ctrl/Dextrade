@@ -81,6 +81,7 @@ class ProxyPool:
         self.proxies: list[str] = []
         self.problems: list[tuple[str, str]] = []  # (замаскированный адрес, что не так)
         self._cooldowns: dict[str, float] = {}
+        self.dead: dict[str, str] = {}
         self._cursor = 0
 
         for candidate in _SPLIT_RE.split(raw or ""):
@@ -96,6 +97,40 @@ class ProxyPool:
                 continue
             if candidate not in self.proxies:
                 self.proxies.append(candidate)
+
+    def add(self, raw: str) -> tuple[int, list[tuple[str, str]]]:
+        """
+        Добавить адреса на ходу. Возвращает (сколько добавлено, что не приняли).
+
+        Нужно, чтобы пополнять пул командой из Telegram, а не передеплоем ради
+        каждого нового адреса. Дубликаты отбрасываются молча: при копировании
+        списками они неизбежны, и падать из-за них незачем.
+        """
+        added = 0
+        rejected: list[tuple[str, str]] = []
+        for candidate in _SPLIT_RE.split(raw or ""):
+            candidate = candidate.strip()
+            if not candidate:
+                continue
+            problem = validate(candidate)
+            if problem:
+                rejected.append((mask(candidate), problem))
+                continue
+            if candidate not in self.proxies:
+                self.proxies.append(candidate)
+                added += 1
+        return added, rejected
+
+    def mark_dead(self, proxy: str, reason: str = "") -> None:
+        """
+        Пометить адрес нерабочим (не ответил вовсе, а не получил отказ от
+        площадки). Держим отдельно от кулдауна: кулдаун — это «занят сейчас»,
+        а тут «похоже, не работает совсем», и в /proxycheck это разные строки.
+        """
+        self.dead[proxy] = reason or "не отвечает"
+
+    def mark_alive(self, proxy: str) -> None:
+        self.dead.pop(proxy, None)
 
     def enabled(self) -> bool:
         return bool(self.proxies)
@@ -148,6 +183,8 @@ class ProxyPool:
             return "не задан"
         free = self.available()
         parts = [f"{len(free)} свободных из {len(self.proxies)}"]
+        if self.dead:
+            parts.append(f"{len(self.dead)} не отвечают")
         busy = [p for p in self.proxies if self.cooldown_remaining(p) > 0]
         if busy:
             soonest = min(self.cooldown_remaining(p) for p in busy)
