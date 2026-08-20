@@ -88,6 +88,20 @@ CSFLOAT_BASE_URL = "https://csfloat.com/api/v1"
 # описаны как "N запросов за 5 минут" без самого N), поэтому стартуем
 # консервативно и смотрим на заголовки остатка — они скажут правду.
 MIN_REQUEST_INTERVAL = 1.5
+
+# Пауза между ЛЮБЫМИ двумя запросами, независимо от адреса.
+#
+# Появилась после прода 2026-08-20. Поадресной паузы оказалось мало: семь
+# полос по 1.5 секунды дают почти пять запросов в секунду суммарно, и CSFloat
+# ответил не квотным 429, а антифродом — {"code": 4874, "message": "You've been
+# making too many requests lately"}, без заголовков лимита.
+#
+# Причина в том, что лимит у CSFloat привязан к КЛЮЧУ, а не к адресу. Это
+# видно прямо в логе: при семи разных прокси счётчик шёл сплошной цепочкой
+# 158 -> 157 -> 156 -> 155 -> 154 и у всех ответов был один и тот же момент
+# сброса окна. Значит разгон по адресам не покупает квоту — он покупает только
+# скорость, а скорость упирается в антифрод.
+GLOBAL_MIN_INTERVAL = 1.0
 MAX_LIMIT = 50  # жёсткий потолок эндпоинта, больше он всё равно не отдаст
 
 # Честный API-клиент: ровно то, что шлёт curl из примера в документации, плюс
@@ -533,7 +547,23 @@ _throttle_locks: dict[str, asyncio.Lock] = {}
 _throttle_last: dict[str, float] = {}
 
 
-async def _throttle(key: str = "") -> None:
+_GLOBAL_THROTTLE_KEY = "\x00global"
+
+
+async def _throttle_all(proxy: str | None) -> None:
+    """
+    Две паузы подряд: общая на весь ключ и отдельная на этот адрес.
+
+    Общая — потому что квота и антифрод у CSFloat считаются по ключу, и никакое
+    число адресов их не обходит. Поадресная — чтобы один адрес не молотил
+    подряд, даже когда общий темп это позволяет.
+    """
+    await _throttle(_GLOBAL_THROTTLE_KEY, GLOBAL_MIN_INTERVAL)
+    if proxy:
+        await _throttle(proxy, MIN_REQUEST_INTERVAL)
+
+
+async def _throttle(key: str = "", interval: float = MIN_REQUEST_INTERVAL) -> None:
     """
     Пауза между запросами, ОТДЕЛЬНАЯ для каждого исходящего адреса.
 
@@ -547,7 +577,7 @@ async def _throttle(key: str = "") -> None:
     if lock is None:
         lock = _throttle_locks[key] = asyncio.Lock()
     async with lock:
-        wait = MIN_REQUEST_INTERVAL - (time.monotonic() - _throttle_last.get(key, 0.0))
+        wait = interval - (time.monotonic() - _throttle_last.get(key, 0.0))
         if wait > 0:
             await asyncio.sleep(wait)
         _throttle_last[key] = time.monotonic()
@@ -760,8 +790,7 @@ async def _request_listings(
     proxy: str | None = None,
 ):
     """Один запрос за страницей лотов. Возвращает разобранный JSON."""
-    # Ключ паузы — сам адрес: у каждого прокси свой темп, см. _throttle.
-    await _throttle(proxy or "")
+    await _throttle_all(proxy)
     try:
         return await _do_request(session, url, request_params, proxy)
     except aiohttp.ClientHttpProxyError as e:
@@ -1110,10 +1139,26 @@ async def fetch_market_wide(
         collected: list[CSFloatListing] = []
         cursor = None
         for _ in range(pages_per_band):
-            listings, cursor = await fetch_listings_page(
-                session, cursor=cursor, sort_by=sort_by,
-                min_price=lo, max_price=hi, proxy=proxy,
-            )
+            try:
+                listings, cursor = await fetch_listings_page(
+                    session, cursor=cursor, sort_by=sort_by,
+                    min_price=lo, max_price=hi, proxy=proxy,
+                )
+            except (CSFloatRateLimited, CSFloatError) as e:
+                # Отдаём то, что успели набрать, а не теряем всё.
+                #
+                # Раньше исключение улетало наружу и полоса пропадала целиком.
+                # На проде это стоило дорого: одна полоса словила 429, следом
+                # общий кулдаун убил остальные пять, и прогон вернул НОЛЬ лотов
+                # при том, что семь запросов уже отработали и 350 лотов были на
+                # руках. За эти запросы бюджет уже списан — выбрасывать их
+                # результат бессмысленно вдвойне.
+                log.info(
+                    "csfloat: полоса $%s-%s оборвалась на %d лотах: %s",
+                    lo if lo is not None else "0", hi if hi is not None else "∞",
+                    len(collected), e,
+                )
+                break
             collected.extend(listings)
             if not cursor or not listings:
                 break

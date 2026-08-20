@@ -167,7 +167,7 @@ ARB_INTERVAL_MINUTES = float(os.environ.get("ARB_INTERVAL_MINUTES", "10"))
 # каждый адрес в пуле. При 10 000 лотов и 7 адресах помещается 7 прогонов в
 # час, то есть интервал не может быть меньше ~9 минут; при 5 минутах квота
 # кончится на середине часа и остаток времени бот будет молчать.
-ARB_TARGET_LISTINGS = int(os.environ.get("ARB_TARGET_LISTINGS", "10000"))
+ARB_TARGET_LISTINGS = int(os.environ.get("ARB_TARGET_LISTINGS", "1500"))
 
 # Окно прайс-листа для ВТОРОГО мнения о цене. Только суточное, без отката на
 # более старые: недельная и тем более месячная цена подтверждает не сегодняшнюю
@@ -1416,6 +1416,44 @@ def _format_arb_chunks(offers) -> list[str]:
     return _chunk_lines(lines, sep="\n\n")
 
 
+def _warn_if_over_budget() -> None:
+    """
+    Сказать при старте, влезает ли настройка скана в квоту CSFloat.
+
+    Считать это надо явно, потому что интуиция здесь подводит. Квота — 200
+    запросов в час НА КЛЮЧ, и она НЕ умножается числом прокси: в проде при
+    семи разных адресах счётчик шёл одной цепочкой с общим моментом сброса.
+    Прокси спасают от блокировки по репутации адреса, но не от квоты.
+
+    Без этой проверки перебор проявляется не сообщением, а пустыми прогонами
+    посреди часа: бюджет выбран, все полосы падают на 429, подборка приходит
+    пустой — и выглядит это как поломка отбора, а не как исчерпанный лимит.
+    """
+    per_scan = -(-ARB_TARGET_LISTINGS // csfloat_client.MAX_LIMIT)  # округление вверх
+    scans_per_hour = 60 / ARB_INTERVAL_MINUTES if ARB_INTERVAL_MINUTES else 0
+    needed = per_scan * scans_per_hour
+    budget = 200  # x-ratelimit-limit, наблюдаемый на ключе
+
+    if needed <= budget:
+        log.info(
+            "csfloat: бюджет в порядке — %d лотов за прогон это %d запросов, "
+            "%.0f прогонов в час = %.0f из %d доступных",
+            ARB_TARGET_LISTINGS, per_scan, scans_per_hour, needed, budget,
+        )
+        return
+
+    safe_target = int(budget / scans_per_hour) * csfloat_client.MAX_LIMIT if scans_per_hour else 0
+    safe_interval = 60 / (budget / per_scan) if per_scan else 0
+    log.warning(
+        "csfloat: настройка НЕ влезает в квоту — %d лотов каждые %.0f мин требуют %.0f "
+        "запросов в час при доступных %d. Прогоны будут падать на 429 посреди часа. "
+        "Варианты: ARB_TARGET_LISTINGS=%d при нынешнем интервале, либо "
+        "ARB_INTERVAL_MINUTES=%.0f при нынешней цели",
+        ARB_TARGET_LISTINGS, ARB_INTERVAL_MINUTES, needed, budget,
+        safe_target, safe_interval,
+    )
+
+
 async def _fill_steam_prices(listings) -> int:
     """
     Проставить лотам цену Steam из прайс-листа csgotrader.app.
@@ -2438,6 +2476,7 @@ async def _on_startup(app: Application):
     await csfloat_client.load_persisted_cooldown()
     if csfloat_client.csfloat_enabled():
         log.info("csfloat: маршрут — %s", csfloat_client.route_description())
+        _warn_if_over_budget()
         proxy_problem = csfloat_client.http_proxy_problem()
         if proxy_problem:
             log.error("csfloat: CSFLOAT_HTTP_PROXY задан неверно — %s", proxy_problem)
