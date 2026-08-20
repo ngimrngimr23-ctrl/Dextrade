@@ -193,6 +193,28 @@ ARB_PAGES_PER_SCAN = int(os.environ.get("ARB_PAGES_PER_SCAN", "10"))
 # мнения по этому предмету нет.
 ARB_PRICE_WINDOW = "last_24h"
 
+# Чем сортировать выдачу CSFloat при скане.
+#
+# most_recent — свежевыставленные лоты. Так и надо, и вот почему.
+#
+# Сначала стояло highest_discount: казалось разумным просить у площадки сразу
+# самое выгодное. На практике этот список почти не обновляется — за час в нём
+# меняется 5-6 позиций, и скан раз за разом приносил одни и те же лоты. Причина
+# простая: лот с настоящей скидкой живёт минуты, его выкупают. Значит всё, что
+# ДОЛГО висит в топе по скидке, — это не выгода, а лоты, у которых сломан
+# ориентир: справочная цена завышена, скидка бумажная. Сортировка по скидке
+# гарантированно поднимает наверх именно их.
+#
+# Со свежими лотами наоборот: недооценённый лот попадает к нам в первые минуты
+# после выставления, когда его ещё можно купить. Скидку считаем сами (см.
+# _fill_steam_prices и find_arbitrage_offers), а не доверяем чужой сортировке.
+ARB_SORT_BY = os.environ.get("ARB_SORT_BY", "most_recent")
+
+# Докуда досмотрели в прошлый прогон — created_at самого свежего лота.
+# Живёт в памяти процесса: после рестарта просто просмотрим одну страницу
+# заново, это дешевле, чем тащить состояние в хранилище.
+_arb_seen_until: str | None = None
+
 # Максимальное расхождение между прайс-листом csgotrader и собственной
 # справочной ценой CSFloat (reference.base_price), при котором цене ещё можно
 # верить. Источники независимы, поэтому согласие — сильный довод, а расхождение
@@ -1516,17 +1538,10 @@ async def _fill_steam_prices(listings) -> int:
     return from_reference + from_pricelist
 
 
-async def _run_arb_scan(bot, chat_id: int, *, respect_dedup: bool = True) -> int | None:
+async def _run_arb_scan(bot, chat_id: int) -> int | None:
     """
     Один прогон арбитража. Возвращает число отправленных находок, либо None,
     если прогон не запускался (выключено / уже идёт / кулдаун).
-
-    respect_dedup=False — показать всё найденное, даже если это уже присылали.
-    Нужно для ручного /arbnow: дедуп держит находку 5 часов, и на ручной запрос
-    бот отвечал "ничего подходящего не нашлось" при том, что находки были и
-    лежали в логе. Для человека, который сам нажал кнопку, это выглядит как
-    поломка фильтра. У фонового автоскана дедуп остаётся — там он и нужен,
-    иначе одно и то же приходило бы каждые 5 минут.
     """
     settings = await get_arb_settings(chat_id)
     if settings["min_discount"] is None:
@@ -1543,14 +1558,38 @@ async def _run_arb_scan(bot, chat_id: int, *, respect_dedup: bool = True) -> int
 
     _arb_running.add(chat_id)
     try:
+        global _arb_seen_until
         listings = await csfloat_client.fetch_market(
             pages=ARB_PAGES_PER_SCAN,
-            sort_by="highest_discount",
+            sort_by=ARB_SORT_BY,
             min_price=settings["min_price"],
             max_price=settings["max_price"],
-            # Глубже порога отбора качать нечего — см. ARB_PAGES_PER_SCAN.
+            # При сортировке по скидке глубже порога качать нечего; при
+            # сортировке по свежести — нечего качать за уже просмотренным.
             stop_below_discount=settings["min_discount"],
+            stop_at_created=_arb_seen_until,
         )
+
+        if ARB_SORT_BY == "most_recent":
+            fresh = [l.created_at for l in listings if l.created_at]
+            newest = max(fresh) if fresh else None
+            # Сколько из принесённого мы ещё не видели. Если это упирается в
+            # весь объём страниц, значит новые лоты появляются быстрее, чем мы
+            # успеваем их разбирать, и часть рынка проходит мимо — про это надо
+            # знать, а не молча терять находки.
+            unseen = sum(1 for c in fresh if not _arb_seen_until or c > _arb_seen_until)
+            log.info(
+                "arb: получено %d лотов, из них новых с прошлого прогона %d",
+                len(listings), unseen,
+            )
+            if _arb_seen_until and unseen == len(listings) and len(listings) >= ARB_PAGES_PER_SCAN * 50:
+                log.warning(
+                    "arb: новых лотов больше, чем помещается в %d страниц — часть рынка "
+                    "не просмотрена. Стоит поднять ARB_PAGES_PER_SCAN или сканировать чаще",
+                    ARB_PAGES_PER_SCAN,
+                )
+            if newest:
+                _arb_seen_until = newest
         await _fill_steam_prices(listings)
         offers = find_arbitrage_offers(
             listings,
@@ -1588,20 +1627,17 @@ async def _run_arb_scan(bot, chat_id: int, *, respect_dedup: bool = True) -> int
         # приходил снова под новым id. С ценой в ключе повторное уведомление
         # приходит только когда предмет реально подешевел, а это как раз то,
         # о чём стоит знать.
-        if respect_dedup:
-            new_offers = []
-            for o in offers:
-                key = f"arb:{o.market_hash_name}:{o.csfloat_price:.2f}"
-                if not await was_offer_sent_recently(chat_id, key):
-                    new_offers.append(o)
-            if not new_offers:
-                log.info(
-                    "arb: chat_id=%s все %d находок уже присылали — молчу (дедуп %d ч)",
-                    chat_id, len(offers), SENT_OFFER_TTL_SECONDS // 3600,
-                )
-                return 0
-        else:
-            new_offers = offers
+        new_offers = []
+        for o in offers:
+            key = f"arb:{o.market_hash_name}:{o.csfloat_price:.2f}"
+            if not await was_offer_sent_recently(chat_id, key):
+                new_offers.append(o)
+        if not new_offers:
+            log.info(
+                "arb: chat_id=%s все %d находок уже присылали — молчу (дедуп %d ч)",
+                chat_id, len(offers), SENT_OFFER_TTL_SECONDS // 3600,
+            )
+            return 0
 
         for chunk in _format_arb_chunks(new_offers):
             await bot.send_message(
@@ -1893,9 +1929,7 @@ async def arbnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Смотрю рынок CSFloat…")
     try:
-        # Ручной запрос — показываем всё, что есть на рынке прямо сейчас,
-        # не оглядываясь на то, присылали это раньше или нет.
-        sent = await _run_arb_scan(context.bot, chat_id, respect_dedup=False)
+        sent = await _run_arb_scan(context.bot, chat_id)
     except CSFloatRateLimited as e:
         if e.is_ip_block:
             await update.message.reply_text(

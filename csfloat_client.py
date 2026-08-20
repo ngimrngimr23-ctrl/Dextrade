@@ -563,6 +563,10 @@ class CSFloatListing:
     # ликвидности и единственный честный ответ на вопрос «смогу ли я это
     # перепродать». Заполняется в bot._fill_steam_prices.
     steam_sales_recent: bool | None = None
+    # Когда лот выставили (created_at из ответа, ISO-строка как есть).
+    # Нужно для скана «по свежести»: по ней видно, докуда мы досмотрели в
+    # прошлый раз, и можно не перекачивать уже просмотренное.
+    created_at: str | None = None
 
     @property
     def url(self) -> str:
@@ -632,6 +636,7 @@ def _parse_listing(raw: dict) -> CSFloatListing | None:
             reference_price=_cents(reference.get("base_price")),
             predicted_price=_cents(reference.get("predicted_price")),
             reference_quantity=reference_quantity,
+            created_at=raw.get("created_at"),
         )
     except Exception:
         log.exception("csfloat: не смог разобрать лот")
@@ -944,6 +949,7 @@ async def fetch_market(
     min_price: float | None = None,
     max_price: float | None = None,
     stop_below_discount: float | None = None,
+    stop_at_created: str | None = None,
 ) -> list[CSFloatListing]:
     """
     Несколько страниц рынка подряд, с постраничным курсором.
@@ -971,6 +977,23 @@ async def fetch_market(
             out.extend(listings)
             if not cursor or not listings:
                 break
+
+            # Скан по свежести: доходим до лотов, которые видели в прошлый раз,
+            # и останавливаемся. Дальше идёт только уже просмотренное.
+            #
+            # Это делает глубину самонастраивающейся: на оживлённом рынке
+            # прогон качает столько страниц, сколько успело появиться нового, а
+            # в затишье укладывается в одну. Фиксированное число страниц либо
+            # недобирало бы новинки, либо каждый раз перекачивало одно и то же.
+            if stop_at_created and sort_by == "most_recent":
+                reached = [l for l in listings if l.created_at and l.created_at <= stop_at_created]
+                if reached:
+                    log.info(
+                        "csfloat: дошёл до уже просмотренных лотов на странице %d "
+                        "(граница %s) — дальше только старое",
+                        page + 1, stop_at_created,
+                    )
+                    break
 
             # Ранняя остановка. При sort_by="highest_discount" лоты идут по
             # убыванию скидки к справочной цене (проверено логом: 51% у первого
