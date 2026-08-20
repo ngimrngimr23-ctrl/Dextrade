@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from urllib.parse import quote
 
 import aiohttp
@@ -116,28 +117,99 @@ async def fetch_market(session: aiohttp.ClientSession, filename: str) -> dict[st
     return prices
 
 
+async def _exists(session: aiohttp.ClientSession, filename: str) -> bool:
+    """
+    Есть ли такой файл — запросом HEAD, без скачивания тела.
+
+    Первая версия проверяла существование обычным GET, то есть качала файл
+    целиком ради ответа «да/нет». На восьми площадках с вариантами написания
+    это до тринадцати полных загрузок по несколько мегабайт, после чего
+    найденные качались ВТОРОЙ раз. На проде команда просто молчала минутами.
+    """
+    try:
+        async with session.head(
+            f"{BASE_URL}/{filename}",
+            timeout=aiohttp.ClientTimeout(total=15),
+            allow_redirects=True,
+        ) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
 async def discover_markets(session: aiohttp.ClientSession) -> dict[str, str]:
     """
-    Какие площадки реально доступны: человекочитаемое имя -> имя файла.
+    Какие площадки доступны: человекочитаемое имя -> имя файла.
 
-    Проверяется живым запросом, потому что состав файлов задаём не мы. Результат
-    стоит запомнить у вызывающего: список меняется редко, а перебор кандидатов
-    стоит по запросу на каждого.
+    Состав файлов задаём не мы, поэтому имена не угадываются, а проверяются.
+    Проверка идёт параллельно и через HEAD, так что стоит доли секунды и
+    нисколько трафика.
     """
-    found: dict[str, str] = {}
-    for market, filenames in MARKET_CANDIDATES.items():
+    async def probe(market: str, filenames: tuple[str, ...]):
         for filename in filenames:
-            prices = await fetch_market(session, filename)
-            if prices:
-                found[market] = filename
-                log.info("markets: %s -> %s, цен %d", market, filename, len(prices))
-                break
-    if not found:
+            if await _exists(session, filename):
+                return market, filename
+        return market, None
+
+    results = await asyncio.gather(
+        *(probe(m, f) for m, f in MARKET_CANDIDATES.items())
+    )
+    found = {market: filename for market, filename in results if filename}
+
+    if found:
+        log.info("markets: доступны — %s", ", ".join(f"{m} ({f})" for m, f in found.items()))
+    else:
         log.warning(
             "markets: ни один файл площадок не открылся — возможно, состав на "
             "prices.csgotrader.app изменился, см. MARKET_CANDIDATES"
         )
     return found
+
+
+# Кэш скачанных цен: имя файла -> (цены, когда скачали).
+#
+# TTL равен периоду обновления самого источника — csgotrader пересобирает файлы
+# примерно раз в час, и качать их чаще бессмысленно: придут те же числа. Кэш
+# живёт в памяти процесса, после рестарта скачается заново.
+_cache: dict[str, tuple[dict[str, float], float]] = {}
+CACHE_TTL_SECONDS = 60 * 60
+
+_discovered: dict[str, str] | None = None
+
+
+async def load_markets(
+    session: aiohttp.ClientSession, force_refresh: bool = False
+) -> dict[str, dict[str, float]]:
+    """
+    Цены всех доступных площадок: имя площадки -> {предмет: цена}.
+
+    Список площадок определяется один раз за процесс (он меняется редко), сами
+    файлы качаются параллельно и кладутся в кэш на час.
+    """
+    global _discovered
+    if _discovered is None:
+        _discovered = await discover_markets(session)
+    if not _discovered:
+        return {}
+
+    now = time.time()
+
+    async def load_one(market: str, filename: str):
+        cached = _cache.get(filename)
+        if not force_refresh and cached and (now - cached[1]) < CACHE_TTL_SECONDS:
+            return market, cached[0]
+        prices = await fetch_market(session, filename)
+        if prices:
+            _cache[filename] = (prices, now)
+        elif cached:
+            # Скачать не вышло — лучше отдать вчерашние числа, чем ничего.
+            return market, cached[0]
+        return market, prices
+
+    results = await asyncio.gather(
+        *(load_one(m, f) for m, f in _discovered.items())
+    )
+    return {market: prices for market, prices in results if prices}
 
 
 class MarketOffer:

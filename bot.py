@@ -2085,17 +2085,17 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Прайс-лист Steam не скачался — сравнивать не с чем.")
             return
 
-        available = await market_prices.discover_markets(session)
-        if not available:
+        by_market = await market_prices.load_markets(session)
+        if not by_market:
             await update.message.reply_text(
                 "⚠️ Ни один файл площадок не открылся. Похоже, состав файлов на "
                 "prices.csgotrader.app изменился — надо смотреть, какие есть сейчас."
             )
             return
 
+        available = list(by_market)
         found: list = []
-        for market, filename in available.items():
-            prices = await market_prices.fetch_market(session, filename)
+        for market, prices in by_market.items():
             found.extend(
                 market_prices.compare(
                     steam_prices, prices, market, min_discount_pct=threshold,
