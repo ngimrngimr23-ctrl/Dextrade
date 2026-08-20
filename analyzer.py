@@ -231,6 +231,10 @@ class ArbOffer:
     # Окно прайс-листа, из которого взята steam_price. Показывается в
     # сообщении: цена за сутки и цена за неделю — разные основания для решения.
     steam_price_window: str | None = None
+    # Что говорит про цену ВТОРОЙ источник — подтверждает или спорит.
+    # Согласие двух независимых оценок сильно повышает доверие к находке,
+    # расхождение — прямой повод проверить предмет руками перед покупкой.
+    steam_price_second_opinion: str | None = None
 
     def __post_init__(self):
         if self.stickers is None:
@@ -359,6 +363,7 @@ def find_arbitrage_offers(
                 inspect_link=l.inspect_link,
                 watchers=l.watchers,
                 steam_price_window=l.steam_price_window,
+                steam_price_second_opinion=l.steam_price_windows,
             )
         )
 

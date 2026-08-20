@@ -1335,8 +1335,8 @@ def _format_arb_chunks(offers) -> list[str]:
     """Сообщения по арбитражным находкам, разбитые под лимит Telegram."""
     lines = [
         f"💱 CSFloat дешевле Steam — найдено {len(offers)}\n"
-        f"<i>Цена Steam — медиана продаж за сутки из прайс-листа, а не текущая "
-        f"нижняя цена в стакане: проверяй лот перед покупкой. "
+        f"<i>Цена Steam — оценка, а не текущая нижняя цена в стакане: "
+        f"проверяй лот перед покупкой. "
         f"«Чистыми» = сколько останется при перепродаже в Steam по этой цене, "
         f"за вычетом комиссии Steam ~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%. "
         f"Помни: выручка в Steam приходит на кошелёк и не выводится.</i>"
@@ -1361,6 +1361,11 @@ def _format_arb_chunks(offers) -> list[str]:
             f"  CSFloat ${o.csfloat_price:.2f} | {steam_part} | {price_cmp}\n"
             f"  чистыми при перепродаже: {net}"
         )
+        # Второе мнение по цене. Показываем всегда, когда оно есть: подтверждение
+        # усиливает доверие к находке, а расхождение — прямой повод проверить
+        # предмет руками перед покупкой.
+        if o.steam_price_second_opinion:
+            block += f"\n  <i>{html_module.escape(o.steam_price_second_opinion)}</i>"
         if o.float_value is not None:
             block += f"\n  флоат {o.float_value:.5f}"
         if o.steam_volume is not None:
@@ -1409,8 +1414,9 @@ async def _fill_steam_prices(listings) -> int:
         log.warning("arb: прайс-лист csgotrader пуст — цену Steam подставить нечем")
         return 0
 
-    filled = 0
-    no_fresh = 0
+    from_reference = 0
+    from_pricelist = 0
+    confirmed = 0
     disagree = 0
     for l in missing:
         # Ликвидность: reference.quantity от CSFloat — замена пропавшему
@@ -1419,45 +1425,55 @@ async def _fill_steam_prices(listings) -> int:
             l.steam_volume = l.reference_quantity
 
         found = prices.get(l.market_hash_name)
-        if not found:
-            continue
         # Только суточное окно, без отката на недельное и старше — см.
-        # ARB_PRICE_WINDOW. Нет продаж за сутки, значит сравнивать не с чем.
-        price = found.windows.get(ARB_PRICE_WINDOW)
-        if price is None:
-            no_fresh += 1
+        # ARB_PRICE_WINDOW.
+        listed = found.windows.get(ARB_PRICE_WINDOW) if found else None
+
+        if l.reference_price and l.reference_price > 0:
+            l.steam_price = l.reference_price
+            l.steam_price_window = "справка CSFloat"
+            from_reference += 1
+
+            # Прайс-лист теперь второе мнение, а не основание. Когда сходится —
+            # это заметно усиливает доверие к находке, и об этом стоит сказать
+            # в сообщении. Когда расходится — доверия меньше, но выбрасывать
+            # лот из-за этого мы больше не будем: на проверяемом случае
+            # (P2000 | Acid Etched, лот $12.04) прайс-лист утверждал $28.18, а
+            # справочная цена CSFloat $10.44, и права оказалась вторая.
+            if listed is not None:
+                gap = abs(listed - l.reference_price) / l.reference_price * 100
+                l.steam_price_spread_pct = None
+                if gap <= ARB_SOURCE_GAP_PCT:
+                    confirmed += 1
+                    l.steam_price_windows = f"прайс-лист подтверждает: ${listed:.2f}"
+                else:
+                    disagree += 1
+                    l.steam_price_windows = (
+                        f"прайс-лист не согласен: ${listed:.2f} (расхождение {gap:.0f}%)"
+                    )
+                    log.info(
+                        "arb: %s — источники расходятся на %.0f%%: справка CSFloat $%.2f, "
+                        "прайс-лист $%.2f. Беру справку CSFloat",
+                        l.market_hash_name, gap, l.reference_price, listed,
+                    )
             continue
 
-        # Сверка с собственной справочной ценой CSFloat.
-        #
-        # Это два НЕЗАВИСИМЫХ источника: прайс-лист csgotrader собирает свою
-        # статистику, reference.base_price считает CSFloat. Пока они согласны,
-        # цене можно верить. Когда расходятся вдвое — кто-то из них ошибается,
-        # и какой именно, по одному числу не понять; звать покупать на таком
-        # основании нельзя. Ровно этот случай и давал «дешевле на 57%».
-        if l.reference_price and l.reference_price > 0:
-            gap = abs(price - l.reference_price) / l.reference_price * 100
-            if gap > ARB_SOURCE_GAP_PCT:
-                log.info(
-                    "arb: %s — источники расходятся на %.0f%%: прайс-лист $%.2f, "
-                    "справочная цена CSFloat $%.2f. Пропускаю",
-                    l.market_hash_name, gap, price, l.reference_price,
-                )
-                disagree += 1
-                continue
-
-        l.steam_price = price
+        # Справки нет — работаем по прайс-листу, как раньше.
+        if listed is None:
+            continue
+        l.steam_price = listed
         l.steam_price_window = ARB_PRICE_WINDOW
         l.steam_price_spread_pct = found.recent_spread_pct
         l.steam_price_windows = found.describe()
-        filled += 1
+        from_pricelist += 1
 
     log.info(
-        "arb: цена Steam за сутки подставлена для %d из %d лотов; "
-        "у %d не было продаж за сутки, у %d источники цены разошлись",
-        filled, len(missing), no_fresh, disagree,
+        "arb: цена подставлена для %d из %d лотов (%d по справке CSFloat, %d по прайс-листу). "
+        "Прайс-лист подтвердил %d, разошёлся на %d",
+        from_reference + from_pricelist, len(missing),
+        from_reference, from_pricelist, confirmed, disagree,
     )
-    return filled
+    return from_reference + from_pricelist
 
 
 async def _run_arb_scan(bot, chat_id: int) -> int | None:
