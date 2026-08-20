@@ -21,10 +21,13 @@ GiftSatteliteAdapter (Upstash + локальный fallback).
 import json
 import os
 import time
+import logging
 from pathlib import Path
 from typing import Optional
 
 import aiohttp
+
+log = logging.getLogger("steam_bot.storage")
 
 REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
 REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
@@ -322,6 +325,80 @@ async def set_arb_setting(chat_id: int, key: str, value) -> None:
     settings = await _get_chat_settings(chat_id)
     settings[f"arb_{key}"] = value
     await _save_chat_settings(chat_id, settings)
+
+
+# --- Кэш живых цен Steam ----------------------------------------------------
+#
+# Зачем отдельно от кэша стикеров: здесь хранится ещё и объём продаж, а он для
+# арбитража не менее важен, чем цена — предмет, который не продаётся, нельзя
+# перепродать ни за какую цену.
+#
+# Зачем вообще: priceoverview лимитирован жёстко, и проверять каждого кандидата
+# живым запросом оказалось нерабочей схемой. На проде автоскан каждые 10 минут
+# выжигал все адреса пула, после чего вторая половина бота приходила к пустому
+# пулу и молчала. Кандидаты при этом повторяются от прогона к прогону, так что
+# кэш убирает основную массу запросов.
+STEAM_PRICE_KEY_PREFIX = "steamprice:"
+STEAM_PRICE_TTL_SECONDS = 12 * 60 * 60
+LOCAL_STEAM_PRICES_PATH = Path(__file__).parent / "steam_prices_local.json"
+
+
+def _local_steam_prices_load() -> dict:
+    if not LOCAL_STEAM_PRICES_PATH.exists():
+        return {}
+    try:
+        return json.loads(LOCAL_STEAM_PRICES_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+async def get_steam_prices_batch(names: list[str]) -> dict[str, dict]:
+    """Кэшированные цены Steam: имя -> {'price', 'volume'}. Отсутствующие просто не попадают в результат."""
+    if not names:
+        return {}
+
+    if REDIS_ENABLED:
+        try:
+            raw = await _redis_cmd("MGET", *[STEAM_PRICE_KEY_PREFIX + n for n in names])
+            out = {}
+            for name, value in zip(names, raw or []):
+                if value:
+                    try:
+                        out[name] = json.loads(value)
+                    except Exception:
+                        pass
+            return out
+        except Exception:
+            pass
+
+    data = _local_steam_prices_load()
+    now = time.time()
+    out = {}
+    for name in names:
+        entry = data.get(name)
+        if entry and (now - entry.get("updated_at", 0)) < STEAM_PRICE_TTL_SECONDS:
+            out[name] = entry
+    return out
+
+
+async def set_steam_price(name: str, price: float, volume: int | None) -> None:
+    entry = {"price": price, "volume": volume, "updated_at": time.time()}
+    if REDIS_ENABLED:
+        try:
+            await _redis_cmd(
+                "SET", STEAM_PRICE_KEY_PREFIX + name,
+                json.dumps(entry), "EX", str(STEAM_PRICE_TTL_SECONDS),
+            )
+            return
+        except Exception:
+            pass
+
+    data = _local_steam_prices_load()
+    data[name] = entry
+    try:
+        LOCAL_STEAM_PRICES_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        log.exception("не смог сохранить локальный кэш цен Steam")
 
 
 async def get_market_settings(chat_id: int) -> dict:

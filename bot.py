@@ -94,6 +94,8 @@ from storage import (
     SENT_OFFER_TTL_SECONDS,
     get_market_settings,
     set_market_setting,
+    get_steam_prices_batch,
+    set_steam_price,
     mark_offer_sent,
     get_arb_settings,
     set_arb_setting,
@@ -223,6 +225,18 @@ ARB_VERIFY_LIMIT = int(os.environ.get("ARB_VERIFY_LIMIT", "80"))
 
 # Сколько находок с площадок проверять живой ценой Steam за раз.
 MARKETS_VERIFY_LIMIT = int(os.environ.get("MARKETS_VERIFY_LIMIT", "25"))
+
+# Потолок ЖИВЫХ запросов к Steam за один прогон — общий для обоих каналов.
+#
+# priceoverview лимитирован жёстко, и проверять каждого кандидата живьём
+# оказалось нерабочей схемой: автоскан арбитража каждые 10 минут выжигал все
+# адреса пула на полчаса, после чего /markets приходила к пустому пулу и
+# молчала. Два канала дрались за один ресурс и проигрывали оба.
+#
+# Восемь запросов на прогон — это около 50 в час на весь бот, что Steam
+# переносит спокойно. Остальное берётся из кэша, а он наполняется постепенно:
+# кандидаты от прогона к прогону в основном одни и те же.
+STEAM_LIVE_BUDGET = int(os.environ.get("STEAM_LIVE_BUDGET", "8"))
 
 # Минимум продаж в Steam за сутки, чтобы находка считалась реализуемой.
 # Без этого «выгода» бумажная: предмет, который не продаётся, не перепродать
@@ -1471,32 +1485,54 @@ async def _verify_against_steam(offers, min_discount_pct: float) -> list:
         return offers
 
     todo = offers[:ARB_VERIFY_LIMIT]
+
+    # Кэш и общий потолок живых запросов — те же, что у /markets, и по той же
+    # причине: раньше этот скан выстреливал до 80 запросов каждые 10 минут,
+    # выжигал все адреса пула на полчаса, и второй канал приходил к пустому
+    # пулу. Ресурс Steam общий, значит и экономить его надо сообща.
+    cached = await get_steam_prices_batch([o.market_hash_name for o in todo])
+    fresh_budget = [o for o in todo if o.market_hash_name not in cached][:STEAM_LIVE_BUDGET]
+
     lanes = max(1, len(STEAM_POOL))
     log.info(
-        "arb: проверяю у Steam %d кандидат(ов) из %d, полос %d",
-        len(todo), len(offers), lanes,
+        "arb: %d кандидат(ов) из %d: в кэше %d, спрошу у Steam %d, полос %d",
+        len(todo), len(offers), len(cached), len(fresh_budget), lanes,
     )
 
     verified = []
+    unchecked = 0
     semaphore = asyncio.Semaphore(lanes)
 
+    class Cached:
+        __slots__ = ("lowest", "volume", "median")
+
+        def __init__(self, entry):
+            self.lowest, self.volume, self.median = entry["price"], entry.get("volume"), None
+
     async def check(offer, session):
+        entry = cached.get(offer.market_hash_name)
+        if entry:
+            return offer, Cached(entry)
+        if offer not in fresh_budget:
+            return offer, None
         async with semaphore:
             try:
-                return offer, await get_steam_market_price(session, offer.market_hash_name)
+                live = await get_steam_market_price(session, offer.market_hash_name)
             except Exception:
-                log.exception("arb: не смог проверить цену Steam для %s", offer.market_hash_name)
+                log.info("arb: %s — Steam не ответил", offer.market_hash_name)
                 return offer, None
+            if live and live.lowest:
+                await set_steam_price(offer.market_hash_name, live.lowest, live.volume)
+            return offer, live
 
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
         checked = await asyncio.gather(*(check(o, session) for o in todo))
         for o, live in checked:
 
             if live is None or not live.lowest:
-                log.info(
-                    "arb: %s — Steam цену не подтвердил, выбрасываю (оценка была $%.2f)",
-                    o.market_hash_name, o.steam_price,
-                )
+                # Не "не подтвердил", а "не проверяли": разница принципиальная,
+                # и раньше лог утверждал первое, когда на деле было второе.
+                unchecked += 1
                 continue
 
             was, was_pct = o.steam_price, o.discount_pct
@@ -1530,6 +1566,12 @@ async def _verify_against_steam(offers, min_discount_pct: float) -> list:
                 continue
             verified.append(o)
 
+    if unchecked:
+        log.info(
+            "arb: %d кандидат(ов) остались непроверенными (бюджет живых запросов %d) — "
+            "их проверим в следующих прогонах, кэш накапливается",
+            unchecked, STEAM_LIVE_BUDGET,
+        )
     verified.sort(key=lambda x: x.discount_pct, reverse=True)
     return verified
 
@@ -2159,17 +2201,42 @@ async def _verify_markets_against_steam(offers, min_discount_pct: float, min_vol
         log.warning("markets: Steam на кулдауне и прокси нет — проверить цены нечем")
         return [], 0, len(offers)
 
+    # Сначала кэш — он снимает основную массу запросов, потому что кандидаты
+    # от прогона к прогону повторяются.
+    cached = await get_steam_prices_batch([o.market_hash_name for o in offers])
+    misses = [o for o in offers if o.market_hash_name not in cached]
+    fresh_budget = misses[:STEAM_LIVE_BUDGET]
+
     lanes = max(1, len(STEAM_POOL))
     semaphore = asyncio.Semaphore(lanes)
-    log.info("markets: проверяю у Steam %d кандидат(ов), полос %d", len(offers), lanes)
+    log.info(
+        "markets: %d кандидат(ов): в кэше %d, спрошу у Steam %d (потолок %d), полос %d",
+        len(offers), len(cached), len(fresh_budget), STEAM_LIVE_BUDGET, lanes,
+    )
+
+    class Cached:
+        __slots__ = ("lowest", "volume", "median")
+
+        def __init__(self, entry):
+            self.lowest, self.volume, self.median = entry["price"], entry.get("volume"), None
 
     async def check(offer, session):
+        entry = cached.get(offer.market_hash_name)
+        if entry:
+            return offer, Cached(entry)
+        if offer not in fresh_budget:
+            return offer, None
         async with semaphore:
             try:
-                return offer, await get_steam_market_price(session, offer.market_hash_name)
+                live = await get_steam_market_price(session, offer.market_hash_name)
             except Exception:
-                log.exception("markets: не смог проверить %s", offer.market_hash_name)
+                # Не .exception(): при выжженном пуле это десятки одинаковых
+                # трейсбеков подряд, из-за которых настоящие ошибки не найти.
+                log.info("markets: %s — Steam не ответил", offer.market_hash_name)
                 return offer, None
+            if live and live.lowest:
+                await set_steam_price(offer.market_hash_name, live.lowest, live.volume)
+            return offer, live
 
     verified = []
     unavailable = 0   # не смогли проверить: Steam не ответил
