@@ -514,6 +514,21 @@ async def _note_ok() -> None:
         await _persist_cooldown()
 
 
+# Счётчик скачанного за прогон — чтобы трафик резидентных прокси был измеренным
+# числом, а не оценкой. Оценки тут уже подводили: объём Steam был прикинут в
+# десять раз выше реального, потому что считался несжатым.
+_bytes_downloaded = 0
+_bytes_exact = True
+
+
+def take_downloaded_bytes() -> tuple[int, bool]:
+    """Сколько скачано с прошлого вызова и точное ли это число. Сбрасывает счётчик."""
+    global _bytes_downloaded, _bytes_exact
+    total, exact = _bytes_downloaded, _bytes_exact
+    _bytes_downloaded, _bytes_exact = 0, True
+    return total, exact
+
+
 _throttle_locks: dict[str, asyncio.Lock] = {}
 _throttle_last: dict[str, float] = {}
 
@@ -695,6 +710,36 @@ def _build_request(path: str, params: dict[str, str]) -> tuple[str, dict[str, st
     return f"{CSFLOAT_PROXY_URL}/proxy", {"url": str(target)}
 
 
+class _ProxyTransient(Exception):
+    """
+    Сетевой сбой на конкретном адресе: оборвалось соединение, таймаут, отказ
+    туннеля. Не ошибка CSFloat и не наша — просто этот адрес сейчас плох.
+
+    Отдельный класс нужен, потому что резидентные прокси рвут соединения
+    регулярно, это их нормальное поведение, а не исключительная ситуация. При
+    восьми полосах по 25 страниц один обрыв убивал всю полосу целиком — 25
+    страниц коту под хвост. Ловим, откладываем адрес ненадолго и повторяем
+    запрос с другого.
+    """
+
+
+# Сетевые сбои, после которых имеет смысл просто взять другой адрес.
+# ServerDisconnectedError сюда попал по факту с прода: прокси закрыл туннель на
+# этапе CONNECT, а прежние обработчики ловили только ClientHttpProxyError и
+# ClientProxyConnectionError, так что этот класс пролетал мимо и валил прогон.
+_TRANSIENT_PROXY_ERRORS = (
+    aiohttp.ServerDisconnectedError,
+    aiohttp.ClientProxyConnectionError,
+    aiohttp.ClientOSError,
+    aiohttp.ServerTimeoutError,
+    asyncio.TimeoutError,
+)
+
+# На сколько откладывать адрес после сетевого сбоя. Коротко: это не квота и не
+# бан, адрес почти наверняка живой — надо лишь не долбиться в него подряд.
+PROXY_TRANSIENT_COOLDOWN_SECONDS = 60
+
+
 class _QuotaRetry(Exception):
     """
     Внутренний сигнал «429 по квоте, но кулдаун ещё не ставили».
@@ -727,11 +772,11 @@ async def _request_listings(
             f"Прокси {mask_proxy(proxy or '')} отклонил запрос (HTTP {e.status}): проверь "
             f"логин, пароль и остаток трафика в личном кабинете."
         ) from None
-    except aiohttp.ClientProxyConnectionError as e:
-        raise CSFloatError(
-            f"Не удалось подключиться к прокси {mask_proxy(proxy or '')} ({e}). "
-            f"Проверь хост и порт в CSFLOAT_HTTP_PROXY."
-        ) from None
+    except _TRANSIENT_PROXY_ERRORS as e:
+        # Без прокси менять нечего — тогда это честная сетевая ошибка наружу.
+        if not proxy:
+            raise CSFloatError(f"Сетевая ошибка при запросе к CSFloat: {e}") from None
+        raise _ProxyTransient(f"{type(e).__name__}: {e}") from None
 
 
 async def _do_request(
@@ -799,6 +844,21 @@ async def _do_request(
             raise CSFloatError(
                 f"CSFloat вернул HTTP {resp.status}: {body!r}. Маршрут: {route_description()}"
             )
+
+        # Считаем СЖАТЫЕ байты — именно их тарифицирует резидентный прокси.
+        # Content-Length у сжатого ответа и есть размер на проводе; когда его
+        # нет (chunked), считаем распакованное тело и помечаем как верхнюю
+        # оценку, чтобы не выдавать её за точное число.
+        global _bytes_downloaded, _bytes_exact
+        raw_len = resp.headers.get("Content-Length")
+        if raw_len:
+            try:
+                _bytes_downloaded += int(raw_len)
+            except ValueError:
+                pass
+        else:
+            _bytes_exact = False
+            _bytes_downloaded += resp.content.total_bytes
 
         await _note_ok()
         # Остаток лимита логируем — это то, чего так не хватало со Steam:
@@ -872,6 +932,18 @@ async def fetch_listings_page(
         try:
             data = await _request_listings(session, url, request_params, proxy)
             break
+        except _ProxyTransient as broke:
+            attempt += 1
+            CSFLOAT_POOL.mark_exhausted(
+                proxy, PROXY_TRANSIENT_COOLDOWN_SECONDS, f"сетевой сбой ({broke})"
+            )
+            if attempt >= max_attempts:
+                raise CSFloatError(
+                    f"Не удалось получить страницу: адреса подряд рвут соединение "
+                    f"({broke}). Свободных адресов: {CSFLOAT_POOL.describe()}"
+                ) from None
+            # Адрес уже помечен, следующий заход возьмёт другой — паузы не надо.
+            continue
         except _QuotaRetry as retry:
             attempt += 1
             _note_budget(retry.headers)
@@ -1073,9 +1145,12 @@ async def fetch_market_wide(
     for listing in out:
         unique[listing.listing_id] = listing
 
+    downloaded, exact = take_downloaded_bytes()
+    mb = downloaded / 1024 / 1024
     log.info(
-        "csfloat: широкий скан собрал %d лотов (%d уникальных), полос отвалилось %d",
-        len(out), len(unique), failed,
+        "csfloat: широкий скан собрал %d лотов (%d уникальных), полос отвалилось %d. "
+        "Скачано %.1f МБ%s — это и есть расход трафика прокси за прогон",
+        len(out), len(unique), failed, mb, "" if exact else " (оценка сверху)",
     )
     return list(unique.values())
 

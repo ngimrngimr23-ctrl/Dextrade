@@ -1471,49 +1471,53 @@ async def _fill_steam_prices(listings) -> int:
             found and any(w in found.windows for w in ("last_24h", "last_7d"))
         )
 
-        if l.reference_price and l.reference_price > 0:
-            l.steam_price = l.reference_price
-            l.steam_price_window = "справка CSFloat"
-            from_reference += 1
+        # Основной источник — прайс-лист, справка CSFloat второе мнение.
+        #
+        # Порядок менялся дважды, поэтому основание записано явно. Сначала
+        # основным был прайс-лист; потом на случае P2000 | Acid Etched (лот
+        # $12.04, прайс-лист $28.18, справка $10.44) я решил, что прав CSFloat,
+        # и поменял приоритет. Проверка на большем числе предметов показала
+        # обратное: с ценой в Steam чаще сходится прайс-лист, а справка CSFloat
+        # систематически ниже — что логично, это оценка площадки для СВОЕГО
+        # рынка, а не цена Steam.
+        #
+        # Справка при этом остаётся полезной вдвойне: как второе мнение и как
+        # запасной источник там, где предмета нет в прайс-листе (а нет его у
+        # заметной доли лотов).
+        if listed is not None:
+            l.steam_price = listed
+            l.steam_price_window = ARB_PRICE_WINDOW
+            l.steam_price_spread_pct = found.recent_spread_pct
+            from_pricelist += 1
 
-            # Прайс-лист теперь второе мнение, а не основание. Когда сходится —
-            # это заметно усиливает доверие к находке, и об этом стоит сказать
-            # в сообщении. Когда расходится — доверия меньше, но выбрасывать
-            # лот из-за этого мы больше не будем: на проверяемом случае
-            # (P2000 | Acid Etched, лот $12.04) прайс-лист утверждал $28.18, а
-            # справочная цена CSFloat $10.44, и права оказалась вторая.
-            if listed is not None:
+            if l.reference_price and l.reference_price > 0:
                 gap = abs(listed - l.reference_price) / l.reference_price * 100
-                l.steam_price_spread_pct = None
                 if gap <= ARB_SOURCE_GAP_PCT:
                     confirmed += 1
-                    l.steam_price_windows = f"прайс-лист подтверждает: ${listed:.2f}"
+                    l.steam_price_windows = f"CSFloat подтверждает: ${l.reference_price:.2f}"
                 else:
                     disagree += 1
                     l.steam_price_windows = (
-                        f"прайс-лист не согласен: ${listed:.2f} (расхождение {gap:.0f}%)"
+                        f"CSFloat оценивает в ${l.reference_price:.2f} "
+                        f"(расхождение {gap:.0f}%) — проверь перед покупкой"
                     )
-                    log.info(
-                        "arb: %s — источники расходятся на %.0f%%: справка CSFloat $%.2f, "
-                        "прайс-лист $%.2f. Беру справку CSFloat",
-                        l.market_hash_name, gap, l.reference_price, listed,
-                    )
+            else:
+                l.steam_price_windows = found.describe()
             continue
 
-        # Справки нет — работаем по прайс-листу, как раньше.
-        if listed is None:
-            continue
-        l.steam_price = listed
-        l.steam_price_window = ARB_PRICE_WINDOW
-        l.steam_price_spread_pct = found.recent_spread_pct
-        l.steam_price_windows = found.describe()
-        from_pricelist += 1
+        # Предмета нет в прайс-листе — берём справку CSFloat, иначе потеряли бы
+        # заметную часть рынка вовсе.
+        if l.reference_price and l.reference_price > 0:
+            l.steam_price = l.reference_price
+            l.steam_price_window = "справка CSFloat"
+            l.steam_price_windows = "в прайс-листе предмета нет — цена по оценке CSFloat"
+            from_reference += 1
 
     log.info(
-        "arb: цена подставлена для %d из %d лотов (%d по справке CSFloat, %d по прайс-листу). "
-        "Прайс-лист подтвердил %d, разошёлся на %d",
-        from_reference + from_pricelist, len(missing),
-        from_reference, from_pricelist, confirmed, disagree,
+        "arb: цена подставлена для %d из %d лотов (%d по прайс-листу, %d по справке CSFloat, "
+        "когда предмета в прайс-листе нет). CSFloat подтвердил %d, разошёлся на %d",
+        from_pricelist + from_reference, len(missing),
+        from_pricelist, from_reference, confirmed, disagree,
     )
     return from_reference + from_pricelist
 
