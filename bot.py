@@ -103,6 +103,7 @@ from storage import (
 )
 import csfloat_client
 import market_prices
+import proxy_pool
 from csfloat_client import CSFloatError, CSFloatRateLimited
 
 logging.basicConfig(level=logging.INFO)
@@ -2110,6 +2111,79 @@ async def arbnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Готово, ничего подходящего не нашлось.")
 
 
+async def proxycheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /proxycheck — какой исходящий адрес даёт каждый прокси на самом деле.
+
+    Зачем понадобилось: в логе все семь «разных» прокси оказались одним хостом
+    и портом (proxy.flameproxies.com:8989), различаясь только логином. Это
+    шлюз с ротацией, и сколько за ним настоящих адресов — по конфигурации не
+    видно вовсе.
+
+    А вопрос принципиальный. Лимиты и баны и у Steam, и у CSFloat считаются по
+    исходящему IP. Если за семью логинами стоит один адрес, то пул — иллюзия:
+    бот думает, что у него семь независимых бюджетов, а на деле долбит один и
+    тот же адрес всемером и сам себя банит. Ровно на это похожи логи, где все
+    восемь запросов получили 429 в течение четырёх секунд.
+
+    Проверяется единственным способом — спросить у внешнего сервиса, каким
+    адресом мы к нему пришли.
+    """
+    pool = STEAM_POOL if STEAM_POOL.enabled() else csfloat_client.CSFLOAT_POOL
+    if not pool.enabled():
+        await update.message.reply_text("Прокси не заданы — проверять нечего.")
+        return
+
+    await update.message.reply_text(f"Проверяю {len(pool)} прокси…")
+
+    async def one(proxy: str):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://api.ipify.org?format=json",
+                    proxy=proxy,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    data = await resp.json(content_type=None)
+                    return proxy, data.get("ip"), None
+        except Exception as e:
+            return proxy, None, f"{type(e).__name__}: {e}"
+
+    results = await asyncio.gather(*(one(p) for p in pool.proxies))
+
+    ips: dict[str, int] = {}
+    lines = ["<b>Исходящие адреса прокси</b>"]
+    for proxy, ip, error in results:
+        if ip:
+            ips[ip] = ips.get(ip, 0) + 1
+            lines.append(f"  {proxy_pool.mask(proxy)} → <code>{ip}</code>")
+        else:
+            lines.append(f"  {proxy_pool.mask(proxy)} → ⚠️ {html_module.escape(error or 'нет ответа')}")
+
+    unique = len(ips)
+    lines.append("")
+    if unique == 0:
+        lines.append("⚠️ Ни один прокси не ответил — проверь доступы и остаток трафика.")
+    elif unique == 1 and len(pool) > 1:
+        lines.append(
+            f"⚠️ <b>Все {len(pool)} прокси выходят с ОДНОГО адреса.</b>\n"
+            "Значит пул не даёт ничего: лимиты и баны считаются по IP, и бот "
+            "долбит один адрес всеми полосами сразу, сам себя загоняя в 429.\n\n"
+            "Нужны sticky-сессии с разными исходящими адресами — у провайдера "
+            "это обычно отдельные порты или логины вида user-session-1."
+        )
+    else:
+        lines.append(f"✅ Разных адресов: {unique} из {len(pool)}.")
+        duplicates = {ip: n for ip, n in ips.items() if n > 1}
+        if duplicates:
+            lines.append(
+                "Повторяются: "
+                + ", ".join(f"<code>{ip}</code> ×{n}" for ip, n in duplicates.items())
+            )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def setmarkets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /setmarkets — пороги для сравнения с площадками, по-человечески.
@@ -2918,6 +2992,7 @@ BOT_COMMANDS = [
     BotCommand("arbnow", "Проверить арбитраж CSFloat прямо сейчас"),
     BotCommand("markets", "Сравнить Steam с другими площадками (весь каталог)"),
     BotCommand("setmarkets", "Пороги для /markets: спред, продажи, прибыль"),
+    BotCommand("proxycheck", "Проверить, какие адреса реально дают прокси"),
     BotCommand("setarb", "Арбитраж: CSFloat дешевле Steam на N%"),
     BotCommand("help", "Полный справочник по всем командам"),
 ]
@@ -3242,6 +3317,7 @@ def _build_application(token: str):
     app.add_handler(CommandHandler("arbnow", arbnow))
     app.add_handler(CommandHandler("markets", markets))
     app.add_handler(CommandHandler("setmarkets", setmarkets))
+    app.add_handler(CommandHandler("proxycheck", proxycheck))
     app.add_handler(CommandHandler("arbreset", arbreset))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_selection))
