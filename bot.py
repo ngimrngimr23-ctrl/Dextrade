@@ -1395,9 +1395,12 @@ async def _fill_steam_prices(listings) -> int:
     for l in missing:
         found = prices.get(l.market_hash_name)
         if found:
-            l.steam_price, l.steam_price_window = found
+            l.steam_price = found.price
+            l.steam_price_window = found.window
+            l.steam_price_spread_pct = found.spread_pct
+            l.steam_price_windows = found.describe()
             filled += 1
-            by_window[l.steam_price_window] = by_window.get(l.steam_price_window, 0) + 1
+            by_window[found.window] = by_window.get(found.window, 0) + 1
 
     log.info(
         "arb: цена Steam подставлена из csgotrader для %d из %d лотов без неё. По окнам: %s",
@@ -1446,6 +1449,18 @@ async def _run_arb_scan(bot, chat_id: int) -> int | None:
             "arb: chat_id=%s просмотрено %s лотов, подошло %s",
             chat_id, len(listings), len(offers),
         )
+        # Все окна цены по каждой находке. Это то, чего не хватило, когда цена
+        # разошлась с реальной в 2.4 раза: по одному числу нельзя было понять,
+        # взяли мы устаревшее окно или в файле лежит не то, что мы думаем.
+        # Теперь спорную находку можно разобрать прямо по логу, не гадая.
+        for o in offers[:10]:
+            log.info(
+                "arb: %s — CSFloat $%.2f, Steam $%.2f (%s) -> скидка %.1f%%. Окна: %s",
+                o.market_hash_name, o.csfloat_price, o.steam_price,
+                o.steam_price_window or "?", o.discount_pct,
+                next((l.steam_price_windows for l in listings
+                      if l.listing_id == o.listing_id), None) or "нет данных",
+            )
         if not offers:
             return 0
 

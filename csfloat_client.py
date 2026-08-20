@@ -559,9 +559,14 @@ class CSFloatListing:
     steam_price: float | None         # цена Steam; заполняется извне, см. bot._fill_steam_prices
     steam_volume: int | None          # сколько продаётся, грубая ликвидность (сейчас всегда None)
     # Из какого окна прайс-листа взята steam_price: "last_24h", "last_7d",
-    # "last_30d", "last_90d". Нужно, чтобы не считать скидку от цены
-    # трёхмесячной давности — см. pricing._pick_csgotrader_price_detailed.
+    # "last_30d", "last_90d". См. pricing._steam_price_from_windows.
     steam_price_window: str | None = None
+    # Насколько разъезжаются окна цены, в процентах. Это мера доверия к цене:
+    # у устойчивого предмета единицы процентов, разброс в разы означает, что
+    # считать от такой цены скидку нельзя. None — окно всего одно.
+    steam_price_spread_pct: float | None = None
+    # Все окна одной строкой — только для логов и разбора спорных случаев.
+    steam_price_windows: str | None = None
     float_value: float | None = None
     wear_name: str | None = None
     is_stattrak: bool = False

@@ -28,7 +28,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import aiohttp
 
@@ -58,10 +58,18 @@ CACHE_TTL_SECONDS = 12 * 60 * 60  # 12 часов — цены на стикер
 MANUAL_PRICE_CACHE_PATH = Path(__file__).parent / "manual_sticker_prices.json"
 
 CSGOTRADER_PRICES_URL = "https://prices.csgotrader.app/latest/steam.json"
-# v2: в кэше теперь не только цена, но и окно, из которого она взята
-# (см. _pick_csgotrader_price_detailed). Имя файла сменено намеренно — старый
-# кэш другого формата, и читать его как новый нельзя.
-CSGOTRADER_CACHE_PATH = Path(__file__).parent / "csgotrader_prices_cache_v2.json"
+# v3: в кэше лежат ВСЕ окна предмета, а не только выбранная цена.
+#
+# Зачем все: по одной цене нельзя понять, можно ли ей верить. Когда цена
+# 2026-08-19 разошлась с реальной в 2.4 раза, версий было две — "взяли
+# устаревшее окно" и "в файле не то, что мы думаем", — и различить их по
+# сохранённому числу было нельзя. С полным набором окон это видно сразу:
+# согласованные значения означают устойчивую цену, разъезжающиеся — что
+# доверять ей нельзя независимо от того, какое окно мы выбрали.
+#
+# Имя файла меняется вместе с форматом намеренно: кэш прошлой версии читаться
+# как новый не должен.
+CSGOTRADER_CACHE_PATH = Path(__file__).parent / "csgotrader_prices_cache_v3.json"
 CSGOTRADER_CACHE_TTL_SECONDS = 3 * 60 * 60  # на их стороне файл обновляется примерно раз в час
 
 # collection-код из имени файла -> человекочитаемое название турнира/капсулы
@@ -195,35 +203,73 @@ def _save_csgotrader_cache(details: dict) -> None:
     )
 
 
-def _pick_csgotrader_price_detailed(entry: dict) -> tuple[float, str] | None:
-    """
-    Цена и ОКНО, из которого она взята: ("last_24h", "last_7d", ...).
+class SteamPrice(NamedTuple):
+    """Цена предмета из прайс-листа вместе с основаниями ей верить."""
 
-    Окно важно не меньше самой цены. Порядок фолбэка тут от свежего к старому,
-    и у неликвида первые два окна часто пустые — тогда сюда попадает цена за
-    30 или 90 дней. Как "примерно сколько стоит" это годится (для стикеров так
-    и используется), а как база для расчёта скидки — нет: если предмет за это
-    время подешевел вдвое, арбитраж покажет скидку 50%, которой не существует.
+    price: float
+    window: str                     # из какого окна взята цена
+    windows: dict[str, float]       # все непустые окна предмета
 
-    Именно так и вышло 2026-08-19: находки шли сплошь со скидкой 57-60%, и все
-    по неликвиду. Сортировка по убыванию скидки этот эффект усиливает — наверх
-    всплывают ровно те предметы, у которых цена-ориентир устарела сильнее всего.
-    Поэтому окно возвращается наружу, а решение "верить или нет" принимает тот,
-    кто цену использует (см. CSGOTRADER_FRESH_WINDOWS).
-    """
+    @property
+    def spread_pct(self) -> float | None:
+        """
+        Насколько разъезжаются окна: (max - min) / min в процентах.
+        None — окно всего одно, сравнивать не с чем.
+
+        Это и есть мера доверия к цене. Устойчивая цена даёт единицы процентов;
+        разброс в разы означает, что предмет недавно резко изменился в цене
+        (или продаж так мало, что среднее скачет), и считать от такой цены
+        скидку нельзя — она будет отражать не выгоду, а разброс данных.
+        """
+        if len(self.windows) < 2:
+            return None
+        lo, hi = min(self.windows.values()), max(self.windows.values())
+        if lo <= 0:
+            return None
+        return (hi - lo) / lo * 100
+
+    def describe(self) -> str:
+        """Все окна одной строкой — для логов."""
+        parts = ", ".join(f"{w.replace('last_', '')}=${self.windows[w]:.2f}"
+                          for w in CSGOTRADER_WINDOWS if w in self.windows)
+        spread = f", разброс {self.spread_pct:.0f}%" if self.spread_pct is not None else ""
+        return f"{parts}{spread}"
+
+
+def _collect_windows(entry: dict) -> dict[str, float]:
+    """Все непустые окна предмета, приведённые к числам."""
+    out: dict[str, float] = {}
     for window in CSGOTRADER_WINDOWS:
         value = entry.get(window)
-        if value is not None:
-            try:
-                return float(value), window
-            except (TypeError, ValueError):
-                continue
+        if value is None:
+            continue
+        try:
+            out[window] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _steam_price_from_windows(windows: dict[str, float]) -> SteamPrice | None:
+    """
+    Цена = самое свежее непустое окно. Порядок фолбэка от свежего к старому:
+    у неликвида первых окон часто нет, и тогда берётся более старое.
+
+    Само по себе старое окно ещё не значит "цена неверна" — если предмет
+    стабилен, цена за 30 дней ничем не хуже. Поэтому решение "верить или нет"
+    принимается не по возрасту окна, а по согласованности окон между собой
+    (см. SteamPrice.spread_pct); тот, кто цену использует, получает и то и
+    другое.
+    """
+    for window in CSGOTRADER_WINDOWS:
+        if window in windows:
+            return SteamPrice(windows[window], window, windows)
     return None
 
 
 def _pick_csgotrader_price(entry: dict) -> float | None:
-    picked = _pick_csgotrader_price_detailed(entry)
-    return picked[0] if picked else None
+    picked = _steam_price_from_windows(_collect_windows(entry))
+    return picked.price if picked else None
 
 
 async def _download_csgotrader_prices(session: aiohttp.ClientSession) -> dict[str, float]:
@@ -244,19 +290,19 @@ async def _download_csgotrader_prices(session: aiohttp.ClientSession) -> dict[st
         log.exception("csgotrader: не удалось скачать/распарсить прайс-лист")
         return {}
 
-    details: dict[str, list] = {}
+    details: dict[str, dict] = {}
     by_window: dict[str, int] = {}
     for name, entry in raw.items():
         if not isinstance(entry, dict):
             continue
-        picked = _pick_csgotrader_price_detailed(entry)
+        windows = _collect_windows(entry)
+        picked = _steam_price_from_windows(windows)
         if picked is not None:
-            price, window = picked
-            details[name] = [price, window]
-            by_window[window] = by_window.get(window, 0) + 1
+            details[name] = windows
+            by_window[picked.window] = by_window.get(picked.window, 0) + 1
 
     log.info(
-        "csgotrader: получено %s цен из %s записей в файле. По окнам: %s",
+        "csgotrader: получено %s цен из %s записей в файле. Свежесть цены по окнам: %s",
         len(details), len(raw),
         ", ".join(f"{w} {by_window.get(w, 0)}" for w in CSGOTRADER_WINDOWS),
     )
@@ -265,10 +311,11 @@ async def _download_csgotrader_prices(session: aiohttp.ClientSession) -> dict[st
 
 async def get_csgotrader_price_details(
     session: aiohttp.ClientSession, force_refresh: bool = False
-) -> dict[str, tuple[float, str]]:
+) -> dict[str, SteamPrice]:
     """
-    market_hash_name -> (цена, окно). Окно нужно тем, кто считает по цене
-    скидку: см. _pick_csgotrader_price_detailed.
+    market_hash_name -> SteamPrice (цена, окно и ВСЕ окна предмета).
+    Полный набор окон нужен тем, кто считает по цене скидку: по одному числу
+    нельзя понять, устойчива цена или скачет.
     """
     cached = _load_csgotrader_cache()
     if not force_refresh and cached and (time.time() - cached[1]) < CSGOTRADER_CACHE_TTL_SECONDS:
@@ -284,13 +331,20 @@ async def get_csgotrader_price_details(
         else:
             return {}
 
-    return {name: (value[0], value[1]) for name, value in details.items() if len(value) == 2}
+    out: dict[str, SteamPrice] = {}
+    for name, windows in details.items():
+        if not isinstance(windows, dict):
+            continue
+        picked = _steam_price_from_windows(windows)
+        if picked is not None:
+            out[name] = picked
+    return out
 
 
 async def get_csgotrader_prices(session: aiohttp.ClientSession, force_refresh: bool = False) -> dict[str, float]:
-    """Только цены, без окон — стикерному пайплайну окно не нужно."""
+    """Только цены — стикерному пайплайну окна не нужны."""
     details = await get_csgotrader_price_details(session, force_refresh=force_refresh)
-    return {name: price for name, (price, _window) in details.items()}
+    return {name: sp.price for name, sp in details.items()}
 
 
 # ---------------------------------------------------------------------------
