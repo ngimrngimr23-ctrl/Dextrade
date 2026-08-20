@@ -218,6 +218,14 @@ ARB_SOURCE_GAP_PCT = 25.0
 # предмету, а Steam банит за темп. Восемьдесят при шести адресах — это меньше
 # минуты, при одном адресе около пяти.
 ARB_VERIFY_LIMIT = int(os.environ.get("ARB_VERIFY_LIMIT", "80"))
+
+# Сколько находок с площадок проверять живой ценой Steam за раз.
+MARKETS_VERIFY_LIMIT = int(os.environ.get("MARKETS_VERIFY_LIMIT", "60"))
+
+# Минимум продаж в Steam за сутки, чтобы находка считалась реализуемой.
+# Без этого «выгода» бумажная: предмет, который не продаётся, не перепродать
+# ни за какую цену. Объёма продаж в прайс-листах нет вовсе — только у Steam.
+MARKETS_MIN_VOLUME = int(os.environ.get("MARKETS_MIN_VOLUME", "5"))
 _arb_running: set[int] = set()
 
 # chat_id -> идёт прогон вотчлиста прямо сейчас — защита от наложения тиков,
@@ -2055,6 +2063,67 @@ async def arbnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Готово, ничего подходящего не нашлось.")
 
 
+async def _verify_markets_against_steam(offers, min_discount_pct: float):
+    """
+    Проверить находки с площадок живой ценой Steam и отсеять неликвид.
+
+    Две задачи разом, и обе не решаются прайс-листом.
+
+    Первая — цена. В прайс-листе это оценка, и на редких позициях она врёт
+    особенно грубо: при пороге 20% верхушка выдачи состояла из скидок 90-95%,
+    которых не бывает. priceoverview даёт lowest_price — то, что реально
+    заплатишь.
+
+    Вторая — ликвидность. Объёма продаж в прайс-листе нет ВООБЩЕ, а без него
+    «выгода» ничего не стоит: предмет, который в Steam не продаётся, нельзя
+    перепродать ни за какую цену. priceoverview возвращает volume за сутки.
+    """
+    if not offers:
+        return []
+    if not STEAM_POOL.enabled() and steam_cooldown_remaining(scope="pricing") > 0:
+        log.warning("markets: Steam на кулдауне и прокси нет — проверить цены нечем")
+        return []
+
+    lanes = max(1, len(STEAM_POOL))
+    semaphore = asyncio.Semaphore(lanes)
+    log.info("markets: проверяю у Steam %d кандидат(ов), полос %d", len(offers), lanes)
+
+    async def check(offer, session):
+        async with semaphore:
+            try:
+                return offer, await get_steam_market_price(session, offer.market_hash_name)
+            except Exception:
+                log.exception("markets: не смог проверить %s", offer.market_hash_name)
+                return offer, None
+
+    verified = []
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+        for offer, live in await asyncio.gather(*(check(o, session) for o in offers)):
+            if live is None or not live.lowest:
+                continue
+
+            was = offer.steam_price
+            offer.apply_live_steam(live.lowest, live.volume)
+
+            if (live.volume or 0) < MARKETS_MIN_VOLUME:
+                log.info(
+                    "markets: %s — продаж за сутки %s, меньше %d: перепродать будет некому",
+                    offer.market_hash_name, live.volume or 0, MARKETS_MIN_VOLUME,
+                )
+                continue
+            if offer.discount_pct < min_discount_pct:
+                log.info(
+                    "markets: %s — оценка была $%.2f, Steam на самом деле $%.2f, "
+                    "скидка %.1f%% ниже порога",
+                    offer.market_hash_name, was, live.lowest, offer.discount_pct,
+                )
+                continue
+            verified.append(offer)
+
+    log.info("markets: подтвердилось %d из %d проверенных", len(verified), len(offers))
+    return verified
+
+
 async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /markets [%] — сравнить Steam с площадками из прайс-листов csgotrader.
@@ -2110,6 +2179,20 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     found.sort(key=lambda o: o.discount_pct, reverse=True)
+
+    # Проверка у Steam. Прайс-лист даёт ОЦЕНКУ, и на копеечных и редких
+    # позициях она врёт особенно сильно — на проде при пороге 20% верхушка
+    # списка была со скидками 90-95%, которых не существует. Заодно только так
+    # и узнаётся ликвидность: объёма продаж в прайс-листе нет вовсе.
+    before = len(found)
+    found = await _verify_markets_against_steam(found[:MARKETS_VERIFY_LIMIT], threshold)
+    if not found:
+        await update.message.reply_text(
+            f"Кандидатов было {before}, но ни один не подтвердился живой ценой Steam. "
+            "Значит это были расхождения в прайс-листах, а не выгода."
+        )
+        return
+    found.sort(key=lambda o: o.discount_pct, reverse=True)
     lines = [
         f"🏪 Дешевле Steam — найдено {len(found)}\n"
         f"<i>Цены из прайс-листов, обновляются примерно раз в час. Это средняя цена "
@@ -2122,7 +2205,8 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<code>{html_module.escape(o.market_hash_name)}</code>\n"
             f"  {html_module.escape(o.market)} ${o.market_price:.2f} | "
             f"Steam ${o.steam_price:.2f} | дешевле на {o.discount_pct:.1f}%\n"
-            f"  чистыми при перепродаже: {'+' if net >= 0 else '-'}${abs(net):.2f}\n"
+            f"  чистыми при перепродаже: {'+' if net >= 0 else '-'}${abs(net):.2f}"
+            f" | продаж в Steam за сутки: {o.steam_volume if o.steam_volume is not None else '?'}\n"
             f'  <a href="{o.steam_url}">Проверить в Steam</a>'
         )
 

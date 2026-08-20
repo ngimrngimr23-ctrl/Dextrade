@@ -215,8 +215,10 @@ async def load_markets(
 class MarketOffer:
     """Находка: предмет дешевле на площадке, чем в Steam."""
 
-    __slots__ = ("market", "market_hash_name", "market_price", "steam_price", "discount_pct")
-
+    __slots__ = (
+        "market", "market_hash_name", "market_price", "steam_price", "discount_pct",
+        "steam_volume", "verified", "estimated_price",
+    )
 
     def __init__(self, market: str, name: str, market_price: float, steam_price: float):
         self.market = market
@@ -224,6 +226,19 @@ class MarketOffer:
         self.market_price = market_price
         self.steam_price = steam_price
         self.discount_pct = (steam_price - market_price) / steam_price * 100
+        # Заполняются проверкой у Steam, см. bot.markets. Пока None — цена
+        # взята из прайс-листа, то есть это оценка, а не то, что в стакане.
+        self.steam_volume: int | None = None
+        self.verified = False
+        self.estimated_price: float | None = None
+
+    def apply_live_steam(self, lowest: float, volume: int | None) -> None:
+        """Заменить оценку настоящей ценой из Steam и пересчитать выгоду."""
+        self.estimated_price = self.steam_price
+        self.steam_price = lowest
+        self.steam_volume = volume
+        self.discount_pct = (lowest - self.market_price) / lowest * 100
+        self.verified = True
 
     def net_after_fee(self, fee_multiplier: float) -> float:
         """Сколько останется при перепродаже в Steam за вычетом комиссии."""
@@ -242,14 +257,38 @@ class MarketOffer:
         )
 
 
+# Потолок скидки, выше которого это почти наверняка не выгода, а дефект данных.
+#
+# Основание с прода: при пороге 20% нашлось 63 тысячи «находок», и верхушка
+# списка была со скидками 90-95%. Настоящего арбитража такого размера не
+# бывает — его бы разобрали мгновенно. Что там на самом деле:
+#   * LOOT.FARM и подобные обменники публикуют цену ВЫКУПА (сколько дают тебе),
+#     а не цену покупки — разрыв структурный и не реализуемый;
+#   * предметы за один-два цента, где процент огромен, а прибыль копеечная;
+#   * просто устаревшие или битые записи по редким позициям.
+# Отсечка сверху дешевле и надёжнее, чем пытаться распознать каждый случай.
+MAX_SANE_DISCOUNT_PCT = 70.0
+
+# Минимальная прибыль в долларах. Процент на копеечных предметах ничего не
+# значит: 92% на предмете за $0.01 — это десять центов, ради которых никто не
+# станет ничего делать.
+MIN_NET_PROFIT = 1.0
+
+# Минимальная цена предмета на площадке — та же мысль с другой стороны.
+MIN_MARKET_PRICE = 1.0
+
+
 def compare(
     steam_prices: dict[str, float],
     market_prices: dict[str, float],
     market: str,
     *,
     min_discount_pct: float,
-    min_price: float | None = None,
+    max_discount_pct: float = MAX_SANE_DISCOUNT_PCT,
+    min_price: float | None = MIN_MARKET_PRICE,
     max_price: float | None = None,
+    min_net_profit: float = MIN_NET_PROFIT,
+    fee_multiplier: float = 0.87,
 ) -> list[MarketOffer]:
     """
     Сравнить цены площадки со Steam по ВСЕМУ пересечению каталогов.
@@ -257,25 +296,43 @@ def compare(
     Здесь нет ни выборки, ни потолка на число проверенных предметов: оба
     словаря уже в памяти, сравнение локальное и стоит миллисекунды. В этом и
     смысл источника — не надо решать, какую тысячу предметов посмотреть.
+
+    Отсев считается по причинам и пишется в лог: без разбивки «нашлось 63
+    тысячи» и «нашлось три» выглядят одинаково непонятно.
     """
+    dropped = {"нет цены Steam": 0, "дёшево": 0, "скидка ниже порога": 0,
+               "скидка неправдоподобна": 0, "прибыль мизерная": 0}
     offers: list[MarketOffer] = []
+    common = 0
+
     for name, market_price in market_prices.items():
         steam_price = steam_prices.get(name)
         if not steam_price or steam_price <= 0:
+            dropped["нет цены Steam"] += 1
             continue
+        common += 1
         if min_price is not None and market_price < min_price:
+            dropped["дёшево"] += 1
             continue
         if max_price is not None and market_price > max_price:
             continue
+
         offer = MarketOffer(market, name, market_price, steam_price)
-        if offer.discount_pct >= min_discount_pct:
-            offers.append(offer)
+        if offer.discount_pct < min_discount_pct:
+            dropped["скидка ниже порога"] += 1
+            continue
+        if offer.discount_pct > max_discount_pct:
+            dropped["скидка неправдоподобна"] += 1
+            continue
+        if offer.net_after_fee(fee_multiplier) < min_net_profit:
+            dropped["прибыль мизерная"] += 1
+            continue
+        offers.append(offer)
 
     offers.sort(key=lambda o: o.discount_pct, reverse=True)
     log.info(
-        "markets: %s — общих со Steam предметов %d, прошло порог %.0f%%: %d",
-        market,
-        sum(1 for n in market_prices if n in steam_prices),
-        min_discount_pct, len(offers),
+        "markets: %s — общих со Steam %d, прошло %d. Отсеяно: %s",
+        market, common, len(offers),
+        ", ".join(f"{k} {v}" for k, v in dropped.items() if v) or "ничего",
     )
     return offers
