@@ -514,13 +514,28 @@ async def _note_ok() -> None:
         await _persist_cooldown()
 
 
-async def _throttle() -> None:
-    global _last_request_at
-    async with _request_lock:
-        wait = MIN_REQUEST_INTERVAL - (time.monotonic() - _last_request_at)
+_throttle_locks: dict[str, asyncio.Lock] = {}
+_throttle_last: dict[str, float] = {}
+
+
+async def _throttle(key: str = "") -> None:
+    """
+    Пауза между запросами, ОТДЕЛЬНАЯ для каждого исходящего адреса.
+
+    Раньше замок был один на весь процесс, и это делало пул прокси бесполезным
+    для скорости: сколько бы адресов ни было, запросы всё равно выстраивались в
+    одну очередь по MIN_REQUEST_INTERVAL. Между тем лимит считается по адресу,
+    значит и темп надо держать по адресу — тогда N адресов дают N параллельных
+    полос, а не N раз по одной.
+    """
+    lock = _throttle_locks.get(key)
+    if lock is None:
+        lock = _throttle_locks[key] = asyncio.Lock()
+    async with lock:
+        wait = MIN_REQUEST_INTERVAL - (time.monotonic() - _throttle_last.get(key, 0.0))
         if wait > 0:
             await asyncio.sleep(wait)
-        _last_request_at = time.monotonic()
+        _throttle_last[key] = time.monotonic()
 
 
 @dataclass
@@ -700,7 +715,8 @@ async def _request_listings(
     proxy: str | None = None,
 ):
     """Один запрос за страницей лотов. Возвращает разобранный JSON."""
-    await _throttle()
+    # Ключ паузы — сам адрес: у каждого прокси свой темп, см. _throttle.
+    await _throttle(proxy or "")
     try:
         return await _do_request(session, url, request_params, proxy)
     except aiohttp.ClientHttpProxyError as e:
@@ -803,6 +819,7 @@ async def fetch_listings_page(
     sort_by: str = "most_recent",
     min_price: float | None = None,
     max_price: float | None = None,
+    proxy: str | None = None,
 ) -> tuple[list[CSFloatListing], str | None]:
     """
     Одна страница лотов CSFloat. Возвращает (лоты, курсор_следующей_страницы).
@@ -840,7 +857,13 @@ async def fetch_listings_page(
     max_attempts = max(len(CSFLOAT_POOL), QUOTA_429_RETRIES + 1)
     attempt = 0
     while True:
-        proxy = CSFLOAT_POOL.next() if CSFLOAT_POOL.enabled() else None
+        # Полоса широкого скана закрепляет за собой адрес (см. fetch_market_wide):
+        # тогда пауза между запросами держится по этому адресу, и полосы идут
+        # параллельно. На повторах после 429 берём уже любой свободный.
+        if proxy and attempt == 0:
+            pass
+        else:
+            proxy = CSFLOAT_POOL.next() if CSFLOAT_POOL.enabled() else None
         if CSFLOAT_POOL.enabled() and proxy is None:
             # Все адреса на кулдауне — ждать нечего, дальше решает вызывающий.
             raise CSFloatRateLimited(
@@ -940,6 +963,121 @@ async def fetch_listings_page(
         )
 
     return listings, next_cursor
+
+
+# Ценовые полосы для широкого скана. Границы в долларах, None — без края.
+#
+# Зачем резать по цене, а не просто качать больше страниц: пагинация у CSFloat
+# курсорная, страницу N не получить без курсора со страницы N-1. Одна цепочка
+# принципиально последовательна, и 200 запросов по 1.5 секунды — это 5 минут на
+# прогон. А вот РАЗНЫЕ ценовые диапазоны — это независимые цепочки, их можно
+# качать одновременно, по одному адресу на полосу.
+#
+# Границы неравномерные намеренно: дешёвых лотов на рынке несопоставимо больше,
+# поэтому внизу полосы узкие, вверху широкие — иначе верхние полосы кончались бы
+# на первой же странице, а нижняя не успевала прокачаться.
+DEFAULT_PRICE_BANDS: tuple[tuple[float | None, float | None], ...] = (
+    (None, 2.0),
+    (2.0, 5.0),
+    (5.0, 10.0),
+    (10.0, 20.0),
+    (20.0, 50.0),
+    (50.0, 100.0),
+    (100.0, 300.0),
+    (300.0, None),
+)
+
+
+def _clip_bands(bands, min_price, max_price):
+    """Оставить только полосы, попадающие в заданный пользователем диапазон цен."""
+    out = []
+    for lo, hi in bands:
+        if min_price is not None:
+            if hi is not None and hi <= min_price:
+                continue
+            lo = max(lo, min_price) if lo is not None else min_price
+        if max_price is not None:
+            if lo is not None and lo >= max_price:
+                continue
+            hi = min(hi, max_price) if hi is not None else max_price
+        out.append((lo, hi))
+    return out or [(min_price, max_price)]
+
+
+async def fetch_market_wide(
+    *,
+    target: int,
+    sort_by: str = "most_recent",
+    min_price: float | None = None,
+    max_price: float | None = None,
+    bands=DEFAULT_PRICE_BANDS,
+) -> list[CSFloatListing]:
+    """
+    Широкий скан рынка: примерно target лотов за прогон, полосами параллельно.
+
+    Каждая полоса — свой ценовой диапазон, своя цепочка курсоров и свой
+    закреплённый адрес из пула. Полосы идут одновременно, поэтому время прогона
+    определяется самой длинной полосой, а не суммой всех запросов.
+
+    Отказ одной полосы (кончилась квота на её адресе, ошибка сети) не отменяет
+    остальные: собираем что получилось и honest пишем в лог, сколько полос
+    отвалилось. Пустой результат лучше половинчатого молчания.
+    """
+    bands = _clip_bands(bands, min_price, max_price)
+    per_band = max(MAX_LIMIT, target // len(bands))
+    pages_per_band = max(1, -(-per_band // MAX_LIMIT))  # округление вверх
+
+    proxies = CSFLOAT_POOL.proxies or [None]
+    log.info(
+        "csfloat: широкий скан — цель %d лотов, %d полос по %d страниц, адресов %d",
+        target, len(bands), pages_per_band, len(proxies),
+    )
+
+    async def one_band(index: int, lo, hi, session):
+        proxy = proxies[index % len(proxies)]
+        collected: list[CSFloatListing] = []
+        cursor = None
+        for _ in range(pages_per_band):
+            listings, cursor = await fetch_listings_page(
+                session, cursor=cursor, sort_by=sort_by,
+                min_price=lo, max_price=hi, proxy=proxy,
+            )
+            collected.extend(listings)
+            if not cursor or not listings:
+                break
+        return collected
+
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=60),
+        headers=_API_HEADERS,
+    ) as session:
+        results = await asyncio.gather(
+            *(one_band(i, lo, hi, session) for i, (lo, hi) in enumerate(bands)),
+            return_exceptions=True,
+        )
+
+    out: list[CSFloatListing] = []
+    failed = 0
+    for (lo, hi), result in zip(bands, results):
+        if isinstance(result, Exception):
+            failed += 1
+            log.warning(
+                "csfloat: полоса $%s-%s отвалилась: %s",
+                lo if lo is not None else "0", hi if hi is not None else "∞", result,
+            )
+        else:
+            out.extend(result)
+
+    # Один и тот же лот может прийти из двух полос, если цена ровно на границе.
+    unique: dict[str, CSFloatListing] = {}
+    for listing in out:
+        unique[listing.listing_id] = listing
+
+    log.info(
+        "csfloat: широкий скан собрал %d лотов (%d уникальных), полос отвалилось %d",
+        len(out), len(unique), failed,
+    )
+    return list(unique.values())
 
 
 async def fetch_market(
