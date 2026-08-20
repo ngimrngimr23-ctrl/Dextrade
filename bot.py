@@ -61,7 +61,7 @@ from pricing import (
     ingest_manual_prices,
     clear_manual_prices,
     manual_prices_count,
-    get_csgotrader_prices,
+    get_csgotrader_price_details,
 )
 from analyzer import (
     find_offers, find_float_offers, find_arbitrage_offers,
@@ -1331,9 +1331,15 @@ def _format_arb_chunks(offers) -> list[str]:
         else:
             price_cmp = f"дороже на {abs(o.discount_pct):.1f}%"
         net = f"+${o.net_after_fee:.2f}" if o.net_after_fee >= 0 else f"-${abs(o.net_after_fee):.2f}"
+        window_label = {"last_24h": "за сутки", "last_7d": "за неделю"}.get(
+            o.steam_price_window or "", o.steam_price_window or ""
+        )
+        steam_part = f"Steam ${o.steam_price:.2f}"
+        if window_label:
+            steam_part += f" ({window_label})"
         block = (
             f"<b>{html_module.escape(o.market_hash_name)}</b>\n"
-            f"  CSFloat ${o.csfloat_price:.2f} | Steam ${o.steam_price:.2f} | {price_cmp}\n"
+            f"  CSFloat ${o.csfloat_price:.2f} | {steam_part} | {price_cmp}\n"
             f"  чистыми при перепродаже: {net}"
         )
         if o.float_value is not None:
@@ -1379,21 +1385,24 @@ async def _fill_steam_prices(listings) -> int:
         return 0
 
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
-        prices = await get_csgotrader_prices(session)
+        prices = await get_csgotrader_price_details(session)
     if not prices:
         log.warning("arb: прайс-лист csgotrader пуст — цену Steam подставить нечем")
         return 0
 
     filled = 0
+    by_window: dict[str, int] = {}
     for l in missing:
-        price = prices.get(l.market_hash_name)
-        if price:
-            l.steam_price = price
+        found = prices.get(l.market_hash_name)
+        if found:
+            l.steam_price, l.steam_price_window = found
             filled += 1
+            by_window[l.steam_price_window] = by_window.get(l.steam_price_window, 0) + 1
 
     log.info(
-        "arb: цена Steam подставлена из csgotrader для %d из %d лотов без неё",
+        "arb: цена Steam подставлена из csgotrader для %d из %d лотов без неё. По окнам: %s",
         filled, len(missing),
+        ", ".join(f"{w} {n}" for w, n in sorted(by_window.items())) or "—",
     )
     return filled
 

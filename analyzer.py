@@ -8,6 +8,8 @@ import logging
 from dataclasses import dataclass
 
 from steam_client import Listing
+# Единый источник правды про «свежесть» окна — там же, где цена и выбирается.
+from pricing import CSGOTRADER_FRESH_WINDOWS as FRESH_PRICE_WINDOWS
 
 log = logging.getLogger("steam_bot.analyzer")
 
@@ -222,6 +224,9 @@ class ArbOffer:
     stickers_unpriced: int = 0
     inspect_link: str | None = None
     watchers: int = 0
+    # Окно прайс-листа, из которого взята steam_price. Показывается в
+    # сообщении: цена за сутки и цена за неделю — разные основания для решения.
+    steam_price_window: str | None = None
 
     def __post_init__(self):
         if self.stickers is None:
@@ -266,6 +271,7 @@ def find_arbitrage_offers(
     # отбор, а поломку в данных — но отличить это по логам было нельзя.
     dropped = {
         "нет цены Steam": 0,
+        "цена Steam устарела (30/90 дней)": 0,
         "цена вне диапазона": 0,
         "мало продаж": 0,
         "объём неизвестен (не отсеян)": 0,
@@ -276,6 +282,14 @@ def find_arbitrage_offers(
     for l in listings:
         if l.steam_price is None or l.steam_price <= 0:
             dropped["нет цены Steam"] += 1
+            continue
+        # Цена из окна 30/90 дней — не цена, а воспоминание о ней. Считать от
+        # неё скидку нельзя: если предмет с тех пор подешевел, получится
+        # выдуманная скидка, а сортировка по убыванию скидки вытащит такие
+        # лоты в самый верх подборки. Ровно это и случилось 2026-08-19 —
+        # все находки были 57-60% и все по неликвиду.
+        if l.steam_price_window and l.steam_price_window not in FRESH_PRICE_WINDOWS:
+            dropped["цена Steam устарела (30/90 дней)"] += 1
             continue  # без цены Steam сравнивать не с чем
         if min_price is not None and l.price < min_price:
             dropped["цена вне диапазона"] += 1
@@ -332,6 +346,7 @@ def find_arbitrage_offers(
                 stickers_unpriced=len(l.stickers) - l.stickers_priced,
                 inspect_link=l.inspect_link,
                 watchers=l.watchers,
+                steam_price_window=l.steam_price_window,
             )
         )
 

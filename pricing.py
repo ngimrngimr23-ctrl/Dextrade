@@ -58,7 +58,10 @@ CACHE_TTL_SECONDS = 12 * 60 * 60  # 12 часов — цены на стикер
 MANUAL_PRICE_CACHE_PATH = Path(__file__).parent / "manual_sticker_prices.json"
 
 CSGOTRADER_PRICES_URL = "https://prices.csgotrader.app/latest/steam.json"
-CSGOTRADER_CACHE_PATH = Path(__file__).parent / "csgotrader_prices_cache.json"
+# v2: в кэше теперь не только цена, но и окно, из которого она взята
+# (см. _pick_csgotrader_price_detailed). Имя файла сменено намеренно — старый
+# кэш другого формата, и читать его как новый нельзя.
+CSGOTRADER_CACHE_PATH = Path(__file__).parent / "csgotrader_prices_cache_v2.json"
 CSGOTRADER_CACHE_TTL_SECONDS = 3 * 60 * 60  # на их стороне файл обновляется примерно раз в час
 
 # collection-код из имени файла -> человекочитаемое название турнира/капсулы
@@ -167,30 +170,60 @@ def manual_prices_count() -> int:
 # модуля: Skinport с 2025 закрыт Cloudflare Bot Management для датацентровых IP)
 # ---------------------------------------------------------------------------
 
+# Окна прайс-листа от самого свежего к самому старому.
+CSGOTRADER_WINDOWS = ("last_24h", "last_7d", "last_30d", "last_90d")
+
+# Окна, которым можно верить как "цене прямо сейчас". 30 и 90 дней сюда не
+# входят: для арбитража это не цена, а воспоминание о ней.
+CSGOTRADER_FRESH_WINDOWS = frozenset({"last_24h", "last_7d"})
+
+
 def _load_csgotrader_cache() -> tuple[dict, float] | None:
     if not CSGOTRADER_CACHE_PATH.exists():
         return None
     try:
         data = json.loads(CSGOTRADER_CACHE_PATH.read_text(encoding="utf-8"))
-        return data["prices"], data["updated_at"]
+        return data["details"], data["updated_at"]
     except Exception:
         return None
 
 
-def _save_csgotrader_cache(prices: dict) -> None:
+def _save_csgotrader_cache(details: dict) -> None:
     CSGOTRADER_CACHE_PATH.write_text(
-        json.dumps({"prices": prices, "updated_at": time.time()}, ensure_ascii=False),
+        json.dumps({"details": details, "updated_at": time.time()}, ensure_ascii=False),
         encoding="utf-8",
     )
 
 
-def _pick_csgotrader_price(entry: dict) -> float | None:
-    """Берём самое свежее окно из тех, что не null — 24ч точнее, но у неликвида его часто нет."""
-    for window in ("last_24h", "last_7d", "last_30d", "last_90d"):
+def _pick_csgotrader_price_detailed(entry: dict) -> tuple[float, str] | None:
+    """
+    Цена и ОКНО, из которого она взята: ("last_24h", "last_7d", ...).
+
+    Окно важно не меньше самой цены. Порядок фолбэка тут от свежего к старому,
+    и у неликвида первые два окна часто пустые — тогда сюда попадает цена за
+    30 или 90 дней. Как "примерно сколько стоит" это годится (для стикеров так
+    и используется), а как база для расчёта скидки — нет: если предмет за это
+    время подешевел вдвое, арбитраж покажет скидку 50%, которой не существует.
+
+    Именно так и вышло 2026-08-19: находки шли сплошь со скидкой 57-60%, и все
+    по неликвиду. Сортировка по убыванию скидки этот эффект усиливает — наверх
+    всплывают ровно те предметы, у которых цена-ориентир устарела сильнее всего.
+    Поэтому окно возвращается наружу, а решение "верить или нет" принимает тот,
+    кто цену использует (см. CSGOTRADER_FRESH_WINDOWS).
+    """
+    for window in CSGOTRADER_WINDOWS:
         value = entry.get(window)
         if value is not None:
-            return float(value)
+            try:
+                return float(value), window
+            except (TypeError, ValueError):
+                continue
     return None
+
+
+def _pick_csgotrader_price(entry: dict) -> float | None:
+    picked = _pick_csgotrader_price_detailed(entry)
+    return picked[0] if picked else None
 
 
 async def _download_csgotrader_prices(session: aiohttp.ClientSession) -> dict[str, float]:
@@ -211,32 +244,53 @@ async def _download_csgotrader_prices(session: aiohttp.ClientSession) -> dict[st
         log.exception("csgotrader: не удалось скачать/распарсить прайс-лист")
         return {}
 
-    prices: dict[str, float] = {}
+    details: dict[str, list] = {}
+    by_window: dict[str, int] = {}
     for name, entry in raw.items():
         if not isinstance(entry, dict):
             continue
-        price = _pick_csgotrader_price(entry)
-        if price is not None:
-            prices[name] = price
+        picked = _pick_csgotrader_price_detailed(entry)
+        if picked is not None:
+            price, window = picked
+            details[name] = [price, window]
+            by_window[window] = by_window.get(window, 0) + 1
 
-    log.info("csgotrader: получено %s цен из %s записей в файле", len(prices), len(raw))
-    return prices
+    log.info(
+        "csgotrader: получено %s цен из %s записей в файле. По окнам: %s",
+        len(details), len(raw),
+        ", ".join(f"{w} {by_window.get(w, 0)}" for w in CSGOTRADER_WINDOWS),
+    )
+    return details
+
+
+async def get_csgotrader_price_details(
+    session: aiohttp.ClientSession, force_refresh: bool = False
+) -> dict[str, tuple[float, str]]:
+    """
+    market_hash_name -> (цена, окно). Окно нужно тем, кто считает по цене
+    скидку: см. _pick_csgotrader_price_detailed.
+    """
+    cached = _load_csgotrader_cache()
+    if not force_refresh and cached and (time.time() - cached[1]) < CSGOTRADER_CACHE_TTL_SECONDS:
+        details = cached[0]
+    else:
+        fresh = await _download_csgotrader_prices(session)
+        if fresh:
+            _save_csgotrader_cache(fresh)
+            details = fresh
+        elif cached:
+            # скачивание не удалось — используем что было, пусть и протухшее
+            details = cached[0]
+        else:
+            return {}
+
+    return {name: (value[0], value[1]) for name, value in details.items() if len(value) == 2}
 
 
 async def get_csgotrader_prices(session: aiohttp.ClientSession, force_refresh: bool = False) -> dict[str, float]:
-    cached = _load_csgotrader_cache()
-    if not force_refresh and cached and (time.time() - cached[1]) < CSGOTRADER_CACHE_TTL_SECONDS:
-        return cached[0]
-
-    fresh = await _download_csgotrader_prices(session)
-    if fresh:
-        _save_csgotrader_cache(fresh)
-        return fresh
-
-    # скачивание не удалось — используем что было, пусть и протухшее
-    if cached:
-        return cached[0]
-    return {}
+    """Только цены, без окон — стикерному пайплайну окно не нужно."""
+    details = await get_csgotrader_price_details(session, force_refresh=force_refresh)
+    return {name: price for name, (price, _window) in details.items()}
 
 
 # ---------------------------------------------------------------------------

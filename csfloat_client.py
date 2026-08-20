@@ -556,8 +556,12 @@ class CSFloatListing:
     listing_id: str
     price: float                      # цена на CSFloat
     market_hash_name: str
-    steam_price: float | None         # item.scm.price — цена Steam Community Market
-    steam_volume: int | None          # item.scm.volume — сколько продаётся, грубая ликвидность
+    steam_price: float | None         # цена Steam; заполняется извне, см. bot._fill_steam_prices
+    steam_volume: int | None          # сколько продаётся, грубая ликвидность (сейчас всегда None)
+    # Из какого окна прайс-листа взята steam_price: "last_24h", "last_7d",
+    # "last_30d", "last_90d". Нужно, чтобы не считать скидку от цены
+    # трёхмесячной давности — см. pricing._pick_csgotrader_price_detailed.
+    steam_price_window: str | None = None
     float_value: float | None = None
     wear_name: str | None = None
     is_stattrak: bool = False
