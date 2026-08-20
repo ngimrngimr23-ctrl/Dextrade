@@ -62,6 +62,7 @@ from pricing import (
     clear_manual_prices,
     manual_prices_count,
     get_csgotrader_price_details,
+    get_csgotrader_prices,
     get_steam_market_price,
     STEAM_POOL,
 )
@@ -97,6 +98,7 @@ from storage import (
     all_chat_ids_with_settings,
 )
 import csfloat_client
+import market_prices
 from csfloat_client import CSFloatError, CSFloatRateLimited
 
 logging.basicConfig(level=logging.INFO)
@@ -2053,6 +2055,81 @@ async def arbnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Готово, ничего подходящего не нашлось.")
 
 
+async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /markets [%] — сравнить Steam с площадками из прайс-листов csgotrader.
+
+    Отдельный от CSFloat канал арбитража, и главное его свойство — отсутствие
+    ограничений. Это статические файлы на CDN: ни ключа, ни квоты, ни банов по
+    IP. Поэтому сравнивается ВЕСЬ каталог целиком, а не выборка лотов, и
+    вопрос «почему только тысяча предметов» тут просто не возникает.
+
+    Цена — агрегат по предмету, а не конкретный лот: ни флоата, ни наклеек, ни
+    ссылки на лот. Для сигнала «предмет дешевле на площадке» этого хватает,
+    дальше человек открывает площадку сам.
+    """
+    chat_id = update.effective_chat.id
+    try:
+        threshold = float(context.args[0].replace("%", "").replace(",", ".")) if context.args else 20.0
+    except (ValueError, IndexError):
+        await update.message.reply_text("Порог не разобрал. Пример: /markets 25")
+        return
+
+    await update.message.reply_text(
+        f"Сравниваю Steam с площадками, порог {threshold:g}%. Это несколько файлов, займёт с полминуты…"
+    )
+
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+        steam_prices = await get_csgotrader_prices(session)
+        if not steam_prices:
+            await update.message.reply_text("⚠️ Прайс-лист Steam не скачался — сравнивать не с чем.")
+            return
+
+        available = await market_prices.discover_markets(session)
+        if not available:
+            await update.message.reply_text(
+                "⚠️ Ни один файл площадок не открылся. Похоже, состав файлов на "
+                "prices.csgotrader.app изменился — надо смотреть, какие есть сейчас."
+            )
+            return
+
+        found: list = []
+        for market, filename in available.items():
+            prices = await market_prices.fetch_market(session, filename)
+            found.extend(
+                market_prices.compare(
+                    steam_prices, prices, market, min_discount_pct=threshold,
+                )
+            )
+
+    if not found:
+        await update.message.reply_text(
+            f"Проверил площадки ({', '.join(available)}) — дешевле Steam на {threshold:g}% "
+            "ничего нет. Попробуй порог ниже."
+        )
+        return
+
+    found.sort(key=lambda o: o.discount_pct, reverse=True)
+    lines = [
+        f"🏪 Дешевле Steam — найдено {len(found)}\n"
+        f"<i>Цены из прайс-листов, обновляются примерно раз в час. Это средняя цена "
+        f"по предмету, а не конкретный лот: проверяй на площадке перед покупкой. "
+        f"«Чистыми» — за вычетом комиссии Steam ~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%.</i>"
+    ]
+    for o in found[:15]:
+        net = o.net_after_fee(STEAM_FEE_MULTIPLIER)
+        lines.append(
+            f"<code>{html_module.escape(o.market_hash_name)}</code>\n"
+            f"  {html_module.escape(o.market)} ${o.market_price:.2f} | "
+            f"Steam ${o.steam_price:.2f} | дешевле на {o.discount_pct:.1f}%\n"
+            f"  чистыми при перепродаже: {'+' if net >= 0 else '-'}${abs(net):.2f}\n"
+            f'  <a href="{o.steam_url}">Проверить в Steam</a>'
+        )
+
+    for chunk in _chunk_lines(lines, sep="\n\n"):
+        await update.message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
+
+
 async def arbreset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /arbreset — снять кулдаун CSFloat вручную и показать, с чем мы к нему ходим.
@@ -2560,6 +2637,7 @@ BOT_COMMANDS = [
     BotCommand("watchpause", "Остановить автоскан"),
     BotCommand("watchresume", "Возобновить автоскан"),
     BotCommand("arbnow", "Проверить арбитраж CSFloat прямо сейчас"),
+    BotCommand("markets", "Сравнить Steam с другими площадками (весь каталог)"),
     BotCommand("setarb", "Арбитраж: CSFloat дешевле Steam на N%"),
     BotCommand("help", "Полный справочник по всем командам"),
 ]
@@ -2882,6 +2960,7 @@ def _build_application(token: str):
     app.add_handler(CommandHandler("setarbvolume", setarbvolume))
     app.add_handler(CommandHandler("setarbstickers", setarbstickers))
     app.add_handler(CommandHandler("arbnow", arbnow))
+    app.add_handler(CommandHandler("markets", markets))
     app.add_handler(CommandHandler("arbreset", arbreset))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_selection))
