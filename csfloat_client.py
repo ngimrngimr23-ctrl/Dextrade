@@ -550,6 +550,14 @@ class CSFloatListing:
     stickers_priced: int = 0          # у скольких наклеек цена вообще известна
     inspect_link: str | None = None
     watchers: int = 0
+    # Блок reference из ответа — то, что пришло на замену пропавшему item.scm.
+    # base_price это собственная справочная цена CSFloat: именно по ней они
+    # считают свою сортировку highest_discount. Ценна тем, что приходит с
+    # каждым лотом бесплатно и получена НЕЗАВИСИМО от прайс-листа csgotrader —
+    # значит их можно сверять друг с другом (см. bot._fill_steam_prices).
+    reference_price: float | None = None
+    predicted_price: float | None = None
+    reference_quantity: int | None = None
 
     @property
     def url(self) -> str:
@@ -581,6 +589,13 @@ def _parse_listing(raw: dict) -> CSFloatListing | None:
             return None
 
         scm = item.get("scm") or {}
+        reference = raw.get("reference") or {}
+        # quantity — сколько таких предметов на рынке; это ближайшая замена
+        # пропавшему scm.volume как грубой мере ликвидности.
+        try:
+            reference_quantity = int(reference["quantity"]) if reference.get("quantity") is not None else None
+        except (TypeError, ValueError):
+            reference_quantity = None
         stickers_raw = item.get("stickers") or []
         sticker_names: list[str] = []
         stickers_value = 0.0
@@ -609,6 +624,9 @@ def _parse_listing(raw: dict) -> CSFloatListing | None:
             stickers_priced=stickers_priced,
             inspect_link=item.get("inspect_link"),
             watchers=raw.get("watchers") or 0,
+            reference_price=_cents(reference.get("base_price")),
+            predicted_price=_cents(reference.get("predicted_price")),
+            reference_quantity=reference_quantity,
         )
     except Exception:
         log.exception("csfloat: не смог разобрать лот")
@@ -876,41 +894,36 @@ async def fetch_listings_page(
     # чем сравнивать. Снаружи это выглядело как «порог слишком строгий», хотя
     # дело в форме ответа. Поэтому считаем такие лоты отдельно и показываем
     # настоящие ключи ответа, а не гадаем, куда переехало поле.
-    without_scm = [l for l in listings if l.steam_price is None]
-    if without_scm:
+    # Справочная цена нужна и как замена пропавшему scm, и как независимая
+    # сверка для прайс-листа. Если её вдруг не станет тоже — это должно быть
+    # видно сразу, а не всплыть через неделю пустыми подборками.
+    without_reference = [l for l in listings if l.reference_price is None]
+    if without_reference:
         log.warning(
-            "csfloat: у %s из %s лотов нет цены Steam (item.scm.price) — "
-            "сравнивать их не с чем, отбор их выбросит",
-            len(without_scm), len(listings),
+            "csfloat: у %s из %s лотов нет reference.base_price — сверить цену не с чем",
+            len(without_reference), len(listings),
         )
         for raw in rows:
-            item = raw.get("item") or {}
-            if not (item.get("scm") or {}).get("price"):
-                # Ключи ВЕРХНЕГО уровня тоже: цена рынка могла не пропасть, а
-                # переехать из item наружу (у CSFloat есть блок reference с
-                # base_price — по нему они, судя по всему, и считают свою
-                # сортировку по скидке). Если он тут есть, это более точный
-                # источник, чем медиана за сутки из прайс-листа.
+            if not (raw.get("reference") or {}).get("base_price"):
                 log.warning(
-                    "csfloat: пример такого лота — ключи лота: %s; ключи item: %s; ключи item.scm: %s",
-                    sorted(raw.keys()), sorted(item.keys()),
-                    sorted((item.get("scm") or {}).keys()),
+                    "csfloat: пример такого лота — ключи лота: %s; ключи reference: %s",
+                    sorted(raw.keys()), sorted((raw.get("reference") or {}).keys()),
                 )
-                reference = raw.get("reference")
-                if isinstance(reference, dict):
-                    log.warning("csfloat: в лоте есть reference, его ключи: %s", sorted(reference.keys()))
                 break
 
-    # Проверка, что sort_by вообще уважается. От этого зависит, имеет ли смысл
-    # качать вторую страницу: при работающей сортировке по скидке страница 1 —
-    # это лучшее, что есть на рынке, и остальные страницы заведомо хуже.
-    with_scm = [l for l in listings if l.steam_price]
-    if sort_by == "highest_discount" and len(with_scm) >= 2:
+    # Проверка, что sort_by вообще уважается. Считаем скидку по той же цене, по
+    # которой её считает сам CSFloat (reference.base_price) — иначе проверяли бы
+    # не сортировку, а расхождение источников. От результата зависит, есть ли
+    # смысл в страницах после первой: при работающей сортировке страница 1 —
+    # лучшее, что есть на рынке, и остальные заведомо хуже.
+    with_ref = [l for l in listings if l.reference_price]
+    if sort_by == "highest_discount" and len(with_ref) >= 2:
         def _disc(l):
-            return (l.steam_price - l.price) / l.steam_price * 100
-        first, last = _disc(with_scm[0]), _disc(with_scm[-1])
+            return (l.reference_price - l.price) / l.reference_price * 100
+        first, last = _disc(with_ref[0]), _disc(with_ref[-1])
         log.info(
-            "csfloat: скидка к Steam по странице — первый лот %.1f%%, последний %.1f%% (%s)",
+            "csfloat: скидка к справочной цене по странице — первый лот %.1f%%, "
+            "последний %.1f%% (%s)",
             first, last,
             "сортировка по скидке работает" if first >= last
             else "СОРТИРОВКА НЕ РАБОТАЕТ, sort_by игнорируется",

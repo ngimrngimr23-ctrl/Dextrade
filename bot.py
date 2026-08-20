@@ -179,6 +179,14 @@ ARB_PAGES_PER_SCAN = 1
 # ценой лота и устаревшим ориентиром выглядит как выгода. Предмет без продаж
 # за сутки для арбитража просто не годится — сравнивать не с чем.
 ARB_PRICE_WINDOW = "last_24h"
+
+# Максимальное расхождение между прайс-листом csgotrader и собственной
+# справочной ценой CSFloat (reference.base_price), при котором цене ещё можно
+# верить. Источники независимы, поэтому согласие — сильный довод, а расхождение
+# вдвое означает, что один из них ошибается, и понять какой невозможно.
+# 25% выбрано так, чтобы обычная разница в методике не мешала, а случай
+# «$28.18 против $12» отсекался гарантированно.
+ARB_SOURCE_GAP_PCT = 25.0
 _arb_running: set[int] = set()
 
 # chat_id -> идёт прогон вотчлиста прямо сейчас — защита от наложения тиков,
@@ -1403,7 +1411,13 @@ async def _fill_steam_prices(listings) -> int:
 
     filled = 0
     no_fresh = 0
+    disagree = 0
     for l in missing:
+        # Ликвидность: reference.quantity от CSFloat — замена пропавшему
+        # scm.volume. Приходит вместе с лотом, лишних запросов не требует.
+        if l.steam_volume is None and l.reference_quantity is not None:
+            l.steam_volume = l.reference_quantity
+
         found = prices.get(l.market_hash_name)
         if not found:
             continue
@@ -1413,6 +1427,25 @@ async def _fill_steam_prices(listings) -> int:
         if price is None:
             no_fresh += 1
             continue
+
+        # Сверка с собственной справочной ценой CSFloat.
+        #
+        # Это два НЕЗАВИСИМЫХ источника: прайс-лист csgotrader собирает свою
+        # статистику, reference.base_price считает CSFloat. Пока они согласны,
+        # цене можно верить. Когда расходятся вдвое — кто-то из них ошибается,
+        # и какой именно, по одному числу не понять; звать покупать на таком
+        # основании нельзя. Ровно этот случай и давал «дешевле на 57%».
+        if l.reference_price and l.reference_price > 0:
+            gap = abs(price - l.reference_price) / l.reference_price * 100
+            if gap > ARB_SOURCE_GAP_PCT:
+                log.info(
+                    "arb: %s — источники расходятся на %.0f%%: прайс-лист $%.2f, "
+                    "справочная цена CSFloat $%.2f. Пропускаю",
+                    l.market_hash_name, gap, price, l.reference_price,
+                )
+                disagree += 1
+                continue
+
         l.steam_price = price
         l.steam_price_window = ARB_PRICE_WINDOW
         l.steam_price_spread_pct = found.recent_spread_pct
@@ -1421,8 +1454,8 @@ async def _fill_steam_prices(listings) -> int:
 
     log.info(
         "arb: цена Steam за сутки подставлена для %d из %d лотов; "
-        "у %d продаж за сутки не было (в отбор не идут)",
-        filled, len(missing), no_fresh,
+        "у %d не было продаж за сутки, у %d источники цены разошлись",
+        filled, len(missing), no_fresh, disagree,
     )
     return filled
 
