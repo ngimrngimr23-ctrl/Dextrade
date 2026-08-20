@@ -2629,7 +2629,33 @@ async def _run_with_webhook(app, token: str) -> bool:
     global _tg_application, _tg_loop, _tg_webhook_path
 
     url = f"{WEBHOOK_BASE_URL}/{_webhook_path(token)}"
-    await app.initialize()  # здесь же отрабатывает post_init (_on_startup)
+    await app.initialize()
+
+    # post_init ПРИХОДИТСЯ звать руками — и это не перестраховка.
+    #
+    # Application.initialize() его НЕ вызывает; в PTB это делают только
+    # run_polling() и run_webhook(), что прямо написано в докстринге метода:
+    # "Does *not* call post_init - that is only done by run_polling and
+    # run_webhook". Мы ведём Application вручную, потому что апдейты в очередь
+    # кладёт наш HTTP-сервер, а не Updater, — значит и post_init на нас.
+    #
+    # Здесь раньше стоял комментарий "здесь же отрабатывает post_init", и он
+    # был просто неверен. Ценой этого в webhook-режиме молча не работало ВСЁ
+    # содержимое _on_startup: не восстанавливались кулдауны Steam и CSFloat
+    # после рестарта (бот заново долбился в забаненный адрес), не поднимался
+    # prewarm, не поднималось меню команд и, заметнее всего, не восстанавливались
+    # джобы автоскана — и вотчлиста, и арбитража. Ручной /setarb ставил джобу в
+    # памяти процесса, но любой редеплой её терял, а Render передеплоивает часто,
+    # так что автоскан фактически не работал никогда.
+    #
+    # Ошибка в восстановлении не должна ронять процесс: Render перезапускает
+    # бота на любой выход, и одна неудачная джоба превратилась бы в цикл
+    # перезапусков вместо работающего бота.
+    if app.post_init:
+        try:
+            await app.post_init(app)
+        except Exception:
+            log.exception("webhook: post_init упал — бот поднимется без восстановленного состояния")
 
     try:
         await app.bot.set_webhook(
