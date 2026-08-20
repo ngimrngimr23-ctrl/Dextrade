@@ -89,6 +89,7 @@ from storage import (
     set_watch_paused,
     all_watchlist_chat_ids,
     was_offer_sent_recently,
+    SENT_OFFER_TTL_SECONDS,
     mark_offer_sent,
     get_arb_settings,
     set_arb_setting,
@@ -1515,10 +1516,17 @@ async def _fill_steam_prices(listings) -> int:
     return from_reference + from_pricelist
 
 
-async def _run_arb_scan(bot, chat_id: int) -> int | None:
+async def _run_arb_scan(bot, chat_id: int, *, respect_dedup: bool = True) -> int | None:
     """
     Один прогон арбитража. Возвращает число отправленных находок, либо None,
     если прогон не запускался (выключено / уже идёт / кулдаун).
+
+    respect_dedup=False — показать всё найденное, даже если это уже присылали.
+    Нужно для ручного /arbnow: дедуп держит находку 5 часов, и на ручной запрос
+    бот отвечал "ничего подходящего не нашлось" при том, что находки были и
+    лежали в логе. Для человека, который сам нажал кнопку, это выглядит как
+    поломка фильтра. У фонового автоскана дедуп остаётся — там он и нужен,
+    иначе одно и то же приходило бы каждые 5 минут.
     """
     settings = await get_arb_settings(chat_id)
     if settings["min_discount"] is None:
@@ -1580,13 +1588,20 @@ async def _run_arb_scan(bot, chat_id: int) -> int | None:
         # приходил снова под новым id. С ценой в ключе повторное уведомление
         # приходит только когда предмет реально подешевел, а это как раз то,
         # о чём стоит знать.
-        new_offers = []
-        for o in offers:
-            key = f"arb:{o.market_hash_name}:{o.csfloat_price:.2f}"
-            if not await was_offer_sent_recently(chat_id, key):
-                new_offers.append(o)
-        if not new_offers:
-            return 0
+        if respect_dedup:
+            new_offers = []
+            for o in offers:
+                key = f"arb:{o.market_hash_name}:{o.csfloat_price:.2f}"
+                if not await was_offer_sent_recently(chat_id, key):
+                    new_offers.append(o)
+            if not new_offers:
+                log.info(
+                    "arb: chat_id=%s все %d находок уже присылали — молчу (дедуп %d ч)",
+                    chat_id, len(offers), SENT_OFFER_TTL_SECONDS // 3600,
+                )
+                return 0
+        else:
+            new_offers = offers
 
         for chunk in _format_arb_chunks(new_offers):
             await bot.send_message(
@@ -1878,7 +1893,9 @@ async def arbnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Смотрю рынок CSFloat…")
     try:
-        sent = await _run_arb_scan(context.bot, chat_id)
+        # Ручной запрос — показываем всё, что есть на рынке прямо сейчас,
+        # не оглядываясь на то, присылали это раньше или нет.
+        sent = await _run_arb_scan(context.bot, chat_id, respect_dedup=False)
     except CSFloatRateLimited as e:
         if e.is_ip_block:
             await update.message.reply_text(
