@@ -71,10 +71,10 @@ import os
 import time
 from dataclasses import dataclass, field
 
-from urllib.parse import urlsplit, urlunsplit
-
 import aiohttp
 import yarl
+
+from proxy_pool import ProxyPool, mask as mask_proxy
 
 log = logging.getLogger("steam_bot.csfloat")
 
@@ -173,49 +173,23 @@ CSFLOAT_PROXY_URL = os.environ.get("CSFLOAT_PROXY_URL", "").rstrip("/")
 # случая подтверждены логами 2026-08-19. Резидентный адрес снимает обе
 # причины сразу: он не помечен как VPN и квота на нём наша.
 #
-# ВАЖНО: в этой строке лежит пароль. В логи она попадает ТОЛЬКО через
-# _mask_proxy() — не логировать её как есть.
-CSFLOAT_HTTP_PROXY = os.environ.get("CSFLOAT_HTTP_PROXY", "").strip()
+# Можно задать НЕСКОЛЬКО адресов через запятую/пробел — это не косметика, а
+# основной способ поднять потолок: лимит CSFloat (200 запросов в час) считается
+# по IP, поэтому шесть адресов дают шесть независимых бюджетов. При отказе по
+# квоте откладывается только выдохшийся адрес, работа продолжается с
+# остальных — см. proxy_pool.ProxyPool.
+#
+# ВАЖНО: в этой строке лежат пароли. В логи они попадают ТОЛЬКО через
+# proxy_pool.mask() — не логировать значение как есть.
+CSFLOAT_POOL = ProxyPool(os.environ.get("CSFLOAT_HTTP_PROXY", ""), name="csfloat")
 
 
 def http_proxy_problem() -> str | None:
-    """
-    Что не так с CSFLOAT_HTTP_PROXY, если не так. None — всё в порядке.
-
-    Проверяем схему отдельно и заранее, потому что aiohttp умеет только
-    http/https-прокси: SOCKS5 ему нужен через отдельный пакет aiohttp-socks,
-    которого в requirements нет. Продавцы резидентных прокси обычно дают и то
-    и другое, и молча купить SOCKS5-порт очень легко — а проявилось бы это
-    невнятной ошибкой соединения уже после оплаты.
-    """
-    if not CSFLOAT_HTTP_PROXY:
+    """Что не так с настройкой прокси, если не так. None — всё в порядке."""
+    if not CSFLOAT_POOL.problems:
         return None
-    parsed = urlsplit(CSFLOAT_HTTP_PROXY)
-    if parsed.scheme not in ("http", "https"):
-        return (
-            f"схема {parsed.scheme or 'не указана'!r} не поддерживается — aiohttp умеет "
-            "только http/https-прокси. Возьми у провайдера HTTP-порт "
-            "(обычно тот же хост, другой номер порта)"
-        )
-    if not parsed.hostname or not parsed.port:
-        return "не разобрать хост и порт — нужен формат http://логин:пароль@хост:порт"
-    return None
+    return "; ".join(f"{addr}: {problem}" for addr, problem in CSFLOAT_POOL.problems)
 
-
-def _mask_proxy(url: str) -> str:
-    """Адрес прокси без логина и пароля — для логов и /status."""
-    try:
-        parsed = urlsplit(url)
-        if not parsed.hostname:
-            # urlsplit на мусоре не падает, а возвращает пустые части — без этой
-            # проверки в лог уехала бы пустая строка вместо внятного «неверный
-            # формат», и настройка выглядела бы применённой.
-            return "адрес не разобрался (ожидается http://логин:пароль@хост:порт)"
-        if parsed.username or parsed.password:
-            return urlunsplit((parsed.scheme, f"***@{parsed.hostname}:{parsed.port}", "", "", ""))
-        return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
-    except Exception:
-        return "адрес не разобрался (ожидается http://логин:пароль@хост:порт)"
 
 COOLDOWN_AFTER_429_SECONDS = 10 * 60
 COOLDOWN_MAX_SECONDS = 2 * 60 * 60
@@ -316,8 +290,8 @@ def key_fingerprint() -> str:
 
 def route_description() -> str:
     """Через что идём в CSFloat — для логов и /arbreset."""
-    if CSFLOAT_HTTP_PROXY:
-        return f"резидентный прокси {_mask_proxy(CSFLOAT_HTTP_PROXY)}"
+    if CSFLOAT_POOL.enabled():
+        return f"резидентные прокси ({CSFLOAT_POOL.describe()})"
     if CSFLOAT_PROXY_URL:
         return f"воркер {CSFLOAT_PROXY_URL}"
     return "напрямую (без прокси)"
@@ -655,7 +629,7 @@ def _looks_like_proxy_error(body: str) -> bool:
     """
     # Резидентный прокси таких ответов не сочиняет — он вообще не читает тело,
     # а только пробрасывает соединение. Сочинять их может только наш воркер.
-    if CSFLOAT_HTTP_PROXY or not CSFLOAT_PROXY_URL:
+    if CSFLOAT_POOL.enabled() or not CSFLOAT_PROXY_URL:
         return False
     return any(marker in body.lower() for marker in _PROXY_ERROR_MARKERS)
 
@@ -671,8 +645,8 @@ def _build_request(path: str, params: dict[str, str]) -> tuple[str, dict[str, st
     yarl кодирует её повторно (%20 -> %2520) и прокси получает мусор.
     """
     # С резидентным прокси идём по настоящему адресу: подмена IP там на
-    # транспортном уровне (см. CSFLOAT_HTTP_PROXY), переписывать URL не нужно.
-    if CSFLOAT_HTTP_PROXY or not CSFLOAT_PROXY_URL:
+    # транспортном уровне (см. CSFLOAT_POOL), переписывать URL не нужно.
+    if CSFLOAT_POOL.enabled() or not CSFLOAT_PROXY_URL:
         return f"{CSFLOAT_BASE_URL}{path}", params
     target = yarl.URL(f"{CSFLOAT_BASE_URL}{path}").with_query(params)
     return f"{CSFLOAT_PROXY_URL}/proxy", {"url": str(target)}
@@ -694,35 +668,37 @@ class _QuotaRetry(Exception):
 
 
 async def _request_listings(
-    session: aiohttp.ClientSession, url: str, request_params: dict[str, str]
+    session: aiohttp.ClientSession, url: str, request_params: dict[str, str],
+    proxy: str | None = None,
 ):
     """Один запрос за страницей лотов. Возвращает разобранный JSON."""
     await _throttle()
     try:
-        return await _do_request(session, url, request_params)
+        return await _do_request(session, url, request_params, proxy)
     except aiohttp.ClientHttpProxyError as e:
         # 407 и подобное от самого прокси: логин/пароль или тариф, а не CSFloat.
         # Без этой ветки наружу летел бы голый трейсбек, и было бы неочевидно,
         # что площадка тут вообще ни при чём.
         raise CSFloatError(
-            f"Резидентный прокси отклонил запрос (HTTP {e.status}): проверь логин, пароль "
-            f"и остаток трафика в личном кабинете. Маршрут: {route_description()}"
+            f"Прокси {mask_proxy(proxy or '')} отклонил запрос (HTTP {e.status}): проверь "
+            f"логин, пароль и остаток трафика в личном кабинете."
         ) from None
     except aiohttp.ClientProxyConnectionError as e:
         raise CSFloatError(
-            f"Не удалось подключиться к резидентному прокси ({e}). Проверь хост и порт "
-            f"в CSFLOAT_HTTP_PROXY. Маршрут: {route_description()}"
+            f"Не удалось подключиться к прокси {mask_proxy(proxy or '')} ({e}). "
+            f"Проверь хост и порт в CSFLOAT_HTTP_PROXY."
         ) from None
 
 
 async def _do_request(
-    session: aiohttp.ClientSession, url: str, request_params: dict[str, str]
+    session: aiohttp.ClientSession, url: str, request_params: dict[str, str],
+    proxy: str | None = None,
 ):
     async with session.get(
         url,
         params=request_params,
         headers={**_API_HEADERS, "Authorization": CSFLOAT_API_KEY},
-        proxy=CSFLOAT_HTTP_PROXY or None,
+        proxy=proxy,
     ) as resp:
         if resp.status == 429:
             body = ""
@@ -825,19 +801,37 @@ async def fetch_listings_page(
 
     url, request_params = _build_request("/listings", params)
 
-    # Повторяем только квотный 429 — см. QUOTA_429_RETRIES. Кулдаун ставится
-    # ОДИН раз, после последней неудачной попытки: иначе первый же отказ
-    # запирает бота на час, даже если следующий запрос уехал бы с другого,
-    # не выжженного адреса.
+    # Квотный 429 — это «на ЭТОМ адресе бюджет кончился», а не «CSFloat
+    # недоступен». Поэтому выдохшийся адрес откладывается до сброса его окна, а
+    # запрос уходит со следующего. Общий кулдаун ставится только когда свободных
+    # адресов не осталось совсем.
+    #
+    # Попыток даём столько, сколько адресов в пуле (плюс запас QUOTA_429_RETRIES
+    # для случая без пула — там повтор всё ещё имеет смысл, если ходим через
+    # воркер с его переменным исходящим адресом).
+    max_attempts = max(len(CSFLOAT_POOL), QUOTA_429_RETRIES + 1)
     attempt = 0
     while True:
+        proxy = CSFLOAT_POOL.next() if CSFLOAT_POOL.enabled() else None
+        if CSFLOAT_POOL.enabled() and proxy is None:
+            # Все адреса на кулдауне — ждать нечего, дальше решает вызывающий.
+            raise CSFloatRateLimited(
+                f"Все прокси на кулдауне по квоте CSFloat ({CSFLOAT_POOL.describe()})."
+            )
         try:
-            data = await _request_listings(session, url, request_params)
+            data = await _request_listings(session, url, request_params, proxy)
             break
         except _QuotaRetry as retry:
             attempt += 1
             _note_budget(retry.headers)
-            if attempt > QUOTA_429_RETRIES:
+
+            # Откладываем ровно тот адрес, на котором кончилась квота — до
+            # сброса его окна, если CSFloat назвал момент.
+            if proxy:
+                reset_in = _seconds_until_reset(retry.headers) or COOLDOWN_AFTER_429_SECONDS
+                CSFLOAT_POOL.mark_exhausted(proxy, reset_in, "квота CSFloat исчерпана")
+
+            if attempt >= max_attempts:
                 seconds, is_ip_block = await _note_429(
                     _header(retry.headers, "Retry-After"), retry.headers, retry.body
                 )
@@ -845,13 +839,15 @@ async def fetch_listings_page(
                     f"CSFloat ответил 429 — запросы приостановлены на {seconds / 60:.0f} мин.",
                     is_ip_block=is_ip_block,
                 ) from None
+
             log.warning(
-                "csfloat: 429 по квоте (%s). Попытка %d из %d — повторяю через %.0f с, "
-                "вдруг следующий запрос уедет с другого исходящего адреса",
-                budget_description() or "остаток неизвестен",
-                attempt, QUOTA_429_RETRIES, QUOTA_429_RETRY_DELAY,
+                "csfloat: 429 по квоте (%s). Попытка %d из %d — пробую следующий адрес",
+                budget_description() or "остаток неизвестен", attempt, max_attempts,
             )
-            await asyncio.sleep(QUOTA_429_RETRY_DELAY)
+            # Без пула менять нечего, поэтому просто ждём; с пулом следующий
+            # запрос уедет уже с другого адреса, и пауза не нужна.
+            if not CSFLOAT_POOL.enabled():
+                await asyncio.sleep(QUOTA_429_RETRY_DELAY)
 
     # Формат ответа документирован как массив, но встречались обёртки вида
     # {"data": [...]} — поддерживаем оба, чтобы не падать на ровном месте.

@@ -25,6 +25,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -32,6 +33,7 @@ from typing import NamedTuple, Optional
 
 import aiohttp
 
+from proxy_pool import ProxyPool, mask as mask_proxy
 from sticker_catalog import get_catalog
 from storage import get_prices_batch, set_prices_batch
 from steam_client import (
@@ -351,6 +353,25 @@ async def get_csgotrader_prices(session: aiohttp.ClientSession, force_refresh: b
 # Steam (фолбэк для того, чего нет в прайс-листе csgotrader.app)
 # ---------------------------------------------------------------------------
 
+# Пул адресов для запросов к Steam. По умолчанию тот же список, что и у
+# CSFloat: отдельная переменная нужна редко, а заставлять дублировать одно и то
+# же значение в двух полях Render — верный способ получить рассинхрон.
+#
+# Смысл тот же, что и у CSFloat: Steam банит ПО АДРЕСУ, поэтому несколько
+# адресов превращают «бот молчит час» в «идём со следующего». Именно из-за
+# поадресных банов в этом проекте и живёт вся машинерия кулдаунов в
+# steam_client — с пулом она перестаёт быть единственной защитой.
+STEAM_POOL = ProxyPool(
+    os.environ.get("STEAM_HTTP_PROXY") or os.environ.get("CSFLOAT_HTTP_PROXY", ""),
+    name="steam",
+)
+
+# На сколько откладывать адрес, которому Steam ответил 429. Steam момент сброса
+# не сообщает (в отличие от CSFloat), поэтому число выбрано с запасом: их баны
+# обычно измеряются десятками минут и ПРОДЛЕВАЮТСЯ при новых попытках.
+STEAM_PROXY_COOLDOWN_SECONDS = 30 * 60
+
+
 class RateLimited(Exception):
     """Внутренний маркер: Steam ответил 429 либо мы на кулдауне после недавнего 429."""
 
@@ -378,17 +399,31 @@ async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict
     ПРОДЛЕВАЕТСЯ каждой новой попыткой — повторы только усугубляли бы бан.
     Вместо этого ставим кулдаун для этой области.
     """
-    if steam_cooldown_remaining(scope="pricing") > 0:
+    # С пулом резидентных прокси кулдаун области больше не приговор: бан у
+    # Steam всегда поадресный, и пока в пуле есть свободный адрес, запрос имеет
+    # смысл отправить с него. Проверку кулдауна оставляем только для прямого
+    # маршрута, где менять действительно нечего.
+    proxy = STEAM_POOL.next() if STEAM_POOL.enabled() else None
+    if proxy is None and steam_cooldown_remaining(scope="pricing") > 0:
         raise RateLimited()
 
     await throttle_steam_request(scope="pricing")
-    async with session.get(url, params=params, headers=_steam_request_headers()) as resp:
+    async with session.get(
+        url, params=params, headers=_steam_request_headers(), proxy=proxy
+    ) as resp:
         if resp.status == 429:
             log.warning(
-                "%s: HTTP 429 для запроса %r — ставлю кулдаун для цен стикеров, не ретраю",
+                "%s: HTTP 429 для запроса %r (маршрут: %s)",
                 label, params.get("query") or params.get("market_hash_name"),
+                mask_proxy(proxy) if proxy else "напрямую",
             )
-            await note_steam_429(scope="pricing", headers=dict(resp.headers))
+            if proxy:
+                # Забанен адрес, а не мы целиком: откладываем его и живём
+                # дальше. Общий кулдаун области ставим только без пула — иначе
+                # один плохой адрес тормозил бы все остальные.
+                STEAM_POOL.mark_exhausted(proxy, STEAM_PROXY_COOLDOWN_SECONDS, "Steam ответил 429")
+            else:
+                await note_steam_429(scope="pricing", headers=dict(resp.headers))
             raise RateLimited()
         await note_steam_ok(scope="pricing")
         if resp.status != 200:
@@ -413,6 +448,74 @@ async def _price_overview(session: aiohttp.ClientSession, market_hash_name: str)
         return float(digits)
     except ValueError:
         return None
+
+
+class SteamMarketPrice(NamedTuple):
+    """Живой ответ Steam priceoverview по одному предмету."""
+
+    lowest: float | None    # нижняя цена в стакане — столько стоит КУПИТЬ сейчас
+    median: float | None    # медиана продаж за сутки — то же, что даёт прайс-лист
+    volume: int | None      # сколько продано за сутки
+
+
+def _money(raw) -> float | None:
+    """'$28.18' / '1,234.56 руб.' -> число. Разделители тысяч выкидываем."""
+    if not raw:
+        return None
+    cleaned = "".join(c for c in str(raw) if c.isdigit() or c in ".,")
+    # Обрезаем разделители по краям. Без этого точка из суффикса валюты
+    # («1 234,56 руб.») прилипала к числу, ветка ниже считала строку
+    # десятичной по наличию точки и выдавала 123456 вместо 1234.56.
+    cleaned = cleaned.strip(".,")
+    # Запятая может быть и разделителем тысяч, и десятичной. Считаем десятичной
+    # только последнюю, если после неё ровно две цифры.
+    if "," in cleaned and "." not in cleaned:
+        head, _, tail = cleaned.rpartition(",")
+        cleaned = f"{head.replace(',', '')}.{tail}" if len(tail) == 2 else cleaned.replace(",", "")
+    else:
+        cleaned = cleaned.replace(",", "")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+async def get_steam_market_price(
+    session: aiohttp.ClientSession, market_hash_name: str
+) -> SteamMarketPrice | None:
+    """
+    Настоящая текущая цена предмета в Steam, прямо у Steam.
+
+    Зачем отдельно от прайс-листа. Прайс-лист даёт медиану СОСТОЯВШИХСЯ продаж,
+    а это не та цена, по которой можно что-то сделать: купить можно только по
+    нижней цене в стакане, а медиана прошедших сделок лежит где-то посередине и
+    у неликвида расходится с ней в разы. Для арбитража нужна именно lowest.
+
+    Дорого это только по запросам (один на предмет), поэтому звать нужно НЕ по
+    всему рынку, а по горстке кандидатов, которые уже прошли дешёвый отбор по
+    прайс-листу. Трафика тут копейки — ответ измеряется сотнями байт.
+    """
+    data = await _get_with_retry(
+        session,
+        "https://steamcommunity.com/market/priceoverview/",
+        {"appid": 730, "currency": 1, "market_hash_name": market_hash_name},
+        "priceoverview",
+    )
+    if not data or not data.get("success"):
+        return None
+
+    volume = None
+    if data.get("volume"):
+        try:
+            volume = int(str(data["volume"]).replace(",", "").replace(" ", ""))
+        except ValueError:
+            volume = None
+
+    return SteamMarketPrice(
+        lowest=_money(data.get("lowest_price")),
+        median=_money(data.get("median_price")),
+        volume=volume,
+    )
 
 
 async def _search_price(session: aiohttp.ClientSession, query: str) -> tuple[str, float] | None:

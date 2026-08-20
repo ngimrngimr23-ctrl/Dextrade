@@ -62,6 +62,8 @@ from pricing import (
     clear_manual_prices,
     manual_prices_count,
     get_csgotrader_price_details,
+    get_steam_market_price,
+    STEAM_POOL,
 )
 from analyzer import (
     find_offers, find_float_offers, find_arbitrage_offers,
@@ -168,6 +170,12 @@ ARB_INTERVAL_MINUTES = 5.0
 # следующие 150 не пройдут тем более. Мы платили вчетверо за данные, которые
 # отбор гарантированно выбрасывает.
 ARB_PAGES_PER_SCAN = 1
+
+# Сколько кандидатов перепроверять живым запросом к Steam за прогон.
+# Это запрос на предмет, поэтому потолок нужен: без него один щедрый прогон
+# съел бы бюджет адреса и подставил следующие. Пятнадцать — столько же, сколько
+# влезает в сообщение, так что ниже по коду ничего не теряется.
+ARB_VERIFY_LIMIT = 15
 _arb_running: set[int] = set()
 
 # chat_id -> идёт прогон вотчлиста прямо сейчас — защита от наложения тиков,
@@ -1410,6 +1418,66 @@ async def _fill_steam_prices(listings) -> int:
     return filled
 
 
+async def _verify_against_steam(offers) -> list:
+    """
+    Перепроверить кандидатов у самого Steam и пересчитать по настоящей цене.
+
+    Зачем. Прайс-лист csgotrader даёт медиану состоявшихся продаж, а купить в
+    Steam можно только по нижней цене в стакане — это разные числа, и у
+    неликвида они расходятся в разы. Пока сравнение шло только с медианой,
+    находки были недостоверными: подборка уверенно показывала «дешевле на 57%»
+    там, где выгоды не было.
+
+    Считать так по всему рынку нельзя — это запрос на предмет. Но кандидатов
+    после дешёвого отбора остаются единицы, и вот на них живой запрос как раз
+    оправдан. Работает это только при заданном прокси: напрямую с Render Steam
+    отвечает 429 (ровно поэтому прайс-лист вообще и появился).
+
+    Лот, который не подтвердился, выбрасывается: лучше промолчать, чем звать
+    покупать по цене, которой нет.
+    """
+    if not offers:
+        return offers
+    if not STEAM_POOL.enabled() and steam_cooldown_remaining(scope="pricing") > 0:
+        log.info("arb: Steam на кулдауне и прокси нет — оставляю цены из прайс-листа как есть")
+        return offers
+
+    verified = []
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+        for o in offers[:ARB_VERIFY_LIMIT]:
+            try:
+                live = await get_steam_market_price(session, o.market_hash_name)
+            except Exception:
+                log.exception("arb: не смог проверить цену Steam для %s", o.market_hash_name)
+                live = None
+
+            if live is None or not live.lowest:
+                log.info(
+                    "arb: %s — Steam не подтвердил цену, выбрасываю (прайс-лист обещал $%.2f)",
+                    o.market_hash_name, o.steam_price,
+                )
+                continue
+
+            was = o.steam_price
+            o.steam_price = live.lowest
+            o.steam_volume = live.volume
+            o.steam_price_window = "живая цена Steam"
+            o.discount_pct = (live.lowest - o.csfloat_price) / live.lowest * 100
+            o.net_after_fee = live.lowest * STEAM_FEE_MULTIPLIER - o.csfloat_price
+
+            log.info(
+                "arb: %s — прайс-лист $%.2f, Steam на самом деле $%.2f (медиана $%s, продаж %s). "
+                "Скидка была бы %.1f%%, на деле %.1f%%",
+                o.market_hash_name, was, live.lowest,
+                f"{live.median:.2f}" if live.median else "?", live.volume or "?",
+                (was - o.csfloat_price) / was * 100 if was else 0, o.discount_pct,
+            )
+            verified.append(o)
+
+    verified.sort(key=lambda x: x.discount_pct, reverse=True)
+    return verified
+
+
 async def _run_arb_scan(bot, chat_id: int) -> int | None:
     """
     Один прогон арбитража. Возвращает число отправленных находок, либо None,
@@ -1462,6 +1530,13 @@ async def _run_arb_scan(bot, chat_id: int) -> int | None:
                       if l.listing_id == o.listing_id), None) or "нет данных",
             )
         if not offers:
+            return 0
+
+        # Кандидаты отобраны по прайс-листу — теперь спрашиваем настоящую цену
+        # у Steam и оставляем только то, что подтвердилось.
+        offers = await _verify_against_steam(offers)
+        if not offers:
+            log.info("arb: chat_id=%s ни один кандидат не подтвердился живой ценой Steam", chat_id)
             return 0
 
         # Тот же дедуп, что у вотчлиста: один и тот же лот не присылаем повторно
@@ -2156,6 +2231,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         proxy_problem = csfloat_client.http_proxy_problem()
         if proxy_problem:
             lines.append(f"  ⚠️ прокси настроен неверно: {proxy_problem}")
+        if STEAM_POOL.enabled():
+            lines.append(f"  прокси для Steam: {STEAM_POOL.describe()}")
         # Остаток квоты — то самое число, которое отличает «порог слишком
         # строгий» от «скан не дошёл до данных». Пока его не было видно, эти
         # два случая выглядели в чате одинаково: бот просто молчал.
