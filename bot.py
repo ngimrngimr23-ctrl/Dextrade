@@ -2136,29 +2136,56 @@ async def proxycheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"Проверяю {len(pool)} прокси…")
 
+    async def ask_ip(session, proxy: str):
+        async with session.get(
+            "https://api.ipify.org?format=json",
+            proxy=proxy,
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            data = await resp.json(content_type=None)
+            return data.get("ip")
+
     async def one(proxy: str):
+        # Спрашиваем ДВАЖДЫ. Один замер говорит только «адрес такой-то», а нам
+        # нужно знать другое: закреплён он за логином или меняется на каждый
+        # запрос. От этого зависит вся стратегия кулдаунов — при ротации
+        # откладывать логин после 429 бессмысленно, потому что банится адрес, а
+        # в следующий раз за тем же логином будет уже другой.
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    "https://api.ipify.org?format=json",
-                    proxy=proxy,
-                    timeout=aiohttp.ClientTimeout(total=20),
-                ) as resp:
-                    data = await resp.json(content_type=None)
-                    return proxy, data.get("ip"), None
+                first = await ask_ip(session, proxy)
+                second = await ask_ip(session, proxy)
+                return proxy, first, second, None
         except Exception as e:
-            return proxy, None, f"{type(e).__name__}: {e}"
+            return proxy, None, None, f"{type(e).__name__}: {e}"
 
     results = await asyncio.gather(*(one(p) for p in pool.proxies))
 
     ips: dict[str, int] = {}
+    rotating = 0
     lines = ["<b>Исходящие адреса прокси</b>"]
-    for proxy, ip, error in results:
-        if ip:
-            ips[ip] = ips.get(ip, 0) + 1
-            lines.append(f"  {proxy_pool.mask(proxy)} → <code>{ip}</code>")
+    for proxy, first, second, error in results:
+        if first:
+            ips[first] = ips.get(first, 0) + 1
+            if second and second != first:
+                rotating += 1
+                lines.append(
+                    f"  {proxy_pool.mask(proxy)} → <code>{first}</code>, "
+                    f"потом <code>{second}</code> ⟳"
+                )
+            else:
+                lines.append(f"  {proxy_pool.mask(proxy)} → <code>{first}</code> (держится)")
         else:
             lines.append(f"  {proxy_pool.mask(proxy)} → ⚠️ {html_module.escape(error or 'нет ответа')}")
+
+    if rotating:
+        lines.append("")
+        lines.append(
+            f"⟳ <b>У {rotating} из {len(pool)} адрес меняется между запросами.</b>\n"
+            "Значит откладывать прокси после 429 незачем — банится адрес, а "
+            "следующий запрос уйдёт уже с другого. Кулдаун таким прокси только "
+            "мешает, и он снижен до нескольких секунд."
+        )
 
     unique = len(ips)
     lines.append("")
