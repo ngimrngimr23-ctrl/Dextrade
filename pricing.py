@@ -183,9 +183,10 @@ def manual_prices_count() -> int:
 # Окна прайс-листа от самого свежего к самому старому.
 CSGOTRADER_WINDOWS = ("last_24h", "last_7d", "last_30d", "last_90d")
 
-# Окна, которым можно верить как "цене прямо сейчас". 30 и 90 дней сюда не
-# входят: для арбитража это не цена, а воспоминание о ней.
-CSGOTRADER_FRESH_WINDOWS = frozenset({"last_24h", "last_7d"})
+# Окна, по которым считается «согласуется ли сегодняшняя цена с недельной»
+# (см. SteamPrice.recent_spread_pct). Арбитраж берёт строго last_24h — какое
+# именно окно ему нужно, решает bot.ARB_PRICE_WINDOW, а не этот список.
+CSGOTRADER_RECENT_WINDOWS = ("last_24h", "last_7d")
 
 
 def _load_csgotrader_cache() -> tuple[dict, float] | None:
@@ -215,17 +216,32 @@ class SteamPrice(NamedTuple):
     @property
     def spread_pct(self) -> float | None:
         """
-        Насколько разъезжаются окна: (max - min) / min в процентах.
+        Разброс по ВСЕМ окнам: (max - min) / min в процентах.
         None — окно всего одно, сравнивать не с чем.
-
-        Это и есть мера доверия к цене. Устойчивая цена даёт единицы процентов;
-        разброс в разы означает, что предмет недавно резко изменился в цене
-        (или продаж так мало, что среднее скачет), и считать от такой цены
-        скидку нельзя — она будет отражать не выгоду, а разброс данных.
         """
-        if len(self.windows) < 2:
+        return self._spread(self.windows.values())
+
+    @property
+    def recent_spread_pct(self) -> float | None:
+        """
+        Разброс только между сутками и неделей — то есть «сегодняшняя цена
+        согласуется с недельной?».
+
+        Считать разброс по всем четырём окнам было ошибкой: предмет мог честно
+        подешеветь за три месяца и при этом быть совершенно стабильным сейчас,
+        а проверка выбрасывала его как «неустойчивый». Расхождение с
+        90-дневным окном говорит о движении цены во времени, а не о том, что
+        текущей цене нельзя верить.
+        """
+        recent = [self.windows[w] for w in CSGOTRADER_RECENT_WINDOWS if w in self.windows]
+        return self._spread(recent)
+
+    @staticmethod
+    def _spread(values) -> float | None:
+        values = list(values)
+        if len(values) < 2:
             return None
-        lo, hi = min(self.windows.values()), max(self.windows.values())
+        lo, hi = min(values), max(values)
         if lo <= 0:
             return None
         return (hi - lo) / lo * 100
@@ -432,32 +448,6 @@ async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict
         return await resp.json()
 
 
-async def _price_overview(session: aiohttp.ClientSession, market_hash_name: str) -> float | None:
-    url = "https://steamcommunity.com/market/priceoverview/"
-    params = {"appid": 730, "currency": 1, "market_hash_name": market_hash_name}
-    data = await _get_with_retry(session, url, params, "priceoverview")
-
-    if not data or not data.get("success"):
-        return None
-
-    raw = data.get("median_price") or data.get("lowest_price")
-    if not raw:
-        return None
-    digits = "".join(c for c in raw if c.isdigit() or c == ".")
-    try:
-        return float(digits)
-    except ValueError:
-        return None
-
-
-class SteamMarketPrice(NamedTuple):
-    """Живой ответ Steam priceoverview по одному предмету."""
-
-    lowest: float | None    # нижняя цена в стакане — столько стоит КУПИТЬ сейчас
-    median: float | None    # медиана продаж за сутки — то же, что даёт прайс-лист
-    volume: int | None      # сколько продано за сутки
-
-
 def _money(raw) -> float | None:
     """'$28.18' / '1,234.56 руб.' -> число. Разделители тысяч выкидываем."""
     if not raw:
@@ -480,42 +470,18 @@ def _money(raw) -> float | None:
         return None
 
 
-async def get_steam_market_price(
-    session: aiohttp.ClientSession, market_hash_name: str
-) -> SteamMarketPrice | None:
-    """
-    Настоящая текущая цена предмета в Steam, прямо у Steam.
+async def _price_overview(session: aiohttp.ClientSession, market_hash_name: str) -> float | None:
+    url = "https://steamcommunity.com/market/priceoverview/"
+    params = {"appid": 730, "currency": 1, "market_hash_name": market_hash_name}
+    data = await _get_with_retry(session, url, params, "priceoverview")
 
-    Зачем отдельно от прайс-листа. Прайс-лист даёт медиану СОСТОЯВШИХСЯ продаж,
-    а это не та цена, по которой можно что-то сделать: купить можно только по
-    нижней цене в стакане, а медиана прошедших сделок лежит где-то посередине и
-    у неликвида расходится с ней в разы. Для арбитража нужна именно lowest.
-
-    Дорого это только по запросам (один на предмет), поэтому звать нужно НЕ по
-    всему рынку, а по горстке кандидатов, которые уже прошли дешёвый отбор по
-    прайс-листу. Трафика тут копейки — ответ измеряется сотнями байт.
-    """
-    data = await _get_with_retry(
-        session,
-        "https://steamcommunity.com/market/priceoverview/",
-        {"appid": 730, "currency": 1, "market_hash_name": market_hash_name},
-        "priceoverview",
-    )
     if not data or not data.get("success"):
         return None
 
-    volume = None
-    if data.get("volume"):
-        try:
-            volume = int(str(data["volume"]).replace(",", "").replace(" ", ""))
-        except ValueError:
-            volume = None
-
-    return SteamMarketPrice(
-        lowest=_money(data.get("lowest_price")),
-        median=_money(data.get("median_price")),
-        volume=volume,
-    )
+    # Через _money, а не самодельной склейкой цифр: та склеивала разделитель
+    # тысяч с числом ("$1,234.56" -> 1234.56 только по счастливой случайности,
+    # а "1 234,56 руб." -> 123456).
+    return _money(data.get("median_price") or data.get("lowest_price"))
 
 
 async def _search_price(session: aiohttp.ClientSession, query: str) -> tuple[str, float] | None:
