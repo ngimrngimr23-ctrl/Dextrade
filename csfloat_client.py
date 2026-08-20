@@ -558,6 +558,11 @@ class CSFloatListing:
     reference_price: float | None = None
     predicted_price: float | None = None
     reference_quantity: int | None = None
+    # Были ли у предмета продажи в Steam за последнюю неделю — по наличию окон
+    # last_24h/last_7d в прайс-листе. Это НЕЗАВИСИМЫЙ от CSFloat признак
+    # ликвидности и единственный честный ответ на вопрос «смогу ли я это
+    # перепродать». Заполняется в bot._fill_steam_prices.
+    steam_sales_recent: bool | None = None
 
     @property
     def url(self) -> str:
@@ -938,6 +943,7 @@ async def fetch_market(
     sort_by: str = "most_recent",
     min_price: float | None = None,
     max_price: float | None = None,
+    stop_below_discount: float | None = None,
 ) -> list[CSFloatListing]:
     """
     Несколько страниц рынка подряд, с постраничным курсором.
@@ -965,4 +971,28 @@ async def fetch_market(
             out.extend(listings)
             if not cursor or not listings:
                 break
+
+            # Ранняя остановка. При sort_by="highest_discount" лоты идут по
+            # убыванию скидки к справочной цене (проверено логом: 51% у первого
+            # лота страницы, 0% у последнего). Значит как только хвост страницы
+            # ушёл ниже порога отбора, все следующие страницы заведомо ниже —
+            # качать их бессмысленно.
+            #
+            # Это и позволяет ставить большое число страниц: глубина берётся
+            # там, где выгодные лоты действительно есть, а на пустом рынке
+            # прогон стоит одну-две страницы вместо десяти.
+            if stop_below_discount is not None and sort_by == "highest_discount":
+                priced = [l for l in listings if l.reference_price]
+                if priced:
+                    tail = min(
+                        (l.reference_price - l.price) / l.reference_price * 100
+                        for l in priced
+                    )
+                    if tail < stop_below_discount:
+                        log.info(
+                            "csfloat: остановился на странице %d — скидки упали до %.1f%% "
+                            "(порог %.1f%%), дальше только хуже",
+                            page + 1, tail, stop_below_discount,
+                        )
+                        break
     return out

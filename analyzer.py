@@ -240,6 +240,9 @@ class ArbOffer:
     # Наклейки и прочий ширпотреб продаются десятками одинаковых копий, и без
     # схлопывания одна находка занимала всю подборку.
     duplicate_count: int = 0
+    # Были ли продажи в Steam за последнюю неделю. False — предмет не торгуется,
+    # и «выгода» бумажная: купить можно, выйти обратно не факт.
+    steam_sales_recent: bool | None = None
 
     def __post_init__(self):
         if self.stickers is None:
@@ -405,6 +408,7 @@ def find_arbitrage_offers(
                 watchers=l.watchers,
                 steam_price_window=l.steam_price_window,
                 steam_price_second_opinion=l.steam_price_windows,
+                steam_sales_recent=l.steam_sales_recent,
             )
         )
 
