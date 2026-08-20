@@ -423,10 +423,24 @@ async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict
     if proxy is None and steam_cooldown_remaining(scope="pricing") > 0:
         raise RateLimited()
 
-    await throttle_steam_request(scope="pricing")
-    async with session.get(
-        url, params=params, headers=_steam_request_headers(), proxy=proxy
-    ) as resp:
+    # Через прокси куку аккаунта НЕ шлём.
+    #
+    # steamLoginSecure — авторизация конкретной сессии, и Steam привязывает её
+    # к адресу. Гонять один логин одновременно с шести резидентных IP выглядит
+    # ровно как кража сессии: в лучшем случае разлогинит, в худшем пометит
+    # аккаунт. priceoverview — публичный эндпоинт, логин ему не нужен, а
+    # bMarketOptOut=1 работает и без него (см. steam_client.steam_cookie_header).
+    #
+    # Защиту от рейт-лимитов, ради которой куку и слали, при этом даёт сам пул:
+    # у каждого адреса свой бюджет.
+    headers = _steam_request_headers()
+    if proxy:
+        headers = {"Cookie": "bMarketOptOut=1"}
+
+    # Пауза считается ПО АДРЕСУ: Steam банит по IP, значит и темп надо держать
+    # по IP — иначе шесть адресов дают не шесть полос, а шесть раз по одной.
+    await throttle_steam_request(scope="pricing", lane=proxy or "")
+    async with session.get(url, params=params, headers=headers, proxy=proxy) as resp:
         if resp.status == 429:
             log.warning(
                 "%s: HTTP 429 для запроса %r (маршрут: %s)",

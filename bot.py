@@ -204,10 +204,18 @@ ARB_SORT_BY = os.environ.get("ARB_SORT_BY", "most_recent")
 # «$28.18 против $12» отсекался гарантированно.
 ARB_SOURCE_GAP_PCT = 25.0
 
-# Сколько кандидатов проверять живым запросом к Steam за прогон.
-# priceoverview отвечает по одному предмету, поэтому потолок нужен: пятнадцать
-# — ровно столько влезает в сообщение, так что ниже по коду ничего не теряется.
-ARB_VERIFY_LIMIT = 15
+# Сколько кандидатов проверять живой ценой Steam за прогон.
+#
+# Раньше стояло 15 — под размер сообщения. Это была ошибка: отбор ранжирует
+# кандидатов по ОЦЕНКЕ, а она может врать вдвое, поэтому кандидат под номером
+# двадцать вполне мог оказаться лучшей находкой после проверки — и не
+# проверялся никогда. Проверять надо всех кандидатов, а показывать лучших
+# пятнадцать УЖЕ ПОСЛЕ проверки.
+#
+# Потолок всё равно нужен, потому что priceoverview отвечает по одному
+# предмету, а Steam банит за темп. Восемьдесят при шести адресах — это меньше
+# минуты, при одном адресе около пяти.
+ARB_VERIFY_LIMIT = int(os.environ.get("ARB_VERIFY_LIMIT", "80"))
 _arb_running: set[int] = set()
 
 # chat_id -> идёт прогон вотчлиста прямо сейчас — защита от наложения тиков,
@@ -1447,14 +1455,27 @@ async def _verify_against_steam(offers, min_discount_pct: float) -> list:
         )
         return offers
 
+    todo = offers[:ARB_VERIFY_LIMIT]
+    lanes = max(1, len(STEAM_POOL))
+    log.info(
+        "arb: проверяю у Steam %d кандидат(ов) из %d, полос %d",
+        len(todo), len(offers), lanes,
+    )
+
     verified = []
-    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
-        for o in offers[:ARB_VERIFY_LIMIT]:
+    semaphore = asyncio.Semaphore(lanes)
+
+    async def check(offer, session):
+        async with semaphore:
             try:
-                live = await get_steam_market_price(session, o.market_hash_name)
+                return offer, await get_steam_market_price(session, offer.market_hash_name)
             except Exception:
-                log.exception("arb: не смог проверить цену Steam для %s", o.market_hash_name)
-                live = None
+                log.exception("arb: не смог проверить цену Steam для %s", offer.market_hash_name)
+                return offer, None
+
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+        checked = await asyncio.gather(*(check(o, session) for o in todo))
+        for o, live in checked:
 
             if live is None or not live.lowest:
                 log.info(

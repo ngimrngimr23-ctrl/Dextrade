@@ -330,19 +330,37 @@ def raise_if_cooling_down(scope: str = "listings") -> None:
         )
 
 
-async def throttle_steam_request(scope: str = "listings") -> None:
+_lane_locks: dict[str, asyncio.Lock] = {}
+_lane_last: dict[str, float] = {}
+
+
+async def throttle_steam_request(scope: str = "listings", lane: str = "") -> None:
     """
-    Держит паузу MIN_REQUEST_INTERVAL между любыми двумя запросами к Steam
-    и попутно отмечает запрос в журнале (см. _record_steam_request) — через
-    эту функцию проходит КАЖДЫЙ запрос к Steam, так что журнал полон по
-    построению и не зависит от того, не забыл ли вызывающий код что-то учесть.
+    Держит паузу MIN_REQUEST_INTERVAL между запросами к Steam и попутно
+    отмечает запрос в журнале (см. _record_steam_request) — через эту функцию
+    проходит КАЖДЫЙ запрос к Steam, так что журнал полон по построению и не
+    зависит от того, не забыл ли вызывающий код что-то учесть.
+
+    lane — по какому исходящему адресу считать паузу. Пусто (по умолчанию) —
+    общая очередь на весь процесс, как было всегда.
+
+    Зачем разделять: Steam банит ПО АДРЕСУ, а не по аккаунту в целом. Пока
+    очередь была одна на процесс, пул прокси не давал никакого выигрыша в
+    скорости — сколько бы адресов ни было, запросы всё равно выстраивались
+    друг за другом по 4 секунды. С поадресной паузой N адресов дают N полос.
     """
     global _last_request_at
-    async with _request_lock:
-        wait = MIN_REQUEST_INTERVAL - (time.monotonic() - _last_request_at)
+    lock = _lane_locks.get(lane)
+    if lock is None:
+        lock = _lane_locks[lane] = asyncio.Lock()
+    async with lock:
+        wait = MIN_REQUEST_INTERVAL - (time.monotonic() - _lane_last.get(lane, 0.0))
         if wait > 0:
             await asyncio.sleep(wait)
-        _last_request_at = time.monotonic()
+        now = time.monotonic()
+        _lane_last[lane] = now
+        if not lane:
+            _last_request_at = now
         _record_steam_request(scope)
 
 
