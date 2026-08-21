@@ -344,8 +344,29 @@ async def note_steam_ok(scope: str = "listings") -> None:
         await _persist_cooldown(scope)
 
 
-def raise_if_cooling_down(scope: str = "listings") -> None:
+def blocking_cooldown(scope: str = "listings") -> float:
+    """
+    Сколько ещё ждать, если ждать действительно нужно. 0 — можно работать.
+
+    Отличается от steam_cooldown_remaining тем, что учитывает пул: кулдаун
+    ставится на ПРЯМОЙ адрес, а при свободном прокси запрос уйдёт с него, и
+    отменять из-за этого весь прогон незачем.
+
+    Без этой разницы получалась нелепость: мы научили скан переходить на прокси
+    при 429, но проверка стояла ДО запроса и отменяла прогон целиком — бот
+    писал «Steam на кулдауне, прогоны будут пропускаться», имея наготове семь
+    рабочих адресов.
+    """
     remaining = steam_cooldown_remaining(scope)
+    if remaining <= 0:
+        return 0.0
+    if STEAM_POOL.available():
+        return 0.0
+    return remaining
+
+
+def raise_if_cooling_down(scope: str = "listings") -> None:
+    remaining = blocking_cooldown(scope)
     if remaining > 0:
         raise SteamRateLimited(
             f"Steam недавно ответил 429 (это временный бан IP, который продлевается "
@@ -558,7 +579,18 @@ async def fetch_all_listings(market_hash_name: str, max_listings: int | None = D
         # route = None означает прямой запрос с адреса Render. На прокси
         # переходим ТОЛЬКО после 429 — прямой маршрут бесплатен, и тратить
         # платный трафик, пока он работает, незачем.
+        # Если прямой адрес уже на кулдауне — начинаем сразу с прокси, а не
+        # пробуем его «на всякий случай». Каждый такой запрос гарантированно
+        # получит 429 и ПРОДЛИТ реальный бан, то есть навредит дважды: и время
+        # потеряем, и выход из бана отодвинем.
         route = None
+        if steam_cooldown_remaining("listings") > 0:
+            route = STEAM_POOL.next()
+            if route:
+                log.info(
+                    "fetch_all_listings: прямой адрес на кулдауне — начинаю сразу с %s",
+                    mask_proxy(route),
+                )
         attempts_left = STEAM_LISTINGS_RETRY
         start = 0
         total_count = None

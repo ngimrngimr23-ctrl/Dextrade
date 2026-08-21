@@ -53,6 +53,7 @@ from steam_client import (
     STEAM_PROXY_URL,
     SteamRateLimited,
     steam_cooldown_remaining,
+    blocking_cooldown,
     load_persisted_cooldown,
 )
 from csgo_api import search_items as search_csgo_items
@@ -1359,7 +1360,7 @@ async def watchlist_scan_job(context: ContextTypes.DEFAULT_TYPE):
         if await get_watch_paused(chat_id):
             log.info("watchlist: chat_id=%s на паузе (/watchpause), пропускаю прогон", chat_id)
             return
-        cooldown = steam_cooldown_remaining()
+        cooldown = blocking_cooldown()
         if cooldown > 0:
             log.info(
                 "watchlist: chat_id=%s пропускает прогон — кулдаун Steam ещё %.0f мин", chat_id, cooldown / 60
@@ -1887,9 +1888,21 @@ async def watchresume(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"▶️ Автоскан возобновлён: вотчлист ({len(sticker_items)} шт.) + охота за флоатом "
         f"({len(float_items)} шт.), пауза {interval:g} мин между прогонами."
     )
-    cooldown = steam_cooldown_remaining()
+    cooldown = blocking_cooldown()
     if cooldown > 0:
-        text += f"\n\n⚠️ Но Steam сейчас на кулдауне после 429 — первые {cooldown / 60:.0f} мин прогоны будут пропускаться."
+        text += (
+            f"\n\n⚠️ Но Steam сейчас на кулдауне после 429, и свободных прокси нет — "
+            f"первые {cooldown / 60:.0f} мин прогоны будут пропускаться.\n"
+            f"Состояние пула: {STEAM_POOL.describe()}"
+        )
+    elif steam_cooldown_remaining() > 0:
+        # Кулдаун есть, но он не мешает: прямой адрес переждёт, а запросы
+        # пойдут с прокси. Сказать об этом стоит — иначе строчка «кулдаун» в
+        # /status выглядит как поломка, хотя всё работает.
+        text += (
+            f"\n\nПрямой адрес на кулдауне после 429, но это не мешает: "
+            f"прогоны пойдут через прокси ({STEAM_POOL.describe()})."
+        )
     await update.message.reply_text(text)
 
 
@@ -2631,7 +2644,7 @@ async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id in _watchlist_running:
         await update.message.reply_text("Скан вотчлиста уже идёт, дождись его окончания.")
         return
-    cooldown = steam_cooldown_remaining()
+    cooldown = blocking_cooldown()
     if cooldown > 0:
         # Без этого лога отказ был неотличим в Render от штатного sendMessage —
         # ровно то, что сбивало с толку при разборе "почему /scanall ничего не
