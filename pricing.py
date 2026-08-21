@@ -37,6 +37,7 @@ from proxy_pool import ProxyPool, mask as mask_proxy
 from sticker_catalog import get_catalog
 from storage import get_prices_batch, set_prices_batch
 from steam_client import (
+    STEAM_POOL,
     steam_cookie_header,
     throttle_steam_request,
     steam_cooldown_remaining,
@@ -377,10 +378,8 @@ async def get_csgotrader_prices(session: aiohttp.ClientSession, force_refresh: b
 # адресов превращают «бот молчит час» в «идём со следующего». Именно из-за
 # поадресных банов в этом проекте и живёт вся машинерия кулдаунов в
 # steam_client — с пулом она перестаёт быть единственной защитой.
-STEAM_POOL = ProxyPool(
-    os.environ.get("STEAM_HTTP_PROXY") or os.environ.get("CSFLOAT_HTTP_PROXY", ""),
-    name="steam",
-)
+# Пул общий со листингами и живёт в steam_client — см. комментарий там.
+# Здесь только переэкспорт, чтобы вызывающий код не гадал, откуда брать.
 
 # На сколько откладывать прокси, которому Steam ответил 429.
 #

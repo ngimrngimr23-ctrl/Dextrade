@@ -50,6 +50,8 @@ from collections import deque
 from dataclasses import dataclass, field
 
 import aiohttp
+
+from proxy_pool import ProxyPool, mask as mask_proxy
 import yarl
 
 log = logging.getLogger("steam_bot.steam_client")
@@ -78,6 +80,28 @@ COOLDOWN_AFTER_429_SECONDS = 30 * 60  # получили 429 -> не трога�
 COOLDOWN_MAX_SECONDS = 6 * 60 * 60  # потолок при повторных 429 подряд (бан может быть длинным)
 
 STEAM_PROXY_URL = os.environ.get("STEAM_PROXY_URL", "").rstrip("/")
+
+# Пул резидентных прокси для Steam — ЗАПАСНОЙ маршрут, не основной.
+#
+# Живёт здесь, а не в pricing, по двум причинам. Во-первых, pricing импортирует
+# steam_client, и обратный импорт замкнул бы круг. Во-вторых, по существу: пул
+# нужен обоим потребителям — и ценам, и листингам, — а листинги живут тут.
+#
+# По умолчанию берётся список CSFloat: заводить вторую переменную ради того же
+# набора адресов значит гарантированно однажды получить рассинхрон.
+STEAM_POOL = ProxyPool(
+    os.environ.get("STEAM_HTTP_PROXY") or os.environ.get("CSFLOAT_HTTP_PROXY", ""),
+    name="steam",
+)
+
+# Сколько раз сменить адрес, прежде чем признать поражение на одном предмете.
+STEAM_LISTINGS_RETRY = int(os.environ.get("STEAM_LISTINGS_RETRY", "3"))
+
+# На сколько откладывать адрес, получивший 429 на листингах. Коротко: адреса
+# резидентные и ротируемые (проверено /proxycheck), поэтому длинный кулдаун
+# бьёт по своим — банится IP, а откладывается логин, за которым в следующий
+# раз будет уже другой адрес.
+LISTINGS_PROXY_COOLDOWN = int(os.environ.get("LISTINGS_PROXY_COOLDOWN", "60"))
 
 # Куки реальной Steam-сессии — все опциональны, бот работает и без них
 # (просто более анонимно и, судя по опыту, более подвержено рейт-лимитам).
@@ -531,6 +555,11 @@ async def fetch_all_listings(market_hash_name: str, max_listings: int | None = D
         # добавлен под гипотезу "первый запрос холодной сессии отдаёт HTML",
         # которая не подтвердилась (настоящей причиной был bMarketOptOut=1).
         # А лишний запрос на каждый предмет — прямой путь к 429.
+        # route = None означает прямой запрос с адреса Render. На прокси
+        # переходим ТОЛЬКО после 429 — прямой маршрут бесплатен, и тратить
+        # платный трафик, пока он работает, незачем.
+        route = None
+        attempts_left = STEAM_LISTINGS_RETRY
         start = 0
         total_count = None
         while total_count is None or start < total_count:
@@ -538,16 +567,49 @@ async def fetch_all_listings(market_hash_name: str, max_listings: int | None = D
                 break
             steam_url = render_url(market_hash_name, start)
             final_url, params = _build_request(steam_url)
-            await throttle_steam_request(scope="listings")
-            async with session.get(final_url, params=params, headers=_with_cookie(_ajax_headers(market_hash_name))) as resp:
+            # Через прокси куку аккаунта НЕ шлём: steamLoginSecure привязан к
+            # сессии, и один логин, гуляющий по резидентным адресам, выглядит
+            # как кража сессии. Публичному /render/ логин не нужен, достаточно
+            # bMarketOptOut=1 (см. steam_cookie_header).
+            headers = (
+                _ajax_headers(market_hash_name)
+                if route
+                else _with_cookie(_ajax_headers(market_hash_name))
+            )
+            if route:
+                headers = {**headers, "Cookie": "bMarketOptOut=1"}
+
+            await throttle_steam_request(scope="listings", lane=route or "")
+            async with session.get(final_url, params=params, headers=headers, proxy=route) as resp:
                 if resp.status == 429:
-                    # НЕ ретраим: у Steam 429 — это временный бан IP, который
-                    # продлевается каждой новой попыткой. Ставим глобальный
-                    # кулдаун и сразу выходим, чтобы не закапываться глубже.
+                    # Повторять с ТОГО ЖЕ адреса нельзя: у Steam 429 — это
+                    # временный бан IP, который каждая новая попытка продлевает.
+                    # А вот сменить адрес — можно и нужно: бан поадресный, и на
+                    # другом IP лимит свой.
+                    #
+                    # Раньше этой ветки не было вовсе: 429 обрывал весь скан и
+                    # ставил кулдаун на 30 минут с удвоением до шести часов,
+                    # хотя в пуле стояли свободные адреса.
+                    if route:
+                        STEAM_POOL.mark_exhausted(route, LISTINGS_PROXY_COOLDOWN, "Steam 429")
+                    next_route = STEAM_POOL.next() if attempts_left > 0 else None
+                    if next_route:
+                        attempts_left -= 1
+                        log.warning(
+                            "fetch_all_listings: 429 с маршрута %s — перехожу на %s "
+                            "и повторяю ту же страницу",
+                            mask_proxy(route) if route else "прямого",
+                            mask_proxy(next_route),
+                        )
+                        route = next_route
+                        continue
+
+                    # Свободных адресов не осталось — только теперь сдаёмся.
                     seconds = await note_steam_429(scope="listings", headers=dict(resp.headers))
                     raise SteamRateLimited(
                         f"Steam ответил 429 (Too Many Requests) — это временный бан IP, "
                         f"который продлевается от новых попыток, поэтому не ретраю. "
+                        f"Свободных прокси нет ({STEAM_POOL.describe()}). "
                         f"Запросы к Steam приостановлены на {seconds / 60:.0f} мин."
                     )
                 await note_steam_ok()
