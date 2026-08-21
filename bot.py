@@ -249,6 +249,10 @@ MARKETS_MIN_VOLUME = int(os.environ.get("MARKETS_MIN_VOLUME", "5"))
 
 # Порог спреда по умолчанию, пока пользователь не задал свой через /setmarkets.
 MARKETS_DEFAULT_DISCOUNT = float(os.environ.get("MARKETS_DEFAULT_DISCOUNT", "20"))
+
+# Пропускать ли StatTrak-предметы в сканах вотчлиста (/scanall и автоскан).
+# Отключается переменной окружения без правки кода: SKIP_STATTRAK=0.
+SKIP_STATTRAK = os.environ.get("SKIP_STATTRAK", "1") not in ("0", "false", "no", "")
 _arb_running: set[int] = set()
 
 # chat_id -> идёт прогон вотчлиста прямо сейчас — защита от наложения тиков,
@@ -1315,8 +1319,13 @@ async def _run_watchlist_scan(bot, chat_id: int) -> bool | None:
         log.info("watchlist: прогон для chat_id=%s уже идёт, пропускаю повторный запуск", chat_id)
         return None
 
-    sticker_items = await get_watchlist(chat_id)
-    float_items = await get_float_watchlist(chat_id)
+    sticker_items, skipped_st = _drop_stattrak(await get_watchlist(chat_id))
+    float_items, skipped_float = _drop_stattrak(await get_float_watchlist(chat_id))
+    if skipped_st or skipped_float:
+        log.info(
+            "watchlist: chat_id=%s пропускаю StatTrak — %d из вотчлиста, %d из флоат-списка",
+            chat_id, skipped_st, skipped_float,
+        )
     if not sticker_items and not float_items:
         return None
 
@@ -1618,6 +1627,24 @@ def _warn_if_over_budget() -> None:
     )
 
 
+def _drop_stattrak(names) -> tuple[list, int]:
+    """
+    Убрать StatTrak-предметы из списка. Возвращает (что осталось, сколько убрали).
+
+    Фильтруем на входе в скан, а не чистим сами списки: предметы остаются в
+    вотчлисте, и если фильтр однажды выключат, они снова начнут сканироваться
+    без ручного добавления заново.
+
+    Проверка по подстроке без ™ намеренно: символ легко теряется при переносе
+    имён между источниками, а "stattrak" в названии обычного скина не
+    встречается.
+    """
+    if not SKIP_STATTRAK:
+        return list(names), 0
+    kept = [n for n in names if "stattrak" not in n.lower()]
+    return kept, len(names) - len(kept)
+
+
 async def _fill_steam_prices(listings) -> int:
     """
     Проставить лотам цену Steam из прайс-листа csgotrader.app.
@@ -1882,12 +1909,19 @@ async def watchresume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await set_watch_paused(chat_id, False)
     interval = await _get_watch_interval(chat_id)
     _schedule_watchlist_job(context.application.job_queue, chat_id, interval)
-    sticker_items = await get_watchlist(chat_id)
-    float_items = await get_float_watchlist(chat_id)
+    sticker_items, st_skipped_a = _drop_stattrak(await get_watchlist(chat_id))
+    float_items, st_skipped_b = _drop_stattrak(await get_float_watchlist(chat_id))
     text = (
         f"▶️ Автоскан возобновлён: вотчлист ({len(sticker_items)} шт.) + охота за флоатом "
         f"({len(float_items)} шт.), пауза {interval:g} мин между прогонами."
     )
+    if st_skipped_a or st_skipped_b:
+        # Говорим прямо, что предметы не потерялись, а исключены фильтром —
+        # иначе уменьшившийся счётчик выглядит как пропажа из списка.
+        text += (
+            f"\n\nStatTrak исключён из сканов: пропускаю {st_skipped_a + st_skipped_b} шт. "
+            "Из списков они не удалены."
+        )
     cooldown = blocking_cooldown()
     if cooldown > 0:
         text += (
@@ -2632,9 +2666,15 @@ async def arbreset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/scanall — сканировать весь вотчлист прямо сейчас, не дожидаясь расписания."""
     chat_id = update.effective_chat.id
-    sticker_items = await get_watchlist(chat_id)
-    float_items = await get_float_watchlist(chat_id)
+    sticker_items, st_a = _drop_stattrak(await get_watchlist(chat_id))
+    float_items, st_b = _drop_stattrak(await get_float_watchlist(chat_id))
     items = set(sticker_items) | set(float_items)
+    if not items and (st_a or st_b):
+        await update.message.reply_text(
+            f"В списках только StatTrak-предметы ({st_a + st_b} шт.), а они сейчас "
+            "исключены из сканов. Сканировать нечего."
+        )
+        return
     if not items:
         await update.message.reply_text(
             "Оба списка пусты. Добавь предметы: /watchadd <предмет1>, <предмет2>, ... "
