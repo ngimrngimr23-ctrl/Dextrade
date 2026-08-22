@@ -1433,13 +1433,27 @@ async def _watchlist_scan_item(
     return sent
 
 
+class WatchlistScanReport(NamedTuple):
+    """
+    Итог прогона — и /scanall, и автоскан шлют по нему один и тот же отчёт
+    "Готово", чтобы поведение не расходилось между ручным и фоновым запуском
+    (раньше автоскан на пустом результате молчал вообще, и по логам нельзя
+    было отличить "ничего не нашёл" от "не запустился").
+    """
+
+    found_any: bool
+    items: int
+
+
 async def _run_watchlist_scan(
     bot, chat_id: int, request_interval: float | None = None
-) -> bool | None:
+) -> WatchlistScanReport | None:
     """
     Прогоняет весь вотчлист чата разом — общая логика для джобы по расписанию
-    и команды /scanall. Возвращает True/False (нашлось ли хоть что-то) или
-    None, если прогон не запустился (пустой список / уже идёт другой прогон).
+    и команды /scanall. Возвращает WatchlistScanReport, либо None, если прогон
+    не запустился вообще (пустой список / уже идёт другой прогон) — в этом
+    случае отчёт "Готово" слать нечего, само событие уже понятно из другого
+    сообщения (или его специально не шлют, как при паузе автоскана).
     """
     if chat_id in _watchlist_running:
         log.info("watchlist: прогон для chat_id=%s уже идёт, пропускаю повторный запуск", chat_id)
@@ -1536,9 +1550,19 @@ async def _run_watchlist_scan(
                 chat_id=chat_id,
                 text=f"⏸ Автоскан остановлен на «{market_hash_name}»: {e}",
             )
-        return found_any
+        return WatchlistScanReport(found_any=found_any, items=stats.items)
     finally:
         _watchlist_running.discard(chat_id)
+
+
+def _format_scan_done(report: "WatchlistScanReport") -> str:
+    """
+    Единый текст итога и для /scanall, и для автоскана — специально ОДИН И ТОТ
+    ЖЕ формат, чтобы пользователь видел одинаковое сообщение независимо от
+    того, кто запустил прогон.
+    """
+    tail = "есть новые находки — см. выше." if report.found_any else "ничего подходящего не нашлось."
+    return f"Готово: проверено {report.items} предмет(ов), {tail}"
 
 
 async def watchlist_scan_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1553,7 +1577,9 @@ async def watchlist_scan_job(context: ContextTypes.DEFAULT_TYPE):
                 "watchlist: chat_id=%s пропускает прогон — кулдаун Steam ещё %.0f мин", chat_id, cooldown / 60
             )
             return
-        await _run_watchlist_scan(context.bot, chat_id)
+        report = await _run_watchlist_scan(context.bot, chat_id)
+        if report is not None:
+            await context.bot.send_message(chat_id=chat_id, text=_format_scan_done(report))
     finally:
         # Планируем следующий прогон только теперь, ПОСЛЕ завершения текущего —
         # так интервал = "N минут после окончания предыдущего", а не "каждые N
@@ -3008,12 +3034,12 @@ async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Ручной запуск: пауза короче фоновой — человек ждёт ответа, а разовый
     # всплеск на пару минут Steam переносит (в отличие от круглосуточного
     # потока, см. MANUAL_REQUEST_INTERVAL).
-    found_any = await _run_watchlist_scan(
+    report = await _run_watchlist_scan(
         context.bot, chat_id, request_interval=MANUAL_REQUEST_INTERVAL
     )
-    await update.message.reply_text(
-        "Готово." if found_any else "Готово, но ничего подходящего не нашлось ни по одному предмету."
-    )
+    # None сюда дойти не должен: списки непустые и "уже идёт" отсеяно выше,
+    # но проверка дешёвая, а падать на отчёте о завершении не хочется.
+    await update.message.reply_text(_format_scan_done(report) if report is not None else "Готово.")
 
 
 async def pricefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
