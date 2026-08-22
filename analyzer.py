@@ -75,6 +75,7 @@ def find_offers(
     min_price: float | None = None,
     max_price: float | None = None,
     listing_floats: dict[str, float] | None = None,
+    min_sticker_ratio: float | None = None,
 ) -> list[Offer]:
     """
     streak_max_markup_pct: отдельный порог наценки для "стрик"-лотов (от
@@ -100,6 +101,21 @@ def find_offers(
         stickers_value = sum(sticker_prices.get(s, 0.0) for s in listing.stickers)
         if stickers_value < min_stickers_value:
             continue
+
+        # Наклейки должны перекрывать цену самого скина в min_sticker_ratio раз.
+        #
+        # Это порог АБСОЛЮТНОЙ весомости набора, и он отвечает на другой вопрос,
+        # чем max_markup_pct. Наценка говорит «сколько сверху просят за
+        # наклейки»: на дешёвом скине она бывает отличной, но набор при этом
+        # стоит копейки, и возиться не с чем. Здесь же условие «наклейки стоят
+        # заметно дороже носителя» — то есть лот интересен именно как набор.
+        #
+        # Считаем от floor_price (цена голого скина), а не от цены лота: цена
+        # лота уже включает наклейки, и делить одно на другое значило бы
+        # сравнивать величину с ней же самой.
+        if min_sticker_ratio is not None:
+            if floor_price <= 0 or stickers_value < floor_price * min_sticker_ratio:
+                continue
 
         # насколько этот лот дороже голого скина — это и есть "цена, которую
         # продавец просит за стикеры" по факту; сравниваем её с реальной

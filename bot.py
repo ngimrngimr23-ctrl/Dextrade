@@ -77,6 +77,8 @@ from storage import (
     get_chat_defaults,
     set_chat_defaults,
     get_streak_markup,
+    get_sticker_ratio,
+    set_sticker_ratio,
     set_streak_markup,
     get_price_filter,
     set_price_filter,
@@ -512,6 +514,7 @@ async def _compute_offers(
     all_sticker_keys = {s for l in listings for s in l.stickers}
     sticker_prices = await get_sticker_prices(all_sticker_keys) if all_sticker_keys else {}
     streak_markup = await get_streak_markup(chat_id)
+    sticker_ratio = await get_sticker_ratio(chat_id)
     min_price, max_price = await get_price_filter(chat_id)
     float_low, float_high = await get_float_filter(chat_id)
     float_markup = await get_float_markup(chat_id)
@@ -534,6 +537,7 @@ async def _compute_offers(
         offers = find_offers(
             listings, sticker_prices, min_value, max_markup,
             streak_max_markup_pct=streak_markup, min_price=min_price, max_price=max_price,
+            min_sticker_ratio=sticker_ratio,
         )
     if offers:
         matched_links = {o.inspect_link for o in offers if o.inspect_link}
@@ -2160,6 +2164,66 @@ async def arbnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Готово, ничего подходящего не нашлось.")
 
 
+async def setratio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /setratio <во сколько раз> — наклейки должны стоить дороже голого скина.
+
+    2 означает «набор наклеек вдвое дороже самого скина», 1.3 — «на 30%
+    дороже». off — фильтр выключить.
+
+    Отвечает на другой вопрос, чем /setdefaults с его наценкой. Наценка — это
+    «сколько сверху просят за наклейки», и на дешёвом скине она бывает
+    отличной, хотя набор стоит копейки и возиться не с чем. Здесь же порог
+    весомости: лот интересен именно как набор, а не как скин.
+    """
+    chat_id = update.effective_chat.id
+    current = await get_sticker_ratio(chat_id)
+
+    if not context.args:
+        now = (
+            f"сейчас: наклейки должны быть дороже скина в {current:g} раз"
+            if current is not None
+            else "сейчас: фильтр выключен"
+        )
+        await update.message.reply_text(
+            "<b>Вес наклеек относительно скина</b>\n"
+            f"{now}\n\n"
+            "<code>/setratio 2</code> — набор вдвое дороже самого скина\n"
+            "<code>/setratio 1.3</code> — на 30% дороже\n"
+            "<code>/setratio off</code> — выключить\n\n"
+            "<i>Считается от цены голого скина (самый дешёвый лот предмета), "
+            "а не от цены лота — в неё наклейки уже включены.</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    raw = context.args[0].lower().replace(",", ".").replace("x", "").replace("х", "")
+    if raw in ("off", "выкл", "0"):
+        await set_sticker_ratio(chat_id, None)
+        await update.message.reply_text("✅ Фильтр по весу наклеек выключен.")
+        return
+
+    try:
+        ratio = float(raw)
+    except ValueError:
+        await update.message.reply_text(
+            f"{context.args[0]!r} — не число. Пример: /setratio 2 или /setratio 1.3"
+        )
+        return
+    if ratio <= 0:
+        await update.message.reply_text("Множитель должен быть больше нуля.")
+        return
+
+    await set_sticker_ratio(chat_id, ratio)
+    example_skin = 10.0
+    await update.message.reply_text(
+        f"✅ Наклейки должны быть дороже скина в {ratio:g} раз.\n\n"
+        f"Например: скин за ${example_skin:.0f} пройдёт, только если наклеек на нём "
+        f"минимум на ${example_skin * ratio:.0f}.\n\n"
+        "Проверить: /scanall"
+    )
+
+
 async def proxyadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /proxyadd <адреса> — добавить прокси на ходу, без передеплоя.
@@ -3030,6 +3094,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"  Стикеры: от ${def_min:.0f}, наценка ≤{def_max:g}%")
     if streak is not None:
         lines.append(f"  Стрик ({STREAK_THRESHOLD}+ подряд): наценка ≤{streak:g}%")
+    ratio = await get_sticker_ratio(chat_id)
+    if ratio is not None:
+        lines.append(f"  Вес наклеек: дороже скина в {ratio:g} раз")
     if p_lo is not None or p_hi is not None:
         lo = f"${p_lo:.2f}" if p_lo is not None else "—"
         hi = f"${p_hi:.2f}" if p_hi is not None else "—"
@@ -3151,6 +3218,7 @@ BOT_COMMANDS = [
     BotCommand("markets", "Сравнить Steam с другими площадками (весь каталог)"),
     BotCommand("setmarkets", "Пороги для /markets: спред, продажи, прибыль"),
     BotCommand("proxycheck", "Проверить прокси: сколько работают, сколько отвалились"),
+    BotCommand("setratio", "Наклейки дороже скина во сколько раз"),
     BotCommand("proxyadd", "Добавить прокси прямо из чата"),
     BotCommand("setarb", "Арбитраж: CSFloat дешевле Steam на N%"),
     BotCommand("help", "Полный справочник по всем командам"),
@@ -3522,6 +3590,7 @@ def _build_application(token: str):
     app.add_handler(CommandHandler("markets", markets))
     app.add_handler(CommandHandler("setmarkets", setmarkets))
     app.add_handler(CommandHandler("proxycheck", proxycheck))
+    app.add_handler(CommandHandler("setratio", setratio))
     app.add_handler(CommandHandler("proxyadd", proxyadd))
     app.add_handler(CommandHandler("proxyclear", proxyclear))
     app.add_handler(CommandHandler("arbreset", arbreset))

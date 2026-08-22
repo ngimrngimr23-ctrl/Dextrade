@@ -241,6 +241,20 @@ async def set_chat_defaults(chat_id: int, min_value: float, max_markup: float) -
     await _save_chat_settings(chat_id, settings)
 
 
+async def get_sticker_ratio(chat_id: int) -> Optional[float]:
+    """
+    Во сколько раз сумма наклеек должна перекрывать цену голого скина.
+    None — порог не задан, лоты по этому признаку не отсеиваются.
+    """
+    return (await _get_chat_settings(chat_id)).get("sticker_ratio")
+
+
+async def set_sticker_ratio(chat_id: int, ratio: Optional[float]) -> None:
+    settings = await _get_chat_settings(chat_id)
+    settings["sticker_ratio"] = ratio
+    await _save_chat_settings(chat_id, settings)
+
+
 async def get_streak_markup(chat_id: int) -> Optional[float]:
     """Отдельный порог наценки (%) для стрик-лотов (4-5 подряд одинаковых стикеров), либо None, если не задан."""
     return (await _get_chat_settings(chat_id)).get("streak_markup")
