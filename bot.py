@@ -3251,7 +3251,35 @@ async def _on_startup(app: Application):
 # Это и способ отката: снял переменную, передеплоил, вернулся к polling —
 # PTB при старте polling всегда сам зовёт delete_webhook, так что подвисшая
 # подписка не помешает.
-WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "").rstrip("/")
+# Render сам сообщает адрес сервиса в RENDER_EXTERNAL_URL. Используем его как
+# значение по умолчанию — и как проверку того, что задано вручную.
+#
+# Зачем. При переезде на новый сервис адрес меняется, а WEBHOOK_BASE_URL
+# остаётся от старого. Бот при этом стартует нормально, setWebhook проходит
+# успешно — и молча просит Telegram слать апдейты на ЧУЖОЙ хост. Снаружи это
+# выглядит как "бот не работает" без единой ошибки в логе; ровно так и вышло
+# 2026-08-22, хотя предупреждение об этом было написано в render.yaml.
+#
+# Полагаться на то, что человек заметит расхождение двух URL в логе, оказалось
+# наивно. Теперь при пустой переменной адрес берётся автоматически, а при
+# заданном и не совпадающем — громкая ошибка в логе с готовым решением.
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "").rstrip("/") or RENDER_EXTERNAL_URL
+
+
+def _warn_if_webhook_url_foreign() -> None:
+    """Сказать вслух, если webhook настроен на адрес не этого сервиса."""
+    if not WEBHOOK_BASE_URL or not RENDER_EXTERNAL_URL:
+        return
+    if WEBHOOK_BASE_URL == RENDER_EXTERNAL_URL:
+        return
+    log.error(
+        "WEBHOOK_BASE_URL указывает на ЧУЖОЙ адрес: задано %s, а этот сервис живёт на %s. "
+        "Telegram будет слать апдейты туда, и бот не получит НИ ОДНОГО сообщения. "
+        "Исправление: убрать переменную WEBHOOK_BASE_URL совсем (адрес подставится сам) "
+        "или вписать в неё %s",
+        WEBHOOK_BASE_URL, RENDER_EXTERNAL_URL, RENDER_EXTERNAL_URL,
+    )
 # Секрет в заголовке X-Telegram-Bot-Api-Secret-Token: Telegram шлёт его с
 # каждым апдейтом, и это единственный способ отличить настоящий апдейт от
 # чужого POST'а на наш URL. Необязателен, но без него мы верим кому угодно.
@@ -3393,6 +3421,7 @@ async def _run_with_webhook(app, token: str) -> bool:
     """
     global _tg_application, _tg_loop, _tg_webhook_path
 
+    _warn_if_webhook_url_foreign()
     url = f"{WEBHOOK_BASE_URL}/{_webhook_path(token)}"
     await app.initialize()
 
