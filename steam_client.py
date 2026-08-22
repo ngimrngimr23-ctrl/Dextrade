@@ -76,6 +76,13 @@ DEFAULT_MAX_LISTINGS = 100  # автосканы (/scanfile, вотчлист) �
 # закапывает себя глубже. Вместо ретраев: сразу сдаёмся и ставим кулдаун
 # для соответствующей области, в течение которого её не трогаем вообще.
 MIN_REQUEST_INTERVAL = 4.0  # секунд между ЛЮБЫМИ двумя запросами к Steam (глобально на весь процесс)
+
+# Пауза для РУЧНОГО скана. Меньше фоновой намеренно: ручной запуск случается
+# редко и человек ждёт ответа, тогда как фоновый молотит круглосуточно, и
+# именно суммарная нагрузка за час доводит Steam до 429, а не промежуток между
+# двумя соседними запросами. Разовый всплеск на пару минут он переносит,
+# постоянный поток — нет.
+MANUAL_REQUEST_INTERVAL = float(os.environ.get("MANUAL_REQUEST_INTERVAL", "2.0"))
 COOLDOWN_AFTER_429_SECONDS = 30 * 60  # получили 429 -> не трогаем Steam столько времени
 COOLDOWN_MAX_SECONDS = 6 * 60 * 60  # потолок при повторных 429 подряд (бан может быть длинным)
 
@@ -379,7 +386,9 @@ _lane_locks: dict[str, asyncio.Lock] = {}
 _lane_last: dict[str, float] = {}
 
 
-async def throttle_steam_request(scope: str = "listings", lane: str = "") -> None:
+async def throttle_steam_request(
+    scope: str = "listings", lane: str = "", interval: float | None = None
+) -> None:
     """
     Держит паузу MIN_REQUEST_INTERVAL между запросами к Steam и попутно
     отмечает запрос в журнале (см. _record_steam_request) — через эту функцию
@@ -399,7 +408,8 @@ async def throttle_steam_request(scope: str = "listings", lane: str = "") -> Non
     if lock is None:
         lock = _lane_locks[lane] = asyncio.Lock()
     async with lock:
-        wait = MIN_REQUEST_INTERVAL - (time.monotonic() - _lane_last.get(lane, 0.0))
+        gap = MIN_REQUEST_INTERVAL if interval is None else interval
+        wait = gap - (time.monotonic() - _lane_last.get(lane, 0.0))
         if wait > 0:
             await asyncio.sleep(wait)
         now = time.monotonic()
@@ -549,7 +559,11 @@ def _ajax_headers(market_hash_name: str) -> dict:
 _BETA_PAGE_MARKERS = ("/ssr/", "DesktopUI", "<!DOCTYPE html")
 
 
-async def fetch_all_listings(market_hash_name: str, max_listings: int | None = DEFAULT_MAX_LISTINGS) -> list[Listing]:
+async def fetch_all_listings(
+    market_hash_name: str,
+    max_listings: int | None = DEFAULT_MAX_LISTINGS,
+    request_interval: float | None = None,
+) -> list[Listing]:
     """
     Тянем страницы листингов для предмета и парсим цену + стикеры каждого лота.
 
@@ -611,7 +625,7 @@ async def fetch_all_listings(market_hash_name: str, max_listings: int | None = D
             if route:
                 headers = {**headers, "Cookie": "bMarketOptOut=1"}
 
-            await throttle_steam_request(scope="listings", lane=route or "")
+            await throttle_steam_request(scope="listings", lane=route or "", interval=request_interval)
             async with session.get(final_url, params=params, headers=headers, proxy=route) as resp:
                 if resp.status == 429:
                     # Повторять с ТОГО ЖЕ адреса нельзя: у Steam 429 — это

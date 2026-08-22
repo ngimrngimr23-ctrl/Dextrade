@@ -241,6 +241,20 @@ async def set_chat_defaults(chat_id: int, min_value: float, max_markup: float) -
     await _save_chat_settings(chat_id, settings)
 
 
+async def get_watch_gap(chat_id: int) -> Optional[float]:
+    """
+    Пауза в минутах между концом одного прогона автоскана и началом следующего.
+    None — не задана, действует значение по умолчанию из кода.
+    """
+    return (await _get_chat_settings(chat_id)).get("watch_gap")
+
+
+async def set_watch_gap(chat_id: int, minutes: Optional[float]) -> None:
+    settings = await _get_chat_settings(chat_id)
+    settings["watch_gap"] = minutes
+    await _save_chat_settings(chat_id, settings)
+
+
 async def get_sticker_ratio(chat_id: int) -> Optional[float]:
     """
     Во сколько раз сумма наклеек должна перекрывать цену голого скина.

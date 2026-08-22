@@ -45,6 +45,8 @@ from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from steam_client import (
+    MANUAL_REQUEST_INTERVAL,
+    MIN_REQUEST_INTERVAL,
     fetch_all_listings,
     market_hash_name_from_url,
     render_url,
@@ -79,6 +81,8 @@ from storage import (
     get_streak_markup,
     get_sticker_ratio,
     set_sticker_ratio,
+    get_watch_gap,
+    set_watch_gap,
     set_streak_markup,
     get_price_filter,
     set_price_filter,
@@ -263,7 +267,8 @@ _watchlist_running: set[int] = set()
 
 
 async def _get_watch_interval(chat_id: int) -> float:
-    return WATCH_GAP_MINUTES
+    saved = await get_watch_gap(chat_id)
+    return saved if saved is not None else WATCH_GAP_MINUTES
 
 
 def _schedule_watchlist_job(job_queue, chat_id: int, interval_minutes: float, delay_seconds: float | None = None) -> None:
@@ -501,6 +506,7 @@ async def _compute_offers(
     *,
     check_stickers: bool = True,
     check_floats: bool = True,
+    request_interval: float | None = None,
 ):
     """
     Общая логика для /scan, /scanfile и автоскана вотчлиста: цены стикеров -> офферы.
@@ -1313,7 +1319,9 @@ async def _watchlist_scan_item(
     return True
 
 
-async def _run_watchlist_scan(bot, chat_id: int) -> bool | None:
+async def _run_watchlist_scan(
+    bot, chat_id: int, request_interval: float | None = None
+) -> bool | None:
     """
     Прогоняет весь вотчлист чата разом — общая логика для джобы по расписанию
     и команды /scanall. Возвращает True/False (нашлось ли хоть что-то) или
@@ -1351,6 +1359,7 @@ async def _run_watchlist_scan(bot, chat_id: int) -> bool | None:
                 found = await _watchlist_scan_item(
                     bot, chat_id, market_hash_name, min_value, max_markup,
                     check_stickers=check_stickers, check_floats=check_floats,
+                    request_interval=request_interval,
                 )
             except SteamRateLimited as e:
                 # Влетели в рейт-лимит Steam. Останавливаем весь прогон: каждая
@@ -2164,6 +2173,71 @@ async def arbnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Готово, ничего подходящего не нашлось.")
 
 
+async def setinterval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /setinterval <минут> — пауза между прогонами автоскана.
+
+    Это главный рычаг против 429, и он важнее паузы между отдельными запросами.
+    Steam смотрит не на промежуток между двумя запросами, а на сколько их
+    приходит суммарно. При 110 предметах прогон занимает около 7 минут, и с
+    паузой в 2 минуты цикл выходит 9 — то есть больше семисот запросов в час с
+    одного адреса. Столько Steam не прощает.
+
+    Показывает расчётную нагрузку прямо в ответе: иначе цифра в минутах ничего
+    не говорит, а последствия видны только через полчаса бана.
+    """
+    chat_id = update.effective_chat.id
+    sticker_items, _ = _drop_stattrak(await get_watchlist(chat_id))
+    float_items, _ = _drop_stattrak(await get_float_watchlist(chat_id))
+    items = len(set(sticker_items) | set(float_items)) or 1
+    scan_minutes = items * MIN_REQUEST_INTERVAL / 60
+
+    def load_line(gap: float) -> str:
+        cycle = scan_minutes + gap
+        return f"{items * 60 / cycle:.0f} запросов в час (цикл {cycle:.0f} мин)"
+
+    current = await _get_watch_interval(chat_id)
+
+    if not context.args:
+        await update.message.reply_text(
+            "<b>Пауза между прогонами автоскана</b>\n"
+            f"сейчас: {current:g} мин → {load_line(current)}\n\n"
+            f"Предметов в сканах: {items}, один прогон ≈ {scan_minutes:.0f} мин.\n\n"
+            "<code>/setinterval 25</code> — поменять\n\n"
+            "<i>Ориентир: держать нагрузку в пределах 200-250 запросов в час "
+            "с одного адреса. Больше — и Steam начинает отвечать 429, а это "
+            "бан адреса на 30 минут и дольше.</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        minutes = float(context.args[0].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text(f"{context.args[0]!r} — не число. Пример: /setinterval 25")
+        return
+    if minutes < 0:
+        await update.message.reply_text("Пауза не может быть отрицательной.")
+        return
+
+    await set_watch_gap(chat_id, minutes)
+
+    text = f"✅ Пауза между прогонами: {minutes:g} мин\nНагрузка: {load_line(minutes)}"
+    rate = items * 60 / (scan_minutes + minutes)
+    if rate > 250:
+        text += (
+            f"\n\n⚠️ Это много для одного адреса — Steam при такой нагрузке "
+            f"отвечает 429, а это бан на 30 минут и дольше. "
+            f"Спокойное значение: /setinterval {max(1, round(items * 60 / 200 - scan_minutes))}"
+        )
+    # Джобу пересоздаём сразу, иначе новая пауза вступит в силу только после
+    # следующего прогона — то есть через старый, слишком короткий интервал.
+    if not await get_watch_paused(chat_id):
+        _schedule_watchlist_job(context.application.job_queue, chat_id, minutes)
+        text += "\n\nРасписание обновлено."
+    await update.message.reply_text(text)
+
+
 async def setratio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /setratio <во сколько раз> — наклейки должны стоить дороже голого скина.
@@ -2765,7 +2839,12 @@ async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     log.info("scanall: chat_id=%s начинаю скан %s предмет(ов)", chat_id, len(items))
     await update.message.reply_text(f"Начинаю скан {len(items)} предмет(ов) из вотчлиста…")
-    found_any = await _run_watchlist_scan(context.bot, chat_id)
+    # Ручной запуск: пауза короче фоновой — человек ждёт ответа, а разовый
+    # всплеск на пару минут Steam переносит (в отличие от круглосуточного
+    # потока, см. MANUAL_REQUEST_INTERVAL).
+    found_any = await _run_watchlist_scan(
+        context.bot, chat_id, request_interval=MANUAL_REQUEST_INTERVAL
+    )
     await update.message.reply_text(
         "Готово." if found_any else "Готово, но ничего подходящего не нашлось ни по одному предмету."
     )
@@ -3218,6 +3297,7 @@ BOT_COMMANDS = [
     BotCommand("markets", "Сравнить Steam с другими площадками (весь каталог)"),
     BotCommand("setmarkets", "Пороги для /markets: спред, продажи, прибыль"),
     BotCommand("proxycheck", "Проверить прокси: сколько работают, сколько отвалились"),
+    BotCommand("setinterval", "Пауза между прогонами автоскана"),
     BotCommand("setratio", "Наклейки дороже скина во сколько раз"),
     BotCommand("proxyadd", "Добавить прокси прямо из чата"),
     BotCommand("setarb", "Арбитраж: CSFloat дешевле Steam на N%"),
@@ -3590,6 +3670,7 @@ def _build_application(token: str):
     app.add_handler(CommandHandler("markets", markets))
     app.add_handler(CommandHandler("setmarkets", setmarkets))
     app.add_handler(CommandHandler("proxycheck", proxycheck))
+    app.add_handler(CommandHandler("setinterval", setinterval))
     app.add_handler(CommandHandler("setratio", setratio))
     app.add_handler(CommandHandler("proxyadd", proxyadd))
     app.add_handler(CommandHandler("proxyclear", proxyclear))
