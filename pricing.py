@@ -45,6 +45,8 @@ from steam_client import (
     note_steam_ok,
 )
 
+from http_session import get_session
+
 log = logging.getLogger("steam_bot.pricing")
 
 OVERRIDES_PATH = Path(__file__).parent / "sticker_overrides.json"
@@ -121,10 +123,70 @@ def _resolve_market_hash_name(sticker_key: str, overrides: dict, catalog: dict) 
     return f"{name}{finish_str} {event}", False
 
 
+# ---------------------------------------------------------------------------
+# Кэш прочитанных JSON-файлов в памяти процесса
+#
+# Прайс-лист csgotrader — это ~3 МБ JSON с двумя десятками тысяч записей, и
+# читался он С ДИСКА ЗАНОВО на каждый предмет: get_sticker_prices зовёт
+# _load_csgotrader_cache, а её зовут по разу на каждый предмет вотчлиста.
+# Плюс поверх этого get_csgotrader_price_details каждый раз заново перебирала
+# все записи, выбирая окно цены. На прогоне в 110 предметов это десятки секунд
+# чистого CPU — причём БЛОКИРУЮЩЕГО: пока идёт json.loads, event loop стоит, и
+# вместе с ним стоят все параллельные запросы сканера.
+#
+# Файл между этими чтениями не меняется (обновляется раз в три часа), так что
+# держим разобранный результат в памяти и сверяемся с mtime+размером файла.
+# Такой ключ переживает и подмену файла другим процессом, и правку руками, и
+# при этом не требует ни явной инвалидации, ни TTL.
+# ---------------------------------------------------------------------------
+
+_JSON_MEMO: dict[Path, tuple[tuple[int, int], object]] = {}
+
+
+def _file_stamp(path: Path) -> tuple[int, int] | None:
+    """(mtime в нс, размер) — отпечаток файла. None, если файла нет."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _read_json(path: Path, default):
+    """Прочитать JSON с диска без кэша. default при отсутствии файла или битом содержимом."""
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        log.exception("не удалось прочитать %s", path)
+        return default
+
+
+def _read_json_memo(path: Path, default):
+    """
+    То же, но с кэшем в памяти по отпечатку файла.
+
+    ВАЖНО: возвращается ОДИН И ТОТ ЖЕ объект при повторных вызовах — менять его
+    на месте нельзя. Кому нужна своя копия для правки (ingest_manual_prices),
+    берёт данные через _read_json.
+    """
+    stamp = _file_stamp(path)
+    if stamp is None:
+        _JSON_MEMO.pop(path, None)
+        return default
+
+    hit = _JSON_MEMO.get(path)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+
+    data = _read_json(path, default)
+    _JSON_MEMO[path] = (stamp, data)
+    return data
+
+
 def _load_overrides() -> dict:
-    if OVERRIDES_PATH.exists():
-        return json.loads(OVERRIDES_PATH.read_text(encoding="utf-8"))
-    return {}
+    return _read_json_memo(OVERRIDES_PATH, {})
 
 
 # ---------------------------------------------------------------------------
@@ -133,13 +195,8 @@ def _load_overrides() -> dict:
 # ---------------------------------------------------------------------------
 
 def _load_manual_prices() -> dict[str, float]:
-    if not MANUAL_PRICE_CACHE_PATH.exists():
-        return {}
-    try:
-        return json.loads(MANUAL_PRICE_CACHE_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        log.exception("manual_prices: не удалось прочитать %s", MANUAL_PRICE_CACHE_PATH)
-        return {}
+    """Только для чтения — объект общий (см. _read_json_memo)."""
+    return _read_json_memo(MANUAL_PRICE_CACHE_PATH, {})
 
 
 def ingest_manual_prices(items: dict[str, float]) -> int:
@@ -149,7 +206,9 @@ def ingest_manual_prices(items: dict[str, float]) -> int:
     получении JSON вида market/search/render с ценами по категории стикеров.
     Возвращает количество реально добавленных/обновлённых записей.
     """
-    current = _load_manual_prices()
+    # Свежая копия с диска, а не общий кэшированный объект: его правка на месте
+    # оставила бы в памяти данные, которых ещё нет в файле.
+    current = dict(_read_json(MANUAL_PRICE_CACHE_PATH, {}))
     changed = 0
     for name, price in items.items():
         if not name or price is None:
@@ -191,13 +250,11 @@ CSGOTRADER_RECENT_WINDOWS = ("last_24h", "last_7d")
 
 
 def _load_csgotrader_cache() -> tuple[dict, float] | None:
-    if not CSGOTRADER_CACHE_PATH.exists():
+    """Содержимое дискового кэша прайс-листа. Читается один раз на версию файла (см. _read_json_memo)."""
+    data = _read_json_memo(CSGOTRADER_CACHE_PATH, None)
+    if not isinstance(data, dict) or "details" not in data or "updated_at" not in data:
         return None
-    try:
-        data = json.loads(CSGOTRADER_CACHE_PATH.read_text(encoding="utf-8"))
-        return data["details"], data["updated_at"]
-    except Exception:
-        return None
+    return data["details"], data["updated_at"]
 
 
 def _save_csgotrader_cache(details: dict) -> None:
@@ -328,19 +385,31 @@ async def _download_csgotrader_prices(session: aiohttp.ClientSession) -> dict[st
     return details
 
 
+# Разобранный прайс-лист: (отпечаток файла-кэша, готовый словарь).
+# Пересборка перебирает ~20 000 записей и на слабом CPU стоит десятки
+# миллисекунд — терпимо раз в три часа и совсем не терпимо на каждый предмет.
+_CSGOTRADER_DERIVED: tuple[tuple[int, int], dict[str, "SteamPrice"]] | None = None
+
+
 async def get_csgotrader_price_details(
-    session: aiohttp.ClientSession, force_refresh: bool = False
+    session: aiohttp.ClientSession | None = None, force_refresh: bool = False
 ) -> dict[str, SteamPrice]:
     """
     market_hash_name -> SteamPrice (цена, окно и ВСЕ окна предмета).
     Полный набор окон нужен тем, кто считает по цене скидку: по одному числу
     нельзя понять, устойчива цена или скачет.
+
+    session можно не передавать — возьмётся общая сессия процесса. Скачивание
+    происходит только когда дисковый кэш протух (или force_refresh), в
+    остальных случаях сеть не трогается вовсе.
     """
+    global _CSGOTRADER_DERIVED
+
     cached = _load_csgotrader_cache()
     if not force_refresh and cached and (time.time() - cached[1]) < CSGOTRADER_CACHE_TTL_SECONDS:
         details = cached[0]
     else:
-        fresh = await _download_csgotrader_prices(session)
+        fresh = await _download_csgotrader_prices(session or get_session())
         if fresh:
             _save_csgotrader_cache(fresh)
             details = fresh
@@ -350,6 +419,10 @@ async def get_csgotrader_price_details(
         else:
             return {}
 
+    stamp = _file_stamp(CSGOTRADER_CACHE_PATH)
+    if stamp is not None and _CSGOTRADER_DERIVED is not None and _CSGOTRADER_DERIVED[0] == stamp:
+        return _CSGOTRADER_DERIVED[1]
+
     out: dict[str, SteamPrice] = {}
     for name, windows in details.items():
         if not isinstance(windows, dict):
@@ -357,13 +430,33 @@ async def get_csgotrader_price_details(
         picked = _steam_price_from_windows(windows)
         if picked is not None:
             out[name] = picked
+
+    if stamp is not None:
+        _CSGOTRADER_DERIVED = (stamp, out)
     return out
 
 
-async def get_csgotrader_prices(session: aiohttp.ClientSession, force_refresh: bool = False) -> dict[str, float]:
+# Только цены, без окон — производная того же словаря, с ключом по тому же
+# отпечатку файла.
+_CSGOTRADER_PRICES_ONLY: tuple[tuple[int, int], dict[str, float]] | None = None
+
+
+async def get_csgotrader_prices(
+    session: aiohttp.ClientSession | None = None, force_refresh: bool = False
+) -> dict[str, float]:
     """Только цены — стикерному пайплайну окна не нужны."""
+    global _CSGOTRADER_PRICES_ONLY
+
     details = await get_csgotrader_price_details(session, force_refresh=force_refresh)
-    return {name: sp.price for name, sp in details.items()}
+
+    stamp = _file_stamp(CSGOTRADER_CACHE_PATH)
+    if stamp is not None and _CSGOTRADER_PRICES_ONLY is not None and _CSGOTRADER_PRICES_ONLY[0] == stamp:
+        return _CSGOTRADER_PRICES_ONLY[1]
+
+    prices = {name: sp.price for name, sp in details.items()}
+    if stamp is not None:
+        _CSGOTRADER_PRICES_ONLY = (stamp, prices)
+    return prices
 
 
 # ---------------------------------------------------------------------------
@@ -713,47 +806,50 @@ async def get_sticker_prices(sticker_keys: set[str]) -> dict[str, float]:
     steam_fallback_needed = []
     rate_limited_count = 0
 
-    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
-        ct_prices = await get_csgotrader_prices(session)
-        if not ct_prices:
-            log.warning("get_sticker_prices: прайс-лист csgotrader.app пуст/недоступен, все ключи уйдут сразу на Steam-фолбэк")
+    # Своя сессия тут больше не поднимается: get_csgotrader_prices почти всегда
+    # отвечает из памяти и в сеть не ходит вовсе, а когда ходит — берёт общую
+    # сессию процесса. Раньше на каждый предмет вотчлиста заводилось новое
+    # TLS-соединение, которое в 99 случаях из 100 не использовалось ни разу.
+    ct_prices = await get_csgotrader_prices()
+    if not ct_prices:
+        log.warning("get_sticker_prices: прайс-лист csgotrader.app пуст/недоступен, все ключи уйдут сразу на Steam-фолбэк")
 
-        ct_hits: list[tuple[str, Optional[str], float, int]] = []
-        for key in to_fetch:
-            name_or_query, is_exact = _resolve_market_hash_name(key, overrides, catalog)
+    ct_hits: list[tuple[str, Optional[str], float, int]] = []
+    for key in to_fetch:
+        name_or_query, is_exact = _resolve_market_hash_name(key, overrides, catalog)
 
-            ct_price = ct_prices.get(name_or_query) if is_exact else None
-            if ct_price is not None:
-                ct_hits.append((key, name_or_query, ct_price, CACHE_TTL_SECONDS))
-                result[key] = ct_price
-            else:
-                steam_fallback_needed.append((key, name_or_query, is_exact))
+        ct_price = ct_prices.get(name_or_query) if is_exact else None
+        if ct_price is not None:
+            ct_hits.append((key, name_or_query, ct_price, CACHE_TTL_SECONDS))
+            result[key] = ct_price
+        else:
+            steam_fallback_needed.append((key, name_or_query, is_exact))
 
-        if ct_hits:
-            await set_prices_batch(ct_hits)
+    if ct_hits:
+        await set_prices_batch(ct_hits)
 
-        if steam_fallback_needed:
-            # Живой путь (/scan, /scanfile, автоскан вотчлиста) больше НЕ ходит в
-            # Steam за ценой стикера вообще — только в статичный прайс-лист
-            # csgotrader.app выше. Причина: 2026-08-14/15 дважды подряд (даже
-            # после подъёма паузы до 12 сек и 6+ часов отдыха между попытками)
-            # именно priceoverview/market-search — НЕ /render/, которым идёт сбор
-            # листингов, — сразу ловил 429 на первом же обращении. У этих двух
-            # эндпоинтов, похоже, отдельный и гораздо более жёсткий лимит у Steam,
-            # чем у /render/, и никакая пауза между запросами его не обходит.
-            # Ронять ВЕСЬ автоскан на 30+ минут ради пары стикеров, которых
-            # почти наверняка нет в csgotrader.app просто потому что они очень
-            # новые, того не стоит. Эти ключи остаются "не найдено" сейчас —
-            # их фоном подтянет prewarm_loop (раз в 30 мин, тоже уважает
-            # кулдаун — см. prewarm.py). Ничего не кэшируем нулём, чтобы при
-            # следующем прогоне (когда prewarm их уже посчитает) взялась
-            # актуальная цена.
-            log.info(
-                "get_sticker_prices: %s ключей не нашлись в прайс-листе csgotrader.app — "
-                "оставляю их фоновому prewarm'у, живой путь к Steam за ценой стикера не ходит",
-                len(steam_fallback_needed),
-            )
-            rate_limited_count += len(steam_fallback_needed)
+    if steam_fallback_needed:
+        # Живой путь (/scan, /scanfile, автоскан вотчлиста) больше НЕ ходит в
+        # Steam за ценой стикера вообще — только в статичный прайс-лист
+        # csgotrader.app выше. Причина: 2026-08-14/15 дважды подряд (даже
+        # после подъёма паузы до 12 сек и 6+ часов отдыха между попытками)
+        # именно priceoverview/market-search — НЕ /render/, которым идёт сбор
+        # листингов, — сразу ловил 429 на первом же обращении. У этих двух
+        # эндпоинтов, похоже, отдельный и гораздо более жёсткий лимит у Steam,
+        # чем у /render/, и никакая пауза между запросами его не обходит.
+        # Ронять ВЕСЬ автоскан на 30+ минут ради пары стикеров, которых
+        # почти наверняка нет в csgotrader.app просто потому что они очень
+        # новые, того не стоит. Эти ключи остаются "не найдено" сейчас —
+        # их фоном подтянет prewarm_loop (раз в 30 мин, тоже уважает
+        # кулдаун — см. prewarm.py). Ничего не кэшируем нулём, чтобы при
+        # следующем прогоне (когда prewarm их уже посчитает) взялась
+        # актуальная цена.
+        log.info(
+            "get_sticker_prices: %s ключей не нашлись в прайс-листе csgotrader.app — "
+            "оставляю их фоновому prewarm'у, живой путь к Steam за ценой стикера не ходит",
+            len(steam_fallback_needed),
+        )
+        rate_limited_count += len(steam_fallback_needed)
 
     if rate_limited_count:
         log.info(

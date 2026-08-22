@@ -27,6 +27,8 @@ from typing import Optional
 
 import aiohttp
 
+from http_session import get_session
+
 log = logging.getLogger("steam_bot.storage")
 
 REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
@@ -52,18 +54,23 @@ def _local_save(data: dict) -> None:
 
 
 async def _redis_cmd(*args):
-    """Одна команда Upstash REST. Бросает исключение при ошибке — вызывающий код ловит и падает на fallback."""
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            REDIS_URL,
-            headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
-            json=list(args),
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
-            data = await resp.json()
-            if "error" in data:
-                raise RuntimeError(data["error"])
-            return data.get("result")
+    """
+    Одна команда Upstash REST. Бросает исключение при ошибке — вызывающий код ловит и падает на fallback.
+
+    Сессия общая на процесс (см. http_session): раньше здесь открывалась новая
+    на каждую команду, то есть полный TLS-хендшейк перед каждым GET/SET.
+    """
+    session = get_session()
+    async with session.post(
+        REDIS_URL,
+        headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
+        json=list(args),
+        timeout=aiohttp.ClientTimeout(total=10),
+    ) as resp:
+        data = await resp.json()
+        if "error" in data:
+            raise RuntimeError(data["error"])
+        return data.get("result")
 
 
 async def get_price(key: str) -> Optional[dict]:
@@ -97,14 +104,14 @@ async def set_price(key: str, matched_name: Optional[str], price: float, ttl_sec
 
 async def _redis_pipeline(commands: list[list]) -> list:
     """Несколько команд Upstash REST одним HTTP-запросом. Возвращает список {'result':...}/{'error':...} по порядку команд."""
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            f"{REDIS_URL}/pipeline",
-            headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
-            json=commands,
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            return await resp.json()
+    session = get_session()
+    async with session.post(
+        f"{REDIS_URL}/pipeline",
+        headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
+        json=commands,
+        timeout=aiohttp.ClientTimeout(total=15),
+    ) as resp:
+        return await resp.json()
 
 
 async def get_prices_batch(keys: list[str]) -> dict[str, Optional[dict]]:
@@ -210,6 +217,21 @@ async def _get_chat_settings(chat_id: int) -> dict:
             pass
 
     return _local_defaults_load().get(str(chat_id), {})
+
+
+async def get_all_chat_settings(chat_id: int) -> dict:
+    """
+    Весь блок настроек чата одним походом в хранилище.
+
+    Нужно тем, кто иначе дёргает пять-шесть отдельных геттеров подряд
+    (get_streak_markup, get_sticker_ratio, get_price_filter, ...). Каждый из них
+    внутри вызывает _get_chat_settings, то есть отдельный HTTP-запрос в Upstash
+    за одним и тем же JSON-блоком. На прогоне вотчлиста в 110 предметов это
+    было 550 запросов вместо одного: настройки за время прогона не меняются.
+
+    Разбирать результат удобно через ScanSettings в bot.py.
+    """
+    return await _get_chat_settings(chat_id)
 
 
 async def _save_chat_settings(chat_id: int, settings: dict) -> None:
@@ -651,6 +673,67 @@ async def was_offer_sent_recently(chat_id: int, offer_key: str) -> bool:
 
     sent_at = _local_sent_offers_load().get(full_key)
     return sent_at is not None and (time.time() - sent_at) < SENT_OFFER_TTL_SECONDS
+
+
+async def filter_new_offers(chat_id: int, offer_keys: list[str]) -> list[bool]:
+    """
+    Пачкой: для каждого ключа True, если такой оффер этому чату ещё НЕ слали.
+
+    Порядок ответа совпадает с порядком offer_keys. Смысл ровно тот же, что у
+    was_offer_sent_recently (только с обратным знаком), но одним запросом на
+    весь лот вместо одного запроса на каждый оффер.
+    """
+    if not offer_keys:
+        return []
+
+    full_keys = [f"{SENT_OFFER_KEY_PREFIX}{chat_id}:{k}" for k in offer_keys]
+
+    if REDIS_ENABLED:
+        try:
+            results = await _redis_pipeline([["EXISTS", k] for k in full_keys])
+            if len(results) != len(full_keys):
+                raise RuntimeError(f"pipeline вернул {len(results)} ответов на {len(full_keys)} команд")
+            out = []
+            for entry in results:
+                if isinstance(entry, dict) and "error" in entry:
+                    raise RuntimeError(f"pipeline вернул ошибку: {entry['error']}")
+                exists = entry.get("result") if isinstance(entry, dict) else entry
+                out.append(not bool(exists))
+            return out
+        except Exception:
+            log.warning("filter_new_offers: Upstash недоступен, проверяю по локальному файлу", exc_info=True)
+
+    data = _local_sent_offers_load()
+    now = time.time()
+    return [
+        not (data.get(k) is not None and (now - data[k]) < SENT_OFFER_TTL_SECONDS)
+        for k in full_keys
+    ]
+
+
+async def mark_offers_sent(chat_id: int, offer_keys: list[str]) -> None:
+    """Пачкой: отметить сразу несколько офферов отправленными (один pipeline вместо SET на каждый)."""
+    if not offer_keys:
+        return
+
+    full_keys = [f"{SENT_OFFER_KEY_PREFIX}{chat_id}:{k}" for k in offer_keys]
+
+    if REDIS_ENABLED:
+        try:
+            results = await _redis_pipeline(
+                [["SET", k, "1", "EX", str(SENT_OFFER_TTL_SECONDS)] for k in full_keys]
+            )
+            if any(isinstance(r, dict) and "error" in r for r in results):
+                raise RuntimeError(f"pipeline вернул ошибку хотя бы по одной команде: {results}")
+            return
+        except Exception:
+            log.warning("mark_offers_sent: Upstash недоступен, пишу в локальный файл", exc_info=True)
+
+    data = _local_sent_offers_load()
+    now = time.time()
+    for k in full_keys:
+        data[k] = now
+    _local_sent_offers_save(data)
 
 
 async def mark_offer_sent(chat_id: int, offer_key: str) -> None:

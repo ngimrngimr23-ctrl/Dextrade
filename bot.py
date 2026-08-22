@@ -38,7 +38,9 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import NamedTuple
 
 import aiohttp
 from telegram import BotCommand, Update
@@ -57,8 +59,10 @@ from steam_client import (
     steam_cooldown_remaining,
     blocking_cooldown,
     load_persisted_cooldown,
+    take_throttle_wait,
 )
 from csgo_api import search_items as search_csgo_items
+from http_session import close_session as close_http_session
 from pricing import (
     get_sticker_prices,
     ingest_manual_prices,
@@ -98,6 +102,9 @@ from storage import (
     set_watch_paused,
     all_watchlist_chat_ids,
     was_offer_sent_recently,
+    filter_new_offers,
+    mark_offers_sent,
+    get_all_chat_settings,
     SENT_OFFER_TTL_SECONDS,
     get_market_settings,
     set_market_setting,
@@ -135,6 +142,20 @@ DEFAULT_MAX_MARKUP = 7.0
 # лишних запросов не стоит, поэтому смысла ограничиваться дешёвыми лотами нет:
 # берём все 100 (это и есть максимум, который Steam вообще отдаёт за раз).
 FLOAT_CHECK_TOP_N = 100
+
+# Сколько предметов вотчлиста обрабатывать одновременно.
+#
+# Это НЕ разрешение слать в Steam чаще: темп запросов держит троттлинг в
+# steam_client, и он один на весь процесс. Смысл в другом — убрать простой.
+# Раньше цикл был строго последовательным: пауза 4 с, запрос, ответ, разбор,
+# шесть походов в Upstash, и только потом следующий предмет. Обязательными
+# были только 4 секунды, остальные 2-3 добавлялись сверху. Теперь пока по
+# одному предмету идёт разбор, запрос по следующему уже отправлен.
+#
+# Четырёх полос хватает с запасом: на паузе в 2 секунды и ~3 секундах работы
+# на предмет очередь заполняется двумя-тремя, четвёртая — про запас на случай
+# медленного ответа Steam.
+SCAN_CONCURRENCY = int(os.environ.get("SCAN_CONCURRENCY", "4"))
 
 # Ожидание выбора варианта после неоднозначного поиска по названию (несколько
 # степеней износа и т.п.) — chat_id -> {"results": [...], "min_value":..., "max_markup":...}
@@ -297,6 +318,52 @@ async def _get_defaults(chat_id: int) -> tuple[float, float]:
     if d is None:
         return DEFAULT_MIN_VALUE, DEFAULT_MAX_MARKUP
     return d["min_value"], d["max_markup"]
+
+
+class ScanSettings(NamedTuple):
+    """
+    Все настройки чата, которые нужны при отборе офферов, одним объектом.
+
+    Зачем: раньше _compute_offers дёргала пять отдельных геттеров
+    (get_streak_markup, get_sticker_ratio, get_price_filter, get_float_filter,
+    get_float_markup), и каждый уходил в Upstash отдельным HTTP-запросом за
+    ОДНИМ И ТЕМ ЖЕ JSON-блоком настроек. На прогоне вотчлиста в 110 предметов
+    это 550 запросов на ровном месте, причём выстроенных в цепочку: пока идёт
+    один, скан стоит.
+
+    Настройки за время прогона не меняются, поэтому читаются один раз в начале
+    (_load_scan_settings) и передаются вниз. Кто настройки не передал — прочтёт
+    их сам, но всё равно одним запросом вместо пяти.
+    """
+
+    min_value: float
+    max_markup: float
+    streak_markup: float | None
+    sticker_ratio: float | None
+    min_price: float | None
+    max_price: float | None
+    float_low: float | None
+    float_high: float | None
+    float_markup: float | None
+
+    @classmethod
+    def from_raw(cls, raw: dict) -> "ScanSettings":
+        return cls(
+            min_value=raw.get("min_value", DEFAULT_MIN_VALUE),
+            max_markup=raw.get("max_markup", DEFAULT_MAX_MARKUP),
+            streak_markup=raw.get("streak_markup"),
+            sticker_ratio=raw.get("sticker_ratio"),
+            min_price=raw.get("min_price"),
+            max_price=raw.get("max_price"),
+            float_low=raw.get("float_low_max"),
+            float_high=raw.get("float_high_min"),
+            float_markup=raw.get("float_markup_pct"),
+        )
+
+
+async def _load_scan_settings(chat_id: int) -> ScanSettings:
+    """Один поход в хранилище за всем блоком настроек чата."""
+    return ScanSettings.from_raw(await get_all_chat_settings(chat_id))
 
 
 def _split_args(args: list[str]) -> tuple[str, float | None, float | None]:
@@ -506,7 +573,7 @@ async def _compute_offers(
     *,
     check_stickers: bool = True,
     check_floats: bool = True,
-    request_interval: float | None = None,
+    settings: ScanSettings | None = None,
 ):
     """
     Общая логика для /scan, /scanfile и автоскана вотчлиста: цены стикеров -> офферы.
@@ -516,14 +583,21 @@ async def _compute_offers(
     за флоатом /floatadd), поэтому для конкретного предмета может быть нужно
     только одно из двух. Ручные /scan и /scanfile считают всё — там пользователь
     сам назвал предмет, значит интересно и то, и другое.
+
+    settings — уже прочитанные настройки чата. Прогон вотчлиста читает их один
+    раз на весь список и передаёт сюда; кто не передал, прочтёт сам (см.
+    ScanSettings — там же, зачем это вообще понадобилось).
     """
+    if settings is None:
+        settings = await _load_scan_settings(chat_id)
+    streak_markup = settings.streak_markup
+    sticker_ratio = settings.sticker_ratio
+    min_price, max_price = settings.min_price, settings.max_price
+    float_low, float_high = settings.float_low, settings.float_high
+    float_markup = settings.float_markup
+
     all_sticker_keys = {s for l in listings for s in l.stickers}
     sticker_prices = await get_sticker_prices(all_sticker_keys) if all_sticker_keys else {}
-    streak_markup = await get_streak_markup(chat_id)
-    sticker_ratio = await get_sticker_ratio(chat_id)
-    min_price, max_price = await get_price_filter(chat_id)
-    float_low, float_high = await get_float_filter(chat_id)
-    float_markup = await get_float_markup(chat_id)
 
     # Флоат для ОХОТЫ (фильтр) считаем только когда фильтр задан и предмет за
     # этим следит — незачем декодировать все лоты, если результат никому не
@@ -1276,9 +1350,30 @@ def _offer_key(market_hash_name: str, offer: Offer) -> str:
     return hashlib.sha1(basis.encode("utf-8")).hexdigest()
 
 
+class _ScanStats:
+    """
+    Разбивка времени прогона по фазам — чтобы оптимизировать по замеру, а не
+    по ощущениям. Суммы считаются по всем предметам, поэтому при параллельной
+    обработке они БОЛЬШЕ реального времени прогона: это нормально и как раз
+    показывает, сколько удалось наложить друг на друга.
+    """
+
+    __slots__ = ("steam", "compute", "send", "items", "failed")
+
+    def __init__(self) -> None:
+        self.steam = 0.0    # запрос листингов: пауза троттлинга + сеть
+        self.compute = 0.0  # цены стикеров, отбор офферов, дедуп (Upstash + CPU)
+        self.send = 0.0     # отправка сообщений в Telegram
+        self.items = 0
+        self.failed = 0
+
+
 async def _watchlist_scan_item(
     bot, chat_id: int, market_hash_name: str, min_value: float, max_markup: float,
     *, check_stickers: bool = True, check_floats: bool = True,
+    request_interval: float | None = None,
+    settings: ScanSettings | None = None,
+    stats: "_ScanStats | None" = None,
 ) -> bool:
     """
     Возвращает True, если нашлись НОВЫЕ офферы (не присылавшиеся этому чату
@@ -1287,36 +1382,55 @@ async def _watchlist_scan_item(
     обычного вотчлиста, из списка охоты за флоатом, или сразу из обоих.
     SteamRateLimited пробрасывается наверх — прогон должен остановиться целиком,
     а не продолжать долбить Steam остальными предметами во время бана.
+
+    request_interval — пауза между запросами к Steam (у ручного скана она
+    короче фоновой, см. MANUAL_REQUEST_INTERVAL).
     """
+    t0 = time.perf_counter()
     try:
-        listings = await fetch_all_listings(market_hash_name)
+        listings = await fetch_all_listings(market_hash_name, request_interval=request_interval)
     except SteamRateLimited:
         raise
     except Exception as e:
         log.warning("watchlist: %s (chat_id=%s): %s", market_hash_name, chat_id, e)
+        if stats is not None:
+            stats.steam += time.perf_counter() - t0
+            stats.failed += 1
         return False
 
+    t1 = time.perf_counter()
     offers, sticker_prices = await _compute_offers(
         chat_id, listings, min_value, max_markup,
         check_stickers=check_stickers, check_floats=check_floats,
+        settings=settings,
     )
-    if not offers:
-        return False  # автоскан молчит, если нечего показать — иначе спамил бы каждый тик
 
-    keys = [_offer_key(market_hash_name, o) for o in offers]
-    new_offers = [
-        o for o, key in zip(offers, keys) if not await was_offer_sent_recently(chat_id, key)
-    ]
-    if not new_offers:
-        return False  # всё это уже присылали этому чату за последние 5 часов
+    new_offers: list = []
+    if offers:
+        keys = [_offer_key(market_hash_name, o) for o in offers]
+        # Одним запросом на весь лот, а не по запросу на каждый оффер.
+        is_new = await filter_new_offers(chat_id, keys)
+        new_offers = [o for o, fresh in zip(offers, is_new) if fresh]
 
-    chunks = _format_offers_chunks(new_offers, sticker_prices, market_hash_name)
-    chunks[0] = f"🔔 {html_module.escape(market_hash_name)}\n\n{chunks[0]}"
-    for chunk in chunks:
-        await bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML", disable_web_page_preview=True)
-    for o in new_offers:
-        await mark_offer_sent(chat_id, _offer_key(market_hash_name, o))
-    return True
+    t2 = time.perf_counter()
+    sent = False
+    if new_offers:
+        chunks = _format_offers_chunks(new_offers, sticker_prices, market_hash_name)
+        chunks[0] = f"🔔 {html_module.escape(market_hash_name)}\n\n{chunks[0]}"
+        for chunk in chunks:
+            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML", disable_web_page_preview=True)
+        await mark_offers_sent(chat_id, [_offer_key(market_hash_name, o) for o in new_offers])
+        sent = True
+
+    if stats is not None:
+        stats.steam += t1 - t0
+        stats.compute += t2 - t1
+        stats.send += time.perf_counter() - t2
+        stats.items += 1
+
+    # Пусто — молчим: автоскан идёт постоянно, и сообщение «ничего не нашлось»
+    # на каждый предмет превратило бы его в спам.
+    return sent
 
 
 async def _run_watchlist_scan(
@@ -1352,25 +1466,76 @@ async def _run_watchlist_scan(
 
     _watchlist_running.add(chat_id)
     try:
-        min_value, max_markup = await _get_defaults(chat_id)
+        # Настройки чата — ОДИН раз на весь прогон, а не по пять запросов в
+        # Upstash на каждый предмет (см. ScanSettings).
+        settings = await _load_scan_settings(chat_id)
+        min_value, max_markup = settings.min_value, settings.max_markup
+
+        stats = _ScanStats()
+        started = time.perf_counter()
+        take_throttle_wait()  # обнуляем счётчик пауз перед прогоном
+
+        queue: asyncio.Queue = asyncio.Queue()
+        for entry in scan_plan:
+            queue.put_nowait(entry)
+
         found_any = False
-        for market_hash_name, check_stickers, check_floats in scan_plan:
-            try:
-                found = await _watchlist_scan_item(
-                    bot, chat_id, market_hash_name, min_value, max_markup,
-                    check_stickers=check_stickers, check_floats=check_floats,
-                    request_interval=request_interval,
-                )
-            except SteamRateLimited as e:
-                # Влетели в рейт-лимит Steam. Останавливаем весь прогон: каждая
-                # следующая попытка во время бана только продлевает его.
-                log.warning("watchlist: прогон chat_id=%s остановлен из-за рейт-лимита: %s", chat_id, e)
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"⏸ Автоскан остановлен на «{market_hash_name}»: {e}",
-                )
-                return found_any
-            found_any = found_any or found
+        # Первый пойманный рейт-лимит: (название предмета, исключение).
+        rate_limit_hit: list[tuple[str, SteamRateLimited]] = []
+
+        async def worker() -> None:
+            nonlocal found_any
+            while not rate_limit_hit:
+                try:
+                    market_hash_name, check_stickers, check_floats = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    found = await _watchlist_scan_item(
+                        bot, chat_id, market_hash_name, min_value, max_markup,
+                        check_stickers=check_stickers, check_floats=check_floats,
+                        request_interval=request_interval,
+                        settings=settings, stats=stats,
+                    )
+                except SteamRateLimited as e:
+                    # Влетели в рейт-лимит Steam. Останавливаем весь прогон:
+                    # каждая следующая попытка во время бана продлевает его.
+                    # Соседние воркеры увидят непустой rate_limit_hit и просто
+                    # не возьмут следующий предмет — уже отправленные запросы
+                    # отменой всё равно не вернуть, а новых не будет.
+                    if not rate_limit_hit:
+                        rate_limit_hit.append((market_hash_name, e))
+                    return
+                found_any = found_any or found
+
+        # Предметы идут параллельно, но темп запросов к Steam держит общий
+        # троттлинг (throttle_steam_request) — он отмеряет паузу от ОТПРАВКИ
+        # предыдущего запроса. То есть Steam видит ровно тот же один запрос в
+        # request_interval секунд, что и при последовательном обходе.
+        # Параллельность нужна не чтобы просить чаще, а чтобы не простаивать:
+        # пока по одному предмету идёт разбор ответа и походы в Upstash,
+        # запрос по следующему уже в пути.
+        workers = min(SCAN_CONCURRENCY, len(scan_plan))
+        await asyncio.gather(*(worker() for _ in range(workers)))
+
+        elapsed = time.perf_counter() - started
+        throttle_wait = take_throttle_wait()
+        log.info(
+            "watchlist: chat_id=%s прогон за %.1f с — предметов %d (ошибок %d), полос %d, пауза %.1f с. "
+            "Суммарно по фазам (идут внахлёст): Steam %.1f с (из них троттлинг %.1f с), "
+            "отбор+Upstash %.1f с, Telegram %.1f с",
+            chat_id, elapsed, stats.items, stats.failed, workers,
+            request_interval if request_interval is not None else MIN_REQUEST_INTERVAL,
+            stats.steam, throttle_wait, stats.compute, stats.send,
+        )
+
+        if rate_limit_hit:
+            market_hash_name, e = rate_limit_hit[0]
+            log.warning("watchlist: прогон chat_id=%s остановлен из-за рейт-лимита: %s", chat_id, e)
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"⏸ Автоскан остановлен на «{market_hash_name}»: {e}",
+            )
         return found_any
     finally:
         _watchlist_running.discard(chat_id)
@@ -1682,8 +1847,9 @@ async def _fill_steam_prices(listings) -> int:
     if not missing:
         return 0
 
-    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
-        prices = await get_csgotrader_price_details(session)
+    # Своей сессии тут не нужно: прайс-лист почти всегда отдаётся из памяти,
+    # а если всё-таки скачивается — берётся общая сессия процесса.
+    prices = await get_csgotrader_price_details()
     if not prices:
         log.warning("arb: прайс-лист csgotrader пуст — цену Steam подставить нечем")
         return 0
@@ -3628,6 +3794,7 @@ async def _run_with_webhook(app, token: str) -> bool:
         _tg_application = None
         await app.stop()
         await app.shutdown()
+        await close_http_session()
     return True
 
 

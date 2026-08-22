@@ -109,13 +109,41 @@ async def _download_catalog() -> dict[str, str]:
 
 
 def _load_cache() -> tuple[dict[str, str], float] | None:
-    if not CATALOG_CACHE_PATH.exists():
+    """
+    Дисковый кэш каталога, разобранный один раз на версию файла.
+
+    Раньше файл читался и парсился заново на каждый предмет прогона (через
+    get_catalog -> get_sticker_prices). Каталог обновляется раз в сутки, так
+    что смысла в этом не было никакого — см. тот же приём в pricing._read_json_memo.
+    """
+    stamp = _file_stamp(CATALOG_CACHE_PATH)
+    if stamp is None:
         return None
+
+    global _CACHE_MEMO
+    if _CACHE_MEMO is not None and _CACHE_MEMO[0] == stamp:
+        return _CACHE_MEMO[1]
+
     try:
         data = json.loads(CATALOG_CACHE_PATH.read_text(encoding="utf-8"))
-        return data["catalog"], data["updated_at"]
+        parsed = (data["catalog"], data["updated_at"])
     except Exception:
         return None
+
+    _CACHE_MEMO = (stamp, parsed)
+    return parsed
+
+
+def _file_stamp(path: Path) -> tuple[int, int] | None:
+    """(mtime в нс, размер) — отпечаток файла. None, если файла нет."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+_CACHE_MEMO: tuple[tuple[int, int], tuple[dict[str, str], float]] | None = None
 
 
 def _save_cache(catalog: dict[str, str]) -> None:

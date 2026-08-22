@@ -51,6 +51,7 @@ from dataclasses import dataclass, field
 
 import aiohttp
 
+from http_session import get_session
 from proxy_pool import ProxyPool, mask as mask_proxy
 import yarl
 
@@ -385,6 +386,19 @@ def raise_if_cooling_down(scope: str = "listings") -> None:
 _lane_locks: dict[str, asyncio.Lock] = {}
 _lane_last: dict[str, float] = {}
 
+# Сколько секунд суммарно простояли в паузе троттлинга с прошлого замера.
+# Нужно, чтобы в итогах прогона отличать «ждали Steam по нашему же расписанию»
+# от «Steam долго отвечал» — без этого разделения непонятно, что оптимизировать.
+_throttle_wait_seconds = 0.0
+
+
+def take_throttle_wait() -> float:
+    """Суммарная пауза троттлинга с прошлого вызова, в секундах (счётчик обнуляется)."""
+    global _throttle_wait_seconds
+    value = _throttle_wait_seconds
+    _throttle_wait_seconds = 0.0
+    return value
+
 
 async def throttle_steam_request(
     scope: str = "listings", lane: str = "", interval: float | None = None
@@ -402,8 +416,16 @@ async def throttle_steam_request(
     очередь была одна на процесс, пул прокси не давал никакого выигрыша в
     скорости — сколько бы адресов ни было, запросы всё равно выстраивались
     друг за другом по 4 секунды. С поадресной паузой N адресов дают N полос.
+
+    ВАЖНО для конвейера (bot._run_watchlist_scan): пауза отсчитывается от
+    момента ОТПРАВКИ предыдущего запроса, а не от получения ответа — отметка
+    _lane_last ставится здесь, до того как вызывающий код уйдёт в session.get.
+    Поэтому несколько предметов можно обрабатывать параллельно, и Steam всё
+    равно увидит ровно один запрос в interval секунд: лишние просто подождут
+    на этом локе. Параллельность убирает простой (разбор ответа, походы в
+    Upstash), но НЕ повышает нагрузку на Steam.
     """
-    global _last_request_at
+    global _last_request_at, _throttle_wait_seconds
     lock = _lane_locks.get(lane)
     if lock is None:
         lock = _lane_locks[lane] = asyncio.Lock()
@@ -411,6 +433,7 @@ async def throttle_steam_request(
         gap = MIN_REQUEST_INTERVAL if interval is None else interval
         wait = gap - (time.monotonic() - _lane_last.get(lane, 0.0))
         if wait > 0:
+            _throttle_wait_seconds += wait
             await asyncio.sleep(wait)
         now = time.monotonic()
         _lane_last[lane] = now
@@ -585,117 +608,121 @@ async def fetch_all_listings(
 
     raise_if_cooling_down()
 
-    async with aiohttp.ClientSession() as session:
-        # Прогревочного захода на страницу предмета здесь больше нет: он был
-        # добавлен под гипотезу "первый запрос холодной сессии отдаёт HTML",
-        # которая не подтвердилась (настоящей причиной был bMarketOptOut=1).
-        # А лишний запрос на каждый предмет — прямой путь к 429.
-        # route = None означает прямой запрос с адреса Render. На прокси
-        # переходим ТОЛЬКО после 429 — прямой маршрут бесплатен, и тратить
-        # платный трафик, пока он работает, незачем.
-        # Если прямой адрес уже на кулдауне — начинаем сразу с прокси, а не
-        # пробуем его «на всякий случай». Каждый такой запрос гарантированно
-        # получит 429 и ПРОДЛИТ реальный бан, то есть навредит дважды: и время
-        # потеряем, и выход из бана отодвинем.
-        route = None
-        if steam_cooldown_remaining("listings") > 0:
-            route = STEAM_POOL.next()
-            if route:
-                log.info(
-                    "fetch_all_listings: прямой адрес на кулдауне — начинаю сразу с %s",
-                    mask_proxy(route),
-                )
-        attempts_left = STEAM_LISTINGS_RETRY
-        start = 0
-        total_count = None
-        while total_count is None or start < total_count:
-            if max_listings is not None and start >= max_listings:
-                break
-            steam_url = render_url(market_hash_name, start)
-            final_url, params = _build_request(steam_url)
-            # Через прокси куку аккаунта НЕ шлём: steamLoginSecure привязан к
-            # сессии, и один логин, гуляющий по резидентным адресам, выглядит
-            # как кража сессии. Публичному /render/ логин не нужен, достаточно
-            # bMarketOptOut=1 (см. steam_cookie_header).
-            headers = (
-                _ajax_headers(market_hash_name)
-                if route
-                else _with_cookie(_ajax_headers(market_hash_name))
+    # Сессия общая на процесс (см. http_session), своя тут больше не поднимается.
+    # Раньше на каждый предмет заводилось новое TCP+TLS соединение к
+    # steamcommunity.com — два лишних round-trip'а перед каждым запросом, и
+    # так 110 раз за прогон. Теперь соединение переиспользуется.
+    session = get_session()
+    # Прогревочного захода на страницу предмета здесь больше нет: он был
+    # добавлен под гипотезу "первый запрос холодной сессии отдаёт HTML",
+    # которая не подтвердилась (настоящей причиной был bMarketOptOut=1).
+    # А лишний запрос на каждый предмет — прямой путь к 429.
+    # route = None означает прямой запрос с адреса Render. На прокси
+    # переходим ТОЛЬКО после 429 — прямой маршрут бесплатен, и тратить
+    # платный трафик, пока он работает, незачем.
+    # Если прямой адрес уже на кулдауне — начинаем сразу с прокси, а не
+    # пробуем его «на всякий случай». Каждый такой запрос гарантированно
+    # получит 429 и ПРОДЛИТ реальный бан, то есть навредит дважды: и время
+    # потеряем, и выход из бана отодвинем.
+    route = None
+    if steam_cooldown_remaining("listings") > 0:
+        route = STEAM_POOL.next()
+        if route:
+            log.info(
+                "fetch_all_listings: прямой адрес на кулдауне — начинаю сразу с %s",
+                mask_proxy(route),
             )
-            if route:
-                headers = {**headers, "Cookie": "bMarketOptOut=1"}
+    attempts_left = STEAM_LISTINGS_RETRY
+    start = 0
+    total_count = None
+    while total_count is None or start < total_count:
+        if max_listings is not None and start >= max_listings:
+            break
+        steam_url = render_url(market_hash_name, start)
+        final_url, params = _build_request(steam_url)
+        # Через прокси куку аккаунта НЕ шлём: steamLoginSecure привязан к
+        # сессии, и один логин, гуляющий по резидентным адресам, выглядит
+        # как кража сессии. Публичному /render/ логин не нужен, достаточно
+        # bMarketOptOut=1 (см. steam_cookie_header).
+        headers = (
+            _ajax_headers(market_hash_name)
+            if route
+            else _with_cookie(_ajax_headers(market_hash_name))
+        )
+        if route:
+            headers = {**headers, "Cookie": "bMarketOptOut=1"}
 
-            await throttle_steam_request(scope="listings", lane=route or "", interval=request_interval)
-            async with session.get(final_url, params=params, headers=headers, proxy=route) as resp:
-                if resp.status == 429:
-                    # Повторять с ТОГО ЖЕ адреса нельзя: у Steam 429 — это
-                    # временный бан IP, который каждая новая попытка продлевает.
-                    # А вот сменить адрес — можно и нужно: бан поадресный, и на
-                    # другом IP лимит свой.
-                    #
-                    # Раньше этой ветки не было вовсе: 429 обрывал весь скан и
-                    # ставил кулдаун на 30 минут с удвоением до шести часов,
-                    # хотя в пуле стояли свободные адреса.
-                    if route:
-                        STEAM_POOL.mark_exhausted(route, LISTINGS_PROXY_COOLDOWN, "Steam 429")
-                    next_route = STEAM_POOL.next() if attempts_left > 0 else None
-                    if next_route:
-                        attempts_left -= 1
-                        log.warning(
-                            "fetch_all_listings: 429 с маршрута %s — перехожу на %s "
-                            "и повторяю ту же страницу",
-                            mask_proxy(route) if route else "прямого",
-                            mask_proxy(next_route),
-                        )
-                        route = next_route
-                        continue
-
-                    # Свободных адресов не осталось — только теперь сдаёмся.
-                    seconds = await note_steam_429(scope="listings", headers=dict(resp.headers))
-                    raise SteamRateLimited(
-                        f"Steam ответил 429 (Too Many Requests) — это временный бан IP, "
-                        f"который продлевается от новых попыток, поэтому не ретраю. "
-                        f"Свободных прокси нет ({STEAM_POOL.describe()}). "
-                        f"Запросы к Steam приостановлены на {seconds / 60:.0f} мин."
+        await throttle_steam_request(scope="listings", lane=route or "", interval=request_interval)
+        async with session.get(final_url, params=params, headers=headers, proxy=route) as resp:
+            if resp.status == 429:
+                # Повторять с ТОГО ЖЕ адреса нельзя: у Steam 429 — это
+                # временный бан IP, который каждая новая попытка продлевает.
+                # А вот сменить адрес — можно и нужно: бан поадресный, и на
+                # другом IP лимит свой.
+                #
+                # Раньше этой ветки не было вовсе: 429 обрывал весь скан и
+                # ставил кулдаун на 30 минут с удвоением до шести часов,
+                # хотя в пуле стояли свободные адреса.
+                if route:
+                    STEAM_POOL.mark_exhausted(route, LISTINGS_PROXY_COOLDOWN, "Steam 429")
+                next_route = STEAM_POOL.next() if attempts_left > 0 else None
+                if next_route:
+                    attempts_left -= 1
+                    log.warning(
+                        "fetch_all_listings: 429 с маршрута %s — перехожу на %s "
+                        "и повторяю ту же страницу",
+                        mask_proxy(route) if route else "прямого",
+                        mask_proxy(next_route),
                     )
-                await note_steam_ok()
-                resp.raise_for_status()
+                    route = next_route
+                    continue
 
-                content_type = resp.headers.get("Content-Type", "")
-                log.info(
-                    "fetch_all_listings: start=%s -> HTTP %s, Content-Type=%r, итоговый URL=%s",
-                    start, resp.status, content_type, resp.url,
+                # Свободных адресов не осталось — только теперь сдаёмся.
+                seconds = await note_steam_429(scope="listings", headers=dict(resp.headers))
+                raise SteamRateLimited(
+                    f"Steam ответил 429 (Too Many Requests) — это временный бан IP, "
+                    f"который продлевается от новых попыток, поэтому не ретраю. "
+                    f"Свободных прокси нет ({STEAM_POOL.describe()}). "
+                    f"Запросы к Steam приостановлены на {seconds / 60:.0f} мин."
                 )
-                if "application/json" not in content_type:
-                    body = await resp.text()
-                    snippet = body[:300].replace("\n", " ").strip()
-                    if any(marker in body[:2000] for marker in _BETA_PAGE_MARKERS):
-                        # Самый частый и неочевидный случай: аккаунт, чьи куки
-                        # использует бот, включён в бета-тест новой торговой
-                        # площадки. Для беты /render/ перестаёт быть JSON-API и
-                        # отдаёт SSR-страницу — ни заголовки, ни прокси, ни смена
-                        # IP это не исправят, помогает только выход из бета-теста.
-                        raise RuntimeError(
-                            "Steam отдал HTML-страницу новой (бета) торговой площадки вместо JSON. "
-                            "Похоже, аккаунт, чьи куки заданы в STEAM_LOGIN_SECURE, включён в бета-тест "
-                            "Steam Market — для беты легаси-эндпоинт /render/ больше не отдаёт JSON. "
-                            "Зайди в браузере под ЭТИМ аккаунтом, нажми «Выйти из бета-теста торговой "
-                            "площадки», заново экспортируй куки и обнови их на Render. "
-                            f"Начало ответа: {snippet!r}"
-                        )
+            await note_steam_ok()
+            resp.raise_for_status()
+
+            content_type = resp.headers.get("Content-Type", "")
+            log.info(
+                "fetch_all_listings: start=%s -> HTTP %s, Content-Type=%r, итоговый URL=%s",
+                start, resp.status, content_type, resp.url,
+            )
+            if "application/json" not in content_type:
+                body = await resp.text()
+                snippet = body[:300].replace("\n", " ").strip()
+                if any(marker in body[:2000] for marker in _BETA_PAGE_MARKERS):
+                    # Самый частый и неочевидный случай: аккаунт, чьи куки
+                    # использует бот, включён в бета-тест новой торговой
+                    # площадки. Для беты /render/ перестаёт быть JSON-API и
+                    # отдаёт SSR-страницу — ни заголовки, ни прокси, ни смена
+                    # IP это не исправят, помогает только выход из бета-теста.
                     raise RuntimeError(
-                        f"Steam вернул не JSON, а {content_type!r}. "
+                        "Steam отдал HTML-страницу новой (бета) торговой площадки вместо JSON. "
+                        "Похоже, аккаунт, чьи куки заданы в STEAM_LOGIN_SECURE, включён в бета-тест "
+                        "Steam Market — для беты легаси-эндпоинт /render/ больше не отдаёт JSON. "
+                        "Зайди в браузере под ЭТИМ аккаунтом, нажми «Выйти из бета-теста торговой "
+                        "площадки», заново экспортируй куки и обнови их на Render. "
                         f"Начало ответа: {snippet!r}"
                     )
+                raise RuntimeError(
+                    f"Steam вернул не JSON, а {content_type!r}. "
+                    f"Начало ответа: {snippet!r}"
+                )
 
-                data = await resp.json()
+            data = await resp.json()
 
-            total_count = data.get("total_count", 0)
-            html = data.get("results_html", "")
-            listings.extend(_parse_listings_html(html))
+        total_count = data.get("total_count", 0)
+        html = data.get("results_html", "")
+        listings.extend(_parse_listings_html(html))
 
-            start += RENDER_COUNT
-            # паузы между страницами держит throttle_steam_request() выше
+        start += RENDER_COUNT
+        # паузы между страницами держит throttle_steam_request() выше
 
     return listings
 
