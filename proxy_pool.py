@@ -142,7 +142,11 @@ class ProxyPool:
         return max(0.0, self._cooldowns.get(proxy, 0.0) - time.time())
 
     def available(self) -> list[str]:
-        return [p for p in self.proxies if self.cooldown_remaining(p) <= 0]
+        # Мёртвые адреса (mark_dead) исключены наравне с адресами на кулдауне.
+        # Раньше dead влиял только на текст /proxycheck, а next()/available()
+        # его не читали вовсе — то есть "мёртвый" прокси всё равно продолжал
+        # получать реальные запросы и заново проваливаться на каждом из них.
+        return [p for p in self.proxies if p not in self.dead and self.cooldown_remaining(p) <= 0]
 
     def all_exhausted(self) -> bool:
         return self.enabled() and not self.available()
@@ -161,7 +165,7 @@ class ProxyPool:
         for _ in range(len(self.proxies)):
             proxy = self.proxies[self._cursor % len(self.proxies)]
             self._cursor += 1
-            if self.cooldown_remaining(proxy) <= 0:
+            if proxy not in self.dead and self.cooldown_remaining(proxy) <= 0:
                 return proxy
         return None
 

@@ -653,7 +653,59 @@ async def fetch_all_listings(
             headers = {**headers, "Cookie": "bMarketOptOut=1"}
 
         await throttle_steam_request(scope="listings", lane=route or "", interval=request_interval)
-        async with session.get(final_url, params=params, headers=headers, proxy=route) as resp:
+        resp_ctx = session.get(final_url, params=params, headers=headers, proxy=route)
+        try:
+            resp = await resp_ctx.__aenter__()
+        except aiohttp.ClientError as e:
+            # Прокси не смог даже соединиться (или сам отверг CONNECT — вот
+            # ровно так и выглядел разбор 2026-08-22: ClientHttpProxyError 403
+            # от flameproxies, когда протухли/заблокировали разом ВСЕ его
+            # сессии). Это НЕ ответ Steam, а поломка транспорта, но раньше сюда
+            # не было отдельной ветки — исключение улетало наверх, ловилось
+            # общим except Exception в _watchlist_scan_item, и предмет просто
+            # тихо пропускался. Из-за этого следующий предмет каждый раз
+            # начинал заново с прямого адреса, СНОВА ловил 429 у Steam и
+            # СНОВА продлевал реальный бан — а формального SteamRateLimited
+            # (и связанного с ним кулдауна) никогда не возникало, потому что
+            # STEAM_POOL.next() исправно находил "свободный" (на деле мёртвый)
+            # прокси и код был уверен, что альтернативы ещё остались.
+            #
+            # Теперь ведём себя как при 429: пробуем следующий адрес, а если
+            # адресов не осталось — сдаёмся организованно.
+            if route:
+                status = getattr(e, "status", None)
+                if status == 403:
+                    # 403 — это отказ авторизации самого прокси-сервиса
+                    # (просрочка/бан аккаунта), а не разовая сетевая заминка.
+                    # Повторные попытки на этот же адрес ничего не изменят.
+                    STEAM_POOL.mark_dead(route, f"прокси вернул 403: {e}")
+                else:
+                    STEAM_POOL.mark_exhausted(route, LISTINGS_PROXY_COOLDOWN, f"ошибка соединения: {e}")
+            next_route = STEAM_POOL.next() if attempts_left > 0 else None
+            if next_route:
+                attempts_left -= 1
+                log.warning(
+                    "fetch_all_listings: маршрут %s не работает (%s) — перехожу на %s "
+                    "и повторяю ту же страницу",
+                    mask_proxy(route) if route else "прямой", e, mask_proxy(next_route),
+                )
+                route = next_route
+                continue
+
+            seconds = await note_steam_429(scope="listings", headers={})
+            raise SteamRateLimited(
+                f"Прокси-маршруты не работают ({e}), альтернатив не осталось "
+                f"({STEAM_POOL.describe()}). Запросы к Steam приостановлены на "
+                f"{seconds / 60:.0f} мин, чтобы не долбить прямой адрес и не продлевать его бан."
+            )
+
+        # Дальше — та же логика, что раньше жила под "async with session.get(...)
+        # as resp:". Теперь вход в контекст-менеджер и обработку ошибки
+        # соединения пришлось развести руками (чтобы поймать именно сбой
+        # СОЕДИНЕНИЯ, а не ответ Steam), поэтому выход из него — тоже руками,
+        # но так же надёжно: finally срабатывает и на "continue" (смена
+        # маршрута), и на "raise" (сдаёмся), и при обычном успехе.
+        try:
             if resp.status == 429:
                 # Повторять с ТОГО ЖЕ адреса нельзя: у Steam 429 — это
                 # временный бан IP, который каждая новая попытка продлевает.
@@ -716,6 +768,8 @@ async def fetch_all_listings(
                 )
 
             data = await resp.json()
+        finally:
+            await resp_ctx.__aexit__(None, None, None)
 
         total_count = data.get("total_count", 0)
         html = data.get("results_html", "")
