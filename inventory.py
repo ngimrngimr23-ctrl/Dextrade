@@ -32,11 +32,14 @@ from dataclasses import dataclass
 import aiohttp
 
 from http_session import get_session
+from proxy_pool import mask as mask_proxy
 from steam_client import (
+    STEAM_POOL,
     SteamRateLimited,
     note_steam_429,
     note_steam_ok,
     raise_if_cooling_down,
+    steam_cooldown_remaining,
     throttle_steam_request,
 )
 
@@ -51,6 +54,13 @@ PAGE_SIZE = 2000
 # Предохранитель от бесконечного листания, если Steam будет отдавать more_items
 # без движения курсора. Инвентарей больше 20 000 предметов не бывает.
 MAX_PAGES = 10
+
+# Сколько раз сменить адрес, прежде чем признать поражение.
+INVENTORY_RETRY = 3
+# На сколько откладывать адрес, получивший 429/сбой на инвентаре. Коротко: у
+# резидентных прокси адрес ротируется, и длинный кулдаун бил бы по своим
+# (см. steam_client.LISTINGS_PROXY_COOLDOWN — там та же история).
+PROXY_COOLDOWN_SECONDS = 60
 
 _STEAMID64_RE = re.compile(r"^7656\d{13}$")
 _PROFILE_URL_RE = re.compile(r"steamcommunity\.com/profiles/(7656\d{13})")
@@ -148,19 +158,44 @@ async def fetch_inventory(steamid: str) -> list[InventoryItem]:
     total_assets = 0
     skipped_unmarketable = 0
 
-    for page in range(MAX_PAGES):
+    # Маршрут. /inventory/ у Steam зарезан заметно жёстче остальных эндпоинтов
+    # и с датацентрового адреса Render отдаёт 429 даже на первом запросе за час
+    # — поэтому, в отличие от листингов, здесь имеет смысл сразу иметь наготове
+    # запасной адрес. Логика та же, что в steam_client.fetch_all_listings: идём
+    # напрямую (бесплатно), а на 429 переходим на прокси и повторяем ТУ ЖЕ
+    # страницу. Куки не шлём вообще: эндпоинт публичный, логин ему не нужен.
+    route = None
+    if steam_cooldown_remaining("inventory") > 0:
+        route = STEAM_POOL.next()
+    attempts_left = INVENTORY_RETRY
+
+    page = 0
+    while page < MAX_PAGES:
         params: dict[str, str | int] = {"l": "english", "count": PAGE_SIZE}
         if start_assetid:
             params["start_assetid"] = start_assetid
 
-        await throttle_steam_request(scope="inventory")
+        await throttle_steam_request(scope="inventory", lane=route or "")
         try:
-            async with session.get(url, params=params) as resp:
+            async with session.get(url, params=params, proxy=route) as resp:
                 if resp.status == 429:
+                    if route:
+                        STEAM_POOL.mark_exhausted(route, PROXY_COOLDOWN_SECONDS, "Steam 429 на инвентаре")
+                    next_route = STEAM_POOL.next() if attempts_left > 0 else None
+                    if next_route:
+                        attempts_left -= 1
+                        log.warning(
+                            "inventory: 429 с маршрута %s — перехожу на %s и повторяю ту же страницу",
+                            mask_proxy(route) if route else "прямого", mask_proxy(next_route),
+                        )
+                        route = next_route
+                        continue
                     seconds = await note_steam_429(scope="inventory", headers=dict(resp.headers))
                     raise SteamRateLimited(
-                        f"Steam ответил 429 на инвентарь — это временный бан IP, "
-                        f"запросы приостановлены на {seconds / 60:.0f} мин."
+                        f"Steam ответил 429 на инвентарь и свободных прокси не осталось "
+                        f"({STEAM_POOL.describe()}). Проверка инвентаря приостановлена на "
+                        f"{seconds / 60:.0f} мин. Остальные сканы это не затрагивает — "
+                        f"у /inventory/ свой, гораздо более жёсткий лимит."
                     )
                 if resp.status in (401, 403):
                     # Самая частая причина, и она не чинится ни ретраем, ни прокси.
@@ -179,8 +214,26 @@ async def fetch_inventory(steamid: str) -> list[InventoryItem]:
                     raise InventoryError(f"Steam ответил HTTP {resp.status} на запрос инвентаря.")
                 data = await resp.json(content_type=None)
         except aiohttp.ClientError as e:
+            # Сбой САМОГО прокси (в т.ч. ClientHttpProxyError 403 от провайдера,
+            # отключившего аккаунт) — не ответ Steam. Ведём себя как при 429:
+            # пробуем следующий адрес, и только исчерпав пул сдаёмся.
+            if route:
+                if getattr(e, "status", None) == 403:
+                    STEAM_POOL.mark_dead(route, f"прокси вернул 403: {e}")
+                else:
+                    STEAM_POOL.mark_exhausted(route, PROXY_COOLDOWN_SECONDS, f"ошибка соединения: {e}")
+                next_route = STEAM_POOL.next() if attempts_left > 0 else None
+                if next_route:
+                    attempts_left -= 1
+                    log.warning(
+                        "inventory: маршрут %s не работает (%s) — перехожу на %s",
+                        mask_proxy(route), e, mask_proxy(next_route),
+                    )
+                    route = next_route
+                    continue
             raise InventoryError(f"Сетевая ошибка при запросе инвентаря: {e}") from None
 
+        page += 1
         if not data or not data.get("success"):
             # success=0 приходит и на закрытый инвентарь, и на пустой — Steam их
             # не различает, поэтому и в тексте называем оба варианта.
@@ -224,8 +277,8 @@ async def fetch_inventory(steamid: str) -> list[InventoryItem]:
             log.warning("inventory: Steam просит листать дальше, но курсор не двигается — останавливаюсь")
             break
         start_assetid = str(next_cursor)
-    else:
-        log.warning("inventory: упёрся в MAX_PAGES=%d, часть инвентаря могла не попасть", MAX_PAGES)
+        if page >= MAX_PAGES:
+            log.warning("inventory: упёрся в MAX_PAGES=%d, часть инвентаря могла не попасть", MAX_PAGES)
 
     log.info(
         "inventory: %s — предметов всего %d, продаваемых уникальных %d (пропущено непродаваемых %d)",

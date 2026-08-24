@@ -155,6 +155,18 @@ _cooldowns: dict[str, dict] = {}
 # а узнать о ещё не созданных состояниях из _cooldowns нельзя.
 KNOWN_SCOPES = ("listings", "pricing", "inventory")
 
+# Области, чей 429 НЕ придерживает остальные (см. _apply_collateral_cooldown).
+#
+# Общее правило — «бан у Steam по IP, а не по эндпоинту», и для листингов с
+# priceoverview оно подтвердилось. Но /inventory/ из этого правила выпадает:
+# он режется несопоставимо жёстче всего остального, и 429 там прилетает даже
+# на первом запросе за час с датацентрового адреса. Считать это признаком
+# общего бана по IP нельзя — иначе одна проверка инвентаря раз в час
+# останавливала бы вотчлист и /markets на полчаса, чего и близко не требуется.
+#
+# Обратное направление сохраняется: 429 на листингах инвентарь придержит.
+COLLATERAL_EXEMPT_SCOPES = ("inventory",)
+
 
 def _cooldown_state(scope: str) -> dict:
     return _cooldowns.setdefault(
@@ -327,7 +339,19 @@ async def _apply_collateral_cooldown(banned_scope: str) -> None:
     Придержать остальные области после 429 — бан у Steam по IP, а не по эндпоинту.
     Счётчик 429 подряд им НЕ трогаем: он отражает "сколько раз эта область
     провинилась", а она не провинилась.
+
+    Исключение — COLLATERAL_EXEMPT_SCOPES: у /inventory/ лимит настолько
+    жёстче остальных, что его 429 ничего не говорит про доступность прочих
+    эндпоинтов, и тормозить из-за него весь бот неправильно.
     """
+    if banned_scope in COLLATERAL_EXEMPT_SCOPES:
+        log.info(
+            "Steam: 429 в области %s остальных не придерживает — у этого эндпоинта "
+            "свой, гораздо более жёсткий лимит",
+            banned_scope,
+        )
+        return
+
     until = time.time() + COOLDOWN_AFTER_429_SECONDS
     for other in KNOWN_SCOPES:
         if other == banned_scope:
