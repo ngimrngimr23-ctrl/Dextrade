@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from typing import NamedTuple
 from urllib.parse import urlsplit, urlunsplit
 
 log = logging.getLogger("steam_bot.proxy")
@@ -67,6 +68,24 @@ def validate(url: str) -> str | None:
     return None
 
 
+class AddResult(NamedTuple):
+    """
+    Итог добавления адресов. Три исхода различаются намеренно: «добавлено»,
+    «уже были» и «не приняты» требуют от пользователя совершенно разных
+    действий, а сведённые в одно число они выглядят как невесть откуда взявшийся
+    лимит.
+    """
+
+    added: int
+    duplicates: int
+    rejected: list[tuple[str, str]]
+
+    @property
+    def seen(self) -> int:
+        """Сколько адресов вообще разобрано из присланного текста."""
+        return self.added + self.duplicates + len(self.rejected)
+
+
 class ProxyPool:
     """
     Набор равноправных прокси с перебором по кругу.
@@ -105,15 +124,21 @@ class ProxyPool:
         # (через add()), пришло из /proxyadd и может быть убрано тем же путём.
         self._base = frozenset(self.proxies)
 
-    def add(self, raw: str) -> tuple[int, list[tuple[str, str]]]:
+    def add(self, raw: str) -> AddResult:
         """
-        Добавить адреса на ходу. Возвращает (сколько добавлено, что не приняли).
+        Добавить адреса на ходу. Ограничения на количество нет.
 
         Нужно, чтобы пополнять пул командой из Telegram, а не передеплоем ради
-        каждого нового адреса. Дубликаты отбрасываются молча: при копировании
-        списками они неизбежны, и падать из-за них незачем.
+        каждого нового адреса. Дубликаты по-прежнему отбрасываются (при
+        копировании списками они неизбежны), но теперь СЧИТАЮТСЯ и попадают в
+        ответ. Раньше они пропадали молча, и это прямо вводило в заблуждение:
+        вставив двадцать адресов, из которых тринадцать уже были в пуле,
+        пользователь видел «Добавлено: 7» и делал вывод, что бот дальше семи
+        не пускает. Никакого потолка не было — просто отчёт умалчивал о
+        половине разобранного.
         """
         added = 0
+        duplicates = 0
         rejected: list[tuple[str, str]] = []
         for candidate in _SPLIT_RE.split(raw or ""):
             candidate = candidate.strip()
@@ -123,10 +148,12 @@ class ProxyPool:
             if problem:
                 rejected.append((mask(candidate), problem))
                 continue
-            if candidate not in self.proxies:
-                self.proxies.append(candidate)
-                added += 1
-        return added, rejected
+            if candidate in self.proxies:
+                duplicates += 1
+                continue
+            self.proxies.append(candidate)
+            added += 1
+        return AddResult(added=added, duplicates=duplicates, rejected=rejected)
 
     def from_env(self) -> list[str]:
         """Адреса, пришедшие из переменной окружения (пережившие все add/remove)."""

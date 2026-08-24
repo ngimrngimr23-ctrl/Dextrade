@@ -103,7 +103,21 @@ STEAM_POOL = ProxyPool(
 )
 
 # Сколько раз сменить адрес, прежде чем признать поражение на одном предмете.
-STEAM_LISTINGS_RETRY = int(os.environ.get("STEAM_LISTINGS_RETRY", "3"))
+#
+# 0 (по умолчанию) означает «по размеру пула, но не больше STEAM_RETRY_HARD_CAP».
+# Раньше здесь стояла жёсткая тройка, и она незаметно обесценивала большой пул:
+# сколько бы адресов ни добавили, на одном предмете пробовались ровно три, а
+# остальные простаивали. Потолок всё же нужен — перебирать полсотни адресов
+# ради одного предмета дороже, чем отложить предмет до следующего прогона.
+STEAM_RETRY_HARD_CAP = int(os.environ.get("STEAM_RETRY_HARD_CAP", "10"))
+STEAM_LISTINGS_RETRY = int(os.environ.get("STEAM_LISTINGS_RETRY", "0"))
+
+
+def listings_retry_budget() -> int:
+    """Сколько смен адреса позволить на одном предмете — с учётом размера пула."""
+    if STEAM_LISTINGS_RETRY > 0:
+        return STEAM_LISTINGS_RETRY
+    return max(1, min(len(STEAM_POOL), STEAM_RETRY_HARD_CAP))
 
 # На сколько откладывать адрес, получивший 429 на листингах. Коротко: адреса
 # резидентные и ротируемые (проверено /proxycheck), поэтому длинный кулдаун
@@ -656,7 +670,7 @@ async def fetch_all_listings(
                 "fetch_all_listings: прямой адрес на кулдауне — начинаю сразу с %s",
                 mask_proxy(route),
             )
-    attempts_left = STEAM_LISTINGS_RETRY
+    attempts_left = listings_retry_budget()
     start = 0
     total_count = None
     while total_count is None or start < total_count:

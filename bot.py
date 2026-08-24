@@ -165,6 +165,12 @@ FLOAT_CHECK_TOP_N = 100
 # медленного ответа Steam.
 SCAN_CONCURRENCY = int(os.environ.get("SCAN_CONCURRENCY", "4"))
 
+# /proxycheck: сколько адресов проверять одновременно и до скольких печатать
+# построчный список. Ограничения нужны только для больших пулов — само
+# количество прокси ничем не ограничено.
+PROXYCHECK_CONCURRENCY = int(os.environ.get("PROXYCHECK_CONCURRENCY", "10"))
+PROXYCHECK_DETAIL_LIMIT = int(os.environ.get("PROXYCHECK_DETAIL_LIMIT", "20"))
+
 # Ожидание выбора варианта после неоднозначного поиска по названию (несколько
 # степеней износа и т.п.) — chat_id -> {"results": [...], "min_value":..., "max_markup":...}
 _pending_search: dict[int, dict] = {}
@@ -2842,11 +2848,18 @@ async def proxyadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    raw = " ".join(context.args)
-    added_cs, rejected = csfloat_client.CSFLOAT_POOL.add(raw)
-    added_steam, _ = STEAM_POOL.add(raw)
+    # Берём ВЕСЬ текст сообщения, а не context.args. PTB режет аргументы по
+    # пробелам, и при вставке длинного списка это лишний проход, который на
+    # многострочном тексте легко теряет разделители. Пулу же всё равно — он
+    # сам режет по запятым, пробелам и переводам строк.
+    text = update.message.text or ""
+    raw = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
 
-    if added_cs or added_steam:
+    result = csfloat_client.CSFLOAT_POOL.add(raw)
+    STEAM_POOL.add(raw)
+    added_cs, rejected = result.added, result.rejected
+
+    if added_cs or result.duplicates:
         # Сохраняем ТОЛЬКО добавленное через бота (pool.extra()), а не весь пул.
         # Раньше цикл шёл по всем proxies подряд и утаскивал в хранилище заодно
         # адреса из переменной окружения. Последствие было обидное: /proxyclear
@@ -2854,12 +2867,23 @@ async def proxyadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # чистил дубли env-адресов, которые всё равно вернулись бы при старте.
         await save_extra_proxies(csfloat_client.CSFLOAT_POOL.extra())
 
-    lines = [f"✅ Добавлено адресов: {added_cs}"]
+    # Отчитываемся по всем трём исходам. Сведённые в одно число «добавлено», они
+    # выглядят как лимит, которого нет: вставил двадцать, семь новых — и кажется,
+    # что бот больше семи не берёт.
+    lines = [f"Разобрано адресов: {result.seen}"]
+    lines.append(f"  ✅ добавлено: {result.added}")
+    if result.duplicates:
+        lines.append(f"  ↩️ уже были в пуле: {result.duplicates}")
     if rejected:
-        lines.append(f"\n⚠️ Не приняты ({len(rejected)}):")
+        lines.append(f"  ⚠️ не приняты: {len(rejected)}")
         for masked, problem in rejected[:5]:
-            lines.append(f"  {masked} — {problem}")
-    lines.append(f"\nВсего в пуле: {len(csfloat_client.CSFLOAT_POOL)}")
+            lines.append(f"      {masked} — {problem}")
+        if len(rejected) > 5:
+            lines.append(f"      …и ещё {len(rejected) - 5}")
+    lines.append(f"\nВсего в пуле: {len(csfloat_client.CSFLOAT_POOL)} (предела нет)")
+    lines.append(
+        "Не влезло в одно сообщение — шли следующей командой, адреса складываются."
+    )
     lines.append("Проверить их: /proxycheck")
     await update.message.reply_text("\n".join(lines))
 
@@ -2949,37 +2973,48 @@ async def proxycheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data = await resp.json(content_type=None)
             return data.get("ip")
 
+    # Ограничиваем одновременность: на полусотне адресов безоглядный gather дал
+    # бы сотню параллельных запросов к ipify, и он сам начал бы отвечать
+    # отказом — проверка врала бы про «мёртвые» прокси, которые на деле живы.
+    gate = asyncio.Semaphore(PROXYCHECK_CONCURRENCY)
+
     async def one(proxy: str):
         # Спрашиваем ДВАЖДЫ. Один замер говорит только «адрес такой-то», а нам
         # нужно знать другое: закреплён он за логином или меняется на каждый
         # запрос. От этого зависит вся стратегия кулдаунов — при ротации
         # откладывать логин после 429 бессмысленно, потому что банится адрес, а
         # в следующий раз за тем же логином будет уже другой.
-        try:
-            async with aiohttp.ClientSession() as session:
-                first = await ask_ip(session, proxy)
-                second = await ask_ip(session, proxy)
-                return proxy, first, second, None
-        except Exception as e:
-            return proxy, None, None, f"{type(e).__name__}: {e}"
+        async with gate:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    first = await ask_ip(session, proxy)
+                    second = await ask_ip(session, proxy)
+                    return proxy, first, second, None
+            except Exception as e:
+                return proxy, None, None, f"{type(e).__name__}: {e}"
 
     results = await asyncio.gather(*(one(p) for p in pool.proxies))
 
     ips: dict[str, int] = {}
     rotating = 0
-    lines = ["<b>Исходящие адреса прокси</b>"]
+    # Построчный список адресов печатаем только у небольшого пула. На полусотне
+    # он всё равно не влезет в сообщение Telegram, а главное — не нужен:
+    # там важны итоги (сколько живых, сколько разных IP), а не портянка.
+    detailed = len(results) <= PROXYCHECK_DETAIL_LIMIT
+    lines = ["<b>Исходящие адреса прокси</b>"] if detailed else []
     for proxy, first, second, error in results:
         if first:
             ips[first] = ips.get(first, 0) + 1
             if second and second != first:
                 rotating += 1
-                lines.append(
-                    f"  {proxy_pool.mask(proxy)} → <code>{first}</code>, "
-                    f"потом <code>{second}</code> ⟳"
-                )
-            else:
+                if detailed:
+                    lines.append(
+                        f"  {proxy_pool.mask(proxy)} → <code>{first}</code>, "
+                        f"потом <code>{second}</code> ⟳"
+                    )
+            elif detailed:
                 lines.append(f"  {proxy_pool.mask(proxy)} → <code>{first}</code> (держится)")
-        else:
+        elif detailed:
             lines.append(f"  {proxy_pool.mask(proxy)} → ⚠️ {html_module.escape(error or 'нет ответа')}")
 
     working = len(ips)
@@ -3031,7 +3066,15 @@ async def proxycheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 + ", ".join(f"<code>{ip}</code> ×{n}" for ip, n in duplicates.items())
             )
 
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    if not detailed:
+        lines.insert(
+            0,
+            f"<b>Исходящие адреса прокси</b>\n<i>Адресов {len(results)} — построчный "
+            f"список опущен, показываю итоги.</i>",
+        )
+    # Даже с опущенным списком сообщение может не влезть, если много разных IP.
+    for chunk in _chunk_lines(lines):
+        await update.message.reply_text(chunk, parse_mode="HTML")
 
 
 async def setmarkets(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3903,11 +3946,12 @@ async def _on_startup(app: Application):
         stored_proxies = []
     if stored_proxies:
         raw = " ".join(stored_proxies)
-        added_cs, _ = csfloat_client.CSFLOAT_POOL.add(raw)
-        added_steam, _ = STEAM_POOL.add(raw)
+        cs_result = csfloat_client.CSFLOAT_POOL.add(raw)
+        steam_result = STEAM_POOL.add(raw)
         log.info(
-            "прокси: из хранилища добавлено %d в пул CSFloat и %d в пул Steam",
-            added_cs, added_steam,
+            "прокси: из хранилища добавлено %d в пул CSFloat и %d в пул Steam "
+            "(разобрано %d, дубликатов %d)",
+            cs_result.added, steam_result.added, cs_result.seen, cs_result.duplicates,
         )
 
     if csfloat_client.csfloat_enabled():
