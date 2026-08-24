@@ -718,9 +718,10 @@ async def fetch_all_listings(
 
             seconds = await note_steam_429(scope="listings", headers={})
             raise SteamRateLimited(
-                f"Прокси-маршруты не работают ({e}), альтернатив не осталось "
-                f"({STEAM_POOL.describe()}). Запросы к Steam приостановлены на "
-                f"{seconds / 60:.0f} мин, чтобы не долбить прямой адрес и не продлевать его бан."
+                f"Прокси не пропускают запрос: {STEAM_POOL.failure_hint()}.\n"
+                f"Последний ответ: {e}\n"
+                f"Запросы к Steam приостановлены на {seconds / 60:.0f} мин, чтобы не "
+                f"долбить прямой адрес и не продлевать его бан."
             )
 
         # Дальше — та же логика, что раньше жила под "async with session.get(...)

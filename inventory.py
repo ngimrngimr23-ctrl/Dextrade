@@ -231,6 +231,13 @@ async def fetch_inventory(steamid: str) -> list[InventoryItem]:
                     )
                     route = next_route
                     continue
+                # Называть отказ прокси «сетевой ошибкой» — значит отправить
+                # человека искать поломку не там: HTTP 403 от прокси-сервиса
+                # это отказ в обслуживании, а не сбой сети.
+                raise InventoryError(
+                    f"Прокси не пропускают запрос: {STEAM_POOL.failure_hint()}.\n"
+                    f"Последний ответ: {e}"
+                ) from None
             raise InventoryError(f"Сетевая ошибка при запросе инвентаря: {e}") from None
 
         page += 1

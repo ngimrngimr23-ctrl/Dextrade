@@ -983,8 +983,8 @@ async def fetch_listings_page(
             )
             if attempt >= max_attempts:
                 raise CSFloatError(
-                    f"Не удалось получить страницу: адреса подряд рвут соединение "
-                    f"({broke}). Свободных адресов: {CSFLOAT_POOL.describe()}"
+                    f"Прокси не пропускают запрос: {CSFLOAT_POOL.failure_hint()}.\n"
+                    f"Последний ответ: {broke}"
                 ) from None
             # Адрес уже помечен, следующий заход возьмёт другой — паузы не надо.
             continue
