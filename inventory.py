@@ -210,6 +210,7 @@ async def fetch_inventory(steamid: str) -> list[InventoryItem]:
                         "и начинается с 7656."
                     )
                 await note_steam_ok(scope="inventory")
+                STEAM_POOL.mark_ok(route)  # прошло — забываем прошлые отказы адреса
                 if resp.status != 200:
                     raise InventoryError(f"Steam ответил HTTP {resp.status} на запрос инвентаря.")
                 data = await resp.json(content_type=None)
@@ -219,7 +220,7 @@ async def fetch_inventory(steamid: str) -> list[InventoryItem]:
             # пробуем следующий адрес, и только исчерпав пул сдаёмся.
             if route:
                 if getattr(e, "status", None) == 403:
-                    STEAM_POOL.mark_dead(route, f"прокси вернул 403: {e}")
+                    STEAM_POOL.mark_refused(route, PROXY_COOLDOWN_SECONDS, f"HTTP 403: {e}")
                 else:
                     STEAM_POOL.mark_exhausted(route, PROXY_COOLDOWN_SECONDS, f"ошибка соединения: {e}")
                 next_route = STEAM_POOL.next() if attempts_left > 0 else None

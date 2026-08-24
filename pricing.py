@@ -565,7 +565,7 @@ async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict
         if proxy:
             status = getattr(e, "status", None)
             if status == 403:
-                STEAM_POOL.mark_dead(proxy, f"прокси вернул 403: {e}")
+                STEAM_POOL.mark_refused(proxy, STEAM_PROXY_COOLDOWN_SECONDS, f"HTTP 403: {e}")
             else:
                 STEAM_POOL.mark_exhausted(proxy, STEAM_PROXY_COOLDOWN_SECONDS, f"ошибка соединения: {e}")
         log.warning(
@@ -594,6 +594,8 @@ async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict
                 await note_steam_429(scope="pricing", headers=dict(resp.headers))
             raise RateLimited()
         await note_steam_ok(scope="pricing")
+        # Запрос прошёл — сбрасываем накопленные отказы этого адреса.
+        STEAM_POOL.mark_ok(proxy)
         if resp.status != 200:
             log.warning("%s: HTTP %s для запроса %r", label, resp.status, params.get("query") or params.get("market_hash_name"))
             return None

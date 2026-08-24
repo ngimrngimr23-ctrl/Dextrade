@@ -702,7 +702,7 @@ async def fetch_all_listings(
                     # 403 — это отказ авторизации самого прокси-сервиса
                     # (просрочка/бан аккаунта), а не разовая сетевая заминка.
                     # Повторные попытки на этот же адрес ничего не изменят.
-                    STEAM_POOL.mark_dead(route, f"прокси вернул 403: {e}")
+                    STEAM_POOL.mark_refused(route, LISTINGS_PROXY_COOLDOWN, f"HTTP 403: {e}")
                 else:
                     STEAM_POOL.mark_exhausted(route, LISTINGS_PROXY_COOLDOWN, f"ошибка соединения: {e}")
             next_route = STEAM_POOL.next() if attempts_left > 0 else None
@@ -763,6 +763,7 @@ async def fetch_all_listings(
                     f"Запросы к Steam приостановлены на {seconds / 60:.0f} мин."
                 )
             await note_steam_ok()
+            STEAM_POOL.mark_ok(route)
             resp.raise_for_status()
 
             content_type = resp.headers.get("Content-Type", "")

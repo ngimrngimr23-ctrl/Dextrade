@@ -82,6 +82,8 @@ class ProxyPool:
         self.problems: list[tuple[str, str]] = []  # (замаскированный адрес, что не так)
         self._cooldowns: dict[str, float] = {}
         self.dead: dict[str, str] = {}
+        # Отказы подряд по каждому адресу — см. mark_refused/mark_ok.
+        self._refusals: dict[str, int] = {}
         self._cursor = 0
 
         for candidate in _SPLIT_RE.split(raw or ""):
@@ -171,6 +173,52 @@ class ProxyPool:
             self.dead.pop(p, None)
         return len(to_remove)
 
+    # Сколько отказов подряд терпим, прежде чем счесть адрес нерабочим.
+    # Меньше трёх ставить нельзя: у 403 полно ВРЕМЕННЫХ причин (лимит
+    # одновременных сессий, протухшая sticky-сессия, разовый сбой на стороне
+    # провайдера), и хоронить адрес с первого раза — значит выключать рабочий
+    # прокси навсегда из-за минутной заминки. Ровно это и случилось
+    # 2026-08-23: единственный живой адрес пользователя получил один 403 и
+    # был вычеркнут до перезапуска процесса.
+    REFUSALS_BEFORE_DEAD = 3
+
+    def mark_refused(self, proxy: str, cooldown_seconds: float, reason: str = "") -> bool:
+        """
+        Прокси отказал в обслуживании (403/407 на CONNECT).
+
+        Первые отказы трактуем как временные — адрес уходит на кулдаун и
+        вернётся сам. Только когда отказы идут подряд REFUSALS_BEFORE_DEAD раз,
+        признаём адрес нерабочим: тогда это уже похоже на настоящую проблему с
+        доступом, а не на заминку.
+
+        Возвращает True, если адрес признан мёртвым.
+        """
+        if not proxy:
+            return False
+        count = self._refusals.get(proxy, 0) + 1
+        self._refusals[proxy] = count
+        if count >= self.REFUSALS_BEFORE_DEAD:
+            self.mark_dead(proxy, f"{count} отказ(ов) подряд: {reason}" if reason else "отказы подряд")
+            log.warning(
+                "%s: адрес %s признан нерабочим после %d отказов подряд%s",
+                self.name, mask(proxy), count, f" ({reason})" if reason else "",
+            )
+            return True
+        self.mark_exhausted(proxy, cooldown_seconds, reason or "отказ прокси")
+        return False
+
+    def mark_ok(self, proxy: str) -> None:
+        """
+        Через этот адрес прошёл успешный запрос — забываем накопленные отказы.
+
+        Без сброса счётчик копился бы месяцами и однажды похоронил бы
+        совершенно рабочий адрес по трём случайным отказам за неделю.
+        """
+        if not proxy:
+            return
+        self._refusals.pop(proxy, None)
+        self.dead.pop(proxy, None)
+
     def mark_dead(self, proxy: str, reason: str = "") -> None:
         """
         Пометить адрес нерабочим (не ответил вовсе, а не получил отказ от
@@ -248,10 +296,14 @@ class ProxyPool:
         if not self.proxies:
             return "прокси не заданы"
         if self.all_dead():
+            # Причину называем как список версий, а не как приговор. 403 на
+            # CONNECT приходит по добром десятку поводов, и утверждать по нему
+            # «аккаунт не оплачен» — значит отправить человека проверять не то.
             return (
-                f"все {len(self.proxies)} адрес(ов) отвечают отказом — это не Steam и не "
-                f"площадка, а сам прокси-провайдер: проверь оплату, остаток трафика и "
-                f"статус аккаунта в личном кабинете"
+                f"все {len(self.proxies)} адрес(ов) отвечают отказом (это сам прокси-сервис, "
+                f"не Steam). Обычные причины: кончился трафик, превышен лимит одновременных "
+                f"сессий, истекла sticky-сессия, целевой хост не разрешён тарифом или "
+                f"сменились логин/пароль. Проверь личный кабинет и /proxycheck"
             )
         return self.describe()
 

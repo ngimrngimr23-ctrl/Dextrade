@@ -814,7 +814,7 @@ async def _request_listings(
         if e.status == 403:
             # Отказ авторизации самого прокси-сервиса — разовым ретраем на тот
             # же адрес не лечится, помечаем насовсем (см. ProxyPool.mark_dead).
-            CSFLOAT_POOL.mark_dead(proxy, f"прокси вернул 403: {e}")
+            CSFLOAT_POOL.mark_refused(proxy, PROXY_TRANSIENT_COOLDOWN_SECONDS, f"HTTP 403: {e}")
         raise _ProxyTransient(f"HTTP {e.status} от прокси: {e}") from None
     except _TRANSIENT_PROXY_ERRORS as e:
         # Без прокси менять нечего — тогда это честная сетевая ошибка наружу.
@@ -905,6 +905,7 @@ async def _do_request(
             _bytes_downloaded += resp.content.total_bytes
 
         await _note_ok()
+        CSFLOAT_POOL.mark_ok(proxy)  # прошло — забываем прошлые отказы адреса
         # Остаток лимита логируем — это то, чего так не хватало со Steam:
         # там мы про лимит узнавали только по факту бана.
         _note_budget(dict(resp.headers))
