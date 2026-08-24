@@ -2517,15 +2517,12 @@ async def proxyadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     added_steam, _ = STEAM_POOL.add(raw)
 
     if added_cs or added_steam:
-        # Сохраняем то, что реально приняли пулом, — так в хранилище не попадёт
-        # мусор, который всё равно был бы отброшен при следующем старте.
-        stored = await get_extra_proxies()
-        known = set(stored)
-        for proxy in csfloat_client.CSFLOAT_POOL.proxies:
-            if proxy not in known:
-                stored.append(proxy)
-                known.add(proxy)
-        await save_extra_proxies(stored)
+        # Сохраняем ТОЛЬКО добавленное через бота (pool.extra()), а не весь пул.
+        # Раньше цикл шёл по всем proxies подряд и утаскивал в хранилище заодно
+        # адреса из переменной окружения. Последствие было обидное: /proxyclear
+        # потом рапортовал «забыл 8», хотя руками добавляли один, — а по сути
+        # чистил дубли env-адресов, которые всё равно вернулись бы при старте.
+        await save_extra_proxies(csfloat_client.CSFLOAT_POOL.extra())
 
     lines = [f"✅ Добавлено адресов: {added_cs}"]
     if rejected:
@@ -2538,20 +2535,54 @@ async def proxyadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def proxyclear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/proxyclear — забыть прокси, добавленные через бота (из переменной окружения останутся)."""
+    """
+    /proxyclear      — забыть прокси, добавленные через бота
+    /proxyclear all  — плюс отключить до рестарта адреса из переменной окружения
+
+    Режим all нужен, когда провайдер отключил аккаунт целиком (403 на всех
+    сессиях): ждать передеплоя ради того, чтобы бот перестал ходить на мёртвые
+    адреса, незачем. Насовсем они убираются правкой CSFLOAT_HTTP_PROXY.
+    """
+    drop_env = bool(context.args) and context.args[0].lower() in ("all", "все", "всё")
+
     stored = await get_extra_proxies()
     await save_extra_proxies([])
-    # Убираем из УЖЕ РАБОТАЮЩИХ пулов прямо сейчас, а не только из хранилища —
-    # раньше здесь чистилось только хранилище (влияло на следующий рестарт), а
-    # текущий процесс продолжал таскать эти адреса в памяти неопределённо
-    # долго, пока Render сам не передеплоит бота.
-    removed_cs = csfloat_client.CSFLOAT_POOL.remove(stored)
-    removed_steam = STEAM_POOL.remove(stored)
-    await update.message.reply_text(
-        f"Забыл {len(stored)} адрес(ов), добавленных через бота — убрал сразу из обоих "
-        f"пулов (CSFloat: -{removed_cs}, Steam: -{removed_steam}), рестарт не нужен.\n"
-        "Адреса из переменной окружения не тронуты."
-    )
+    # Убираем из УЖЕ РАБОТАЮЩИХ пулов прямо сейчас, а не только из хранилища:
+    # хранилище влияет лишь на следующий старт, а процесс продолжал бы таскать
+    # эти адреса в памяти, пока Render сам не передеплоит бота.
+    targets = list(stored)
+    if drop_env:
+        targets += csfloat_client.CSFLOAT_POOL.from_env() + STEAM_POOL.from_env()
+    removed_cs = csfloat_client.CSFLOAT_POOL.remove(targets, include_env=drop_env)
+    removed_steam = STEAM_POOL.remove(targets, include_env=drop_env)
+
+    left_cs = len(csfloat_client.CSFLOAT_POOL)
+    lines = [
+        f"Убрано из пулов — CSFloat: -{removed_cs}, Steam: -{removed_steam}. "
+        f"Рестарт не нужен."
+    ]
+    if stored:
+        lines.append(f"Из хранилища забыто {len(stored)} адрес(ов), добавленных через бота.")
+    else:
+        lines.append("В хранилище добавленных через бота адресов не было.")
+
+    if drop_env:
+        lines.append(
+            "\nАдреса из переменной окружения отключены ДО РЕСТАРТА — при следующем "
+            "запуске они вернутся. Чтобы убрать насовсем, поправь CSFLOAT_HTTP_PROXY "
+            "на Render."
+        )
+    elif left_cs:
+        # Главное, чего не хватало раньше: если в пуле осталось что-то, надо
+        # прямо сказать, откуда оно, — иначе «забыл 0» при семи живых адресах
+        # выглядит как поломка команды, а не как отказ трогать чужое.
+        lines.append(
+            f"\nВ пуле осталось {left_cs} адрес(ов) — они из переменной окружения "
+            f"CSFLOAT_HTTP_PROXY, и эта команда их не трогает.\n"
+            f"Отключить их до рестарта: /proxyclear all\n"
+            f"Убрать насовсем: поправь переменную на Render."
+        )
+    await update.message.reply_text("\n".join(lines))
 
 
 async def proxycheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
