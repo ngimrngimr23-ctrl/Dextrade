@@ -98,6 +98,11 @@ class ProxyPool:
             if candidate not in self.proxies:
                 self.proxies.append(candidate)
 
+        # Снимок адресов из переменной окружения — единственное, что remove()
+        # не имеет права трогать. Всё, что появится в self.proxies позже
+        # (через add()), пришло из /proxyadd и может быть убрано тем же путём.
+        self._base = frozenset(self.proxies)
+
     def add(self, raw: str) -> tuple[int, list[tuple[str, str]]]:
         """
         Добавить адреса на ходу. Возвращает (сколько добавлено, что не приняли).
@@ -120,6 +125,30 @@ class ProxyPool:
                 self.proxies.append(candidate)
                 added += 1
         return added, rejected
+
+    def remove(self, addresses: list[str]) -> int:
+        """
+        Убрать конкретные адреса из УЖЕ РАБОТАЮЩЕГО пула — без рестарта процесса.
+
+        Нужен парой к add(): /proxyadd действует немедленно, а /proxyclear до
+        этого метода — только наполовину. Он чистил хранилище (так что при
+        следующем рестарте адреса не вернутся), но сам пул в памяти их не
+        трогал: 8 адресов, добавленных через бота, продолжали числиться в
+        proxies (пусть и мёртвыми после mark_dead) до тех пор, пока Render не
+        передеплоит процесс сам по себе — то есть неопределённо долго.
+
+        Адреса из self._base (переменная окружения) не трогает НИКОГДА — их
+        можно снять только правкой самой переменной и рестартом, ровно как
+        написано пользователю в /proxyclear. Возвращает, сколько реально убрано.
+        """
+        to_remove = set(addresses) - self._base
+        if not to_remove:
+            return 0
+        self.proxies = [p for p in self.proxies if p not in to_remove]
+        for p in to_remove:
+            self._cooldowns.pop(p, None)
+            self.dead.pop(p, None)
+        return len(to_remove)
 
     def mark_dead(self, proxy: str, reason: str = "") -> None:
         """

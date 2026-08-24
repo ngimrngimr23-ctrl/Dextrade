@@ -2541,9 +2541,16 @@ async def proxyclear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/proxyclear — забыть прокси, добавленные через бота (из переменной окружения останутся)."""
     stored = await get_extra_proxies()
     await save_extra_proxies([])
+    # Убираем из УЖЕ РАБОТАЮЩИХ пулов прямо сейчас, а не только из хранилища —
+    # раньше здесь чистилось только хранилище (влияло на следующий рестарт), а
+    # текущий процесс продолжал таскать эти адреса в памяти неопределённо
+    # долго, пока Render сам не передеплоит бота.
+    removed_cs = csfloat_client.CSFLOAT_POOL.remove(stored)
+    removed_steam = STEAM_POOL.remove(stored)
     await update.message.reply_text(
-        f"Забыл {len(stored)} адрес(ов), добавленных через бота.\n"
-        "Адреса из переменной окружения останутся — они подхватятся при перезапуске."
+        f"Забыл {len(stored)} адрес(ов), добавленных через бота — убрал сразу из обоих "
+        f"пулов (CSFloat: -{removed_cs}, Steam: -{removed_steam}), рестарт не нужен.\n"
+        "Адреса из переменной окружения не тронуты."
     )
 
 
