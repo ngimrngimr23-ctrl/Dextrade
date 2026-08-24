@@ -548,7 +548,37 @@ async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict
     # Пауза считается ПО АДРЕСУ: Steam банит по IP, значит и темп надо держать
     # по IP — иначе шесть адресов дают не шесть полос, а шесть раз по одной.
     await throttle_steam_request(scope="pricing", lane=proxy or "")
-    async with session.get(url, params=params, headers=headers, proxy=proxy) as resp:
+    try:
+        resp_ctx = session.get(url, params=params, headers=headers, proxy=proxy)
+        resp = await resp_ctx.__aenter__()
+    except aiohttp.ClientError as e:
+        # Тот же класс бага, что чинили в steam_client.fetch_all_listings:
+        # прокси не смог даже соединиться (или сам отверг CONNECT, как
+        # ClientHttpProxyError 403 при протухшем аккаунте flameproxies) — это
+        # НЕ ответ Steam. Раньше такое исключение улетало наверх мимо ветки
+        # "resp.status == 429" (она просто не срабатывала — до неё не
+        # доходило) и мимо retry-цикла get_steam_market_price_retrying (он
+        # ловит только RateLimited), поэтому кандидат сразу считался
+        # "Steam не ответил" вместо того, чтобы попробовать другой адрес.
+        # На проде это выглядело как "25 из 25 запросов не прошли — Steam
+        # ограничил доступ", хотя на деле Steam тут был ни при чём.
+        if proxy:
+            status = getattr(e, "status", None)
+            if status == 403:
+                STEAM_POOL.mark_dead(proxy, f"прокси вернул 403: {e}")
+            else:
+                STEAM_POOL.mark_exhausted(proxy, STEAM_PROXY_COOLDOWN_SECONDS, f"ошибка соединения: {e}")
+        log.warning(
+            "%s: маршрут %s не работает (%s) для запроса %r",
+            label, mask_proxy(proxy) if proxy else "прямой", e,
+            params.get("query") or params.get("market_hash_name"),
+        )
+        # RateLimited — тот же сигнал, что и на реальный 429: вызывающий код
+        # (get_steam_market_price_retrying) уже умеет на него реагировать
+        # повторной попыткой с другого адреса пула.
+        raise RateLimited()
+
+    try:
         if resp.status == 429:
             log.warning(
                 "%s: HTTP 429 для запроса %r (маршрут: %s)",
@@ -568,6 +598,8 @@ async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict
             log.warning("%s: HTTP %s для запроса %r", label, resp.status, params.get("query") or params.get("market_hash_name"))
             return None
         return await resp.json()
+    finally:
+        await resp_ctx.__aexit__(None, None, None)
 
 
 def _money(raw) -> float | None:
