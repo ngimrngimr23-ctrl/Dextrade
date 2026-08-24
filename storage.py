@@ -377,6 +377,79 @@ async def set_arb_setting(chat_id: int, key: str, value) -> None:
     await _save_chat_settings(chat_id, settings)
 
 
+# --- Слежение за инвентарём -------------------------------------------------
+#
+# steamid и порог живут в общем блоке настроек чата (там же, где /setdefaults),
+# а вот СНИМОК ЦЕН — отдельным ключом на чат. Причина простая: снимок это сотни
+# записей, которые переписываются на каждом прогоне, и держать их в одном JSON
+# с настройками значило бы гонять весь блок туда-обратно ради одной галочки.
+INV_BASELINE_KEY_PREFIX = "invbaseline:"
+LOCAL_INV_BASELINE_PATH = Path(__file__).parent / "inventory_baseline_local.json"
+
+
+def _local_baseline_load() -> dict:
+    if LOCAL_INV_BASELINE_PATH.exists():
+        try:
+            return json.loads(LOCAL_INV_BASELINE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _local_baseline_save(data: dict) -> None:
+    LOCAL_INV_BASELINE_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+async def get_inventory_steamid(chat_id: int) -> Optional[str]:
+    """steamid64 привязанного аккаунта, либо None, если /inv ещё не звали."""
+    return (await _get_chat_settings(chat_id)).get("inventory_steamid")
+
+
+async def set_inventory_steamid(chat_id: int, steamid: Optional[str]) -> None:
+    settings = await _get_chat_settings(chat_id)
+    settings["inventory_steamid"] = steamid
+    await _save_chat_settings(chat_id, settings)
+
+
+async def get_inventory_growth(chat_id: int) -> Optional[float]:
+    """Порог роста в процентах, при котором слать уведомление. None — слежение выключено."""
+    return (await _get_chat_settings(chat_id)).get("inventory_growth_pct")
+
+
+async def set_inventory_growth(chat_id: int, pct: Optional[float]) -> None:
+    settings = await _get_chat_settings(chat_id)
+    settings["inventory_growth_pct"] = pct
+    await _save_chat_settings(chat_id, settings)
+
+
+async def get_inventory_baseline(chat_id: int) -> dict[str, float]:
+    """market_hash_name -> цена, от которой считается рост."""
+    key = f"{INV_BASELINE_KEY_PREFIX}{chat_id}"
+    if REDIS_ENABLED:
+        try:
+            raw = await _redis_cmd("GET", key)
+            return json.loads(raw) if raw else {}
+        except Exception:
+            log.warning("get_inventory_baseline: Upstash недоступен, читаю локальный файл", exc_info=True)
+    return _local_baseline_load().get(str(chat_id), {})
+
+
+async def save_inventory_baseline(chat_id: int, baseline: dict[str, float]) -> None:
+    key = f"{INV_BASELINE_KEY_PREFIX}{chat_id}"
+    value = json.dumps(baseline, ensure_ascii=False)
+    if REDIS_ENABLED:
+        try:
+            # Без TTL: это точка отсчёта пользователя, а не кэш. Протухнув, она
+            # молча превратила бы «вырос на 20%» в «вырос с нуля».
+            await _redis_cmd("SET", key, value)
+            return
+        except Exception:
+            log.warning("save_inventory_baseline: Upstash недоступен, пишу в локальный файл", exc_info=True)
+    data = _local_baseline_load()
+    data[str(chat_id)] = baseline
+    _local_baseline_save(data)
+
+
 # --- Прокси, добавленные через Telegram -------------------------------------
 #
 # Живут в хранилище, а не в переменных окружения, чтобы добавлять их на ходу и

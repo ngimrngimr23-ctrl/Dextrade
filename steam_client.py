@@ -153,7 +153,7 @@ _cooldowns: dict[str, dict] = {}
 # Все области, которые ходят в Steam. Нужен явный список: при 429 в одной из них
 # остальные надо придержать (Steam банит IP, а не эндпоинт — см. note_steam_429),
 # а узнать о ещё не созданных состояниях из _cooldowns нельзя.
-KNOWN_SCOPES = ("listings", "pricing")
+KNOWN_SCOPES = ("listings", "pricing", "inventory")
 
 
 def _cooldown_state(scope: str) -> dict:

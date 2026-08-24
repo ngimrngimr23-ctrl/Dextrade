@@ -41,6 +41,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import NamedTuple
+from urllib.parse import quote
 
 import aiohttp
 from telegram import BotCommand, Update
@@ -63,6 +64,7 @@ from steam_client import (
 )
 from csgo_api import search_items as search_csgo_items
 from http_session import close_session as close_http_session
+from inventory import InventoryError, fetch_inventory, resolve_steamid
 from pricing import (
     get_sticker_prices,
     ingest_manual_prices,
@@ -112,6 +114,12 @@ from storage import (
     set_steam_price,
     get_extra_proxies,
     save_extra_proxies,
+    get_inventory_steamid,
+    set_inventory_steamid,
+    get_inventory_growth,
+    set_inventory_growth,
+    get_inventory_baseline,
+    save_inventory_baseline,
     mark_offer_sent,
     get_arb_settings,
     set_arb_setting,
@@ -2084,6 +2092,328 @@ async def arb_scan_job(context: ContextTypes.DEFAULT_TYPE):
             _schedule_arb_job(context.job_queue, chat_id)
 
 
+# ---------------------------------------------------------------------------
+# Слежение за инвентарём: сообщать, когда свои скины подорожали
+#
+# Дешевле всего остального в этом боте, и это стоит понимать. Инвентарь целиком
+# приходит ОДНИМ запросом, а цены берутся из прайс-листа csgotrader, уже
+# разобранного в памяти процесса, — то есть проверка инвентаря на пятьсот
+# предметов стоит один сетевой запрос, а не пятьсот. Поэтому здесь нет ни пула
+# прокси, ни бюджетов, ни хитрых пауз: их просто нечем тратить.
+# ---------------------------------------------------------------------------
+
+INVENTORY_JOB_PREFIX = "inventory_scan_"
+# Раз в час. Чаще смысла нет: прайс-лист на стороне csgotrader обновляется
+# примерно раз в час, и более частая проверка сравнивала бы одни и те же числа.
+INVENTORY_INTERVAL_MINUTES = float(os.environ.get("INVENTORY_INTERVAL_MINUTES", "60"))
+# Предметы дешевле этого в отчёт не идут: рост на 30% от десяти центов — это
+# три цента, и такие строки только прячут настоящие движения.
+INVENTORY_MIN_PRICE = float(os.environ.get("INVENTORY_MIN_PRICE", "0.50"))
+# Какое окно прайс-листа считать текущей ценой. Сутки — самое свежее, что есть.
+INVENTORY_PRICE_WINDOW = "last_24h"
+
+
+def _schedule_inventory_job(job_queue, chat_id: int, delay_minutes: float | None = None) -> None:
+    """Следующая проверка инвентаря — одноразовой джобой, как у вотчлиста и арбитража."""
+    for job in job_queue.get_jobs_by_name(f"{INVENTORY_JOB_PREFIX}{chat_id}"):
+        job.schedule_removal()
+    job_queue.run_once(
+        inventory_scan_job,
+        when=(delay_minutes if delay_minutes is not None else INVENTORY_INTERVAL_MINUTES) * 60,
+        data={"chat_id": chat_id},
+        name=f"{INVENTORY_JOB_PREFIX}{chat_id}",
+    )
+
+
+def _inventory_price(prices: dict, market_hash_name: str) -> float | None:
+    """
+    Текущая цена предмета из прайс-листа.
+
+    Берём сначала суточное окно, и только если его нет — недельное. Предметы,
+    которые не продавались сутки, иначе выпали бы из слежения совсем, хотя для
+    инвентаря они как раз обычное дело.
+    """
+    entry = prices.get(market_hash_name)
+    if entry is None:
+        return None
+    for window in (INVENTORY_PRICE_WINDOW, "last_7d", "last_30d"):
+        value = entry.windows.get(window)
+        if value:
+            return value
+    return None
+
+
+async def _run_inventory_scan(bot, chat_id: int, *, announce_baseline: bool = False):
+    """
+    Один прогон: прочитать инвентарь, сравнить с сохранённым снимком цен и
+    сообщить о выросших.
+
+    Возвращает (сколько предметов проверено, сколько выросло) либо None, если
+    прогон не состоялся (нет привязанного аккаунта).
+
+    Точка отсчёта сдвигается ТОЛЬКО у тех предметов, о росте которых мы
+    сообщили. Иначе одно и то же подорожание всплывало бы в каждом прогоне —
+    и наоборот, если сдвигать всё подряд, медленный рост по чуть-чуть за раз
+    никогда не набрал бы порога.
+    """
+    steamid = await get_inventory_steamid(chat_id)
+    if not steamid:
+        return None
+
+    threshold = await get_inventory_growth(chat_id)
+    items = await fetch_inventory(steamid)
+    if not items:
+        return 0, 0
+
+    prices = await get_csgotrader_price_details()
+    if not prices:
+        raise InventoryError("Прайс-лист не скачался — оценить инвентарь нечем.")
+
+    baseline = await get_inventory_baseline(chat_id)
+    new_baseline = dict(baseline)
+    grown: list[tuple[str, int, float, float, float]] = []  # имя, шт, было, стало, %
+    priced = 0
+    first_seen = 0
+
+    for item in items:
+        price = _inventory_price(prices, item.market_hash_name)
+        if price is None or price < INVENTORY_MIN_PRICE:
+            continue
+        priced += 1
+
+        was = baseline.get(item.market_hash_name)
+        if was is None:
+            # Первая встреча — просто запоминаем, сравнивать пока не с чем.
+            new_baseline[item.market_hash_name] = price
+            first_seen += 1
+            continue
+
+        if threshold is None or was <= 0:
+            continue
+        growth_pct = (price - was) / was * 100
+        if growth_pct >= threshold:
+            grown.append((item.market_hash_name, item.count, was, price, growth_pct))
+            new_baseline[item.market_hash_name] = price  # отсчёт от новой цены
+
+    # Предметы, которых в инвентаре больше нет, из снимка убираем: держать их
+    # вечно значит копить мусор и однажды отчитаться о росте того, что продано.
+    present = {i.market_hash_name for i in items}
+    new_baseline = {k: v for k, v in new_baseline.items() if k in present}
+
+    if new_baseline != baseline:
+        await save_inventory_baseline(chat_id, new_baseline)
+
+    if grown:
+        grown.sort(key=lambda row: row[4], reverse=True)
+        total_gain = sum((now - was) * count for _, count, was, now, _ in grown)
+        lines = [
+            f"📈 Подорожало в инвентаре — {len(grown)} поз.\n"
+            f"<i>Цены из прайс-листа csgotrader (обновляется примерно раз в час), "
+            f"это средняя цена по предмету, а не текущий нижний лот. "
+            f"Суммарно прибавка ≈ ${total_gain:.2f}.</i>"
+        ]
+        for name, count, was, now, pct in grown[:20]:
+            amount = f" ×{count}" if count > 1 else ""
+            lines.append(
+                f"<code>{html_module.escape(name)}</code>{amount}\n"
+                f"  ${was:.2f} → ${now:.2f} (+{pct:.1f}%)\n"
+                f'  <a href="{_steam_market_url(name)}">Открыть в Steam</a>'
+            )
+        for chunk in _chunk_lines(lines, sep="\n\n"):
+            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML", disable_web_page_preview=True)
+    elif announce_baseline and first_seen:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"Запомнил цены по {first_seen} предмет(ам) — это точка отсчёта. "
+                f"Дальше буду сообщать, когда что-то из них подорожает."
+            ),
+        )
+
+    log.info(
+        "inventory: chat_id=%s проверено %d, впервые записано %d, выросло %d (порог %s)",
+        chat_id, priced, first_seen, len(grown),
+        f"{threshold:g}%" if threshold is not None else "не задан",
+    )
+    return priced, len(grown)
+
+
+def _steam_market_url(market_hash_name: str) -> str:
+    return f"https://steamcommunity.com/market/listings/730/{quote(market_hash_name, safe='')}"
+
+
+async def inventory_scan_job(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.data["chat_id"]
+    try:
+        await _run_inventory_scan(context.bot, chat_id)
+    except SteamRateLimited as e:
+        log.warning("inventory: chat_id=%s рейт-лимит: %s", chat_id, e)
+    except InventoryError as e:
+        log.warning("inventory: chat_id=%s не прочитать инвентарь: %s", chat_id, e)
+        # Молча гасить нельзя: закрытый инвентарь означает, что слежение не
+        # работает вообще, и пользователь должен об этом узнать. Но и в каждый
+        # прогон повторять не будем — раз в SENT_OFFER_TTL_SECONDS.
+        notice_key = "inventory_error_notice"
+        if not await was_offer_sent_recently(chat_id, notice_key):
+            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Слежение за инвентарём: {e}")
+            await mark_offer_sent(chat_id, notice_key)
+    except Exception:
+        log.exception("inventory: непредвиденная ошибка в прогоне chat_id=%s", chat_id)
+    finally:
+        if await get_inventory_growth(chat_id) is not None:
+            _schedule_inventory_job(context.job_queue, chat_id)
+
+
+async def inv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /inv                  — показать привязанный аккаунт и оценку инвентаря
+    /inv <ссылка|steamid> — привязать аккаунт
+    /inv off              — отвязать и забыть снимок цен
+    """
+    chat_id = update.effective_chat.id
+
+    if context.args and context.args[0].lower() in ("off", "выкл"):
+        await set_inventory_steamid(chat_id, None)
+        await set_inventory_growth(chat_id, None)
+        await save_inventory_baseline(chat_id, {})
+        for job in context.application.job_queue.get_jobs_by_name(f"{INVENTORY_JOB_PREFIX}{chat_id}"):
+            job.schedule_removal()
+        await update.message.reply_text("Аккаунт отвязан, точка отсчёта забыта.")
+        return
+
+    if context.args:
+        try:
+            steamid = await resolve_steamid(" ".join(context.args))
+        except (InventoryError, SteamRateLimited) as e:
+            await update.message.reply_text(f"⚠️ {e}")
+            return
+        await set_inventory_steamid(chat_id, steamid)
+        # Снимок от прошлого аккаунта к новому не относится.
+        await save_inventory_baseline(chat_id, {})
+        await update.message.reply_text(f"✅ Аккаунт привязан: {steamid}\nСчитаю инвентарь…")
+    else:
+        steamid = await get_inventory_steamid(chat_id)
+        if not steamid:
+            await update.message.reply_text(
+                "Аккаунт не привязан.\n\n"
+                "<code>/inv https://steamcommunity.com/id/твой_ник</code>\n"
+                "или <code>/inv 7656119...</code>\n\n"
+                "Инвентарь должен быть открыт: Steam → Профиль → Редактировать "
+                "профиль → Настройки приватности → «Инвентарь» = Открытый.",
+                parse_mode="HTML",
+            )
+            return
+
+    try:
+        items = await fetch_inventory(steamid)
+    except (InventoryError, SteamRateLimited) as e:
+        await update.message.reply_text(f"⚠️ {e}")
+        return
+
+    if not items:
+        await update.message.reply_text("В инвентаре нет продаваемых предметов CS2.")
+        return
+
+    prices = await get_csgotrader_price_details()
+    total = 0.0
+    unpriced = 0
+    valued: list[tuple[str, int, float]] = []
+    for item in items:
+        price = _inventory_price(prices, item.market_hash_name)
+        if price is None:
+            unpriced += 1
+            continue
+        total += price * item.count
+        valued.append((item.market_hash_name, item.count, price))
+
+    valued.sort(key=lambda row: row[2] * row[1], reverse=True)
+    units = sum(i.count for i in items)
+    lines = [
+        f"🎒 Инвентарь: {units} предмет(ов), {len(items)} уникальных\n"
+        f"Оценка: <b>${total:.2f}</b>"
+        + (f"\n<i>Без цены в прайс-листе: {unpriced}</i>" if unpriced else "")
+    ]
+    for name, count, price in valued[:10]:
+        amount = f" ×{count}" if count > 1 else ""
+        lines.append(f"<code>{html_module.escape(name)}</code>{amount} — ${price * count:.2f}")
+    if len(valued) > 10:
+        lines.append(f"<i>…и ещё {len(valued) - 10} поз.</i>")
+
+    growth = await get_inventory_growth(chat_id)
+    lines.append(
+        f"\nСлежение за ростом: {f'включено, порог {growth:g}%' if growth is not None else 'выключено'}\n"
+        "Включить: /invwatch 15"
+    )
+    for chunk in _chunk_lines(lines, sep="\n"):
+        await update.message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
+
+
+async def invwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /invwatch <%>  — сообщать, когда предмет из инвентаря подорожал на N%
+    /invwatch off  — выключить
+    """
+    chat_id = update.effective_chat.id
+    steamid = await get_inventory_steamid(chat_id)
+
+    if not context.args:
+        growth = await get_inventory_growth(chat_id)
+        baseline = await get_inventory_baseline(chat_id)
+        if growth is None:
+            await update.message.reply_text(
+                "📈 Слежение за ростом инвентаря выключено.\n\n"
+                "Включить: <code>/invwatch 15</code> — сообщу, когда предмет "
+                "подорожает на 15% от цены, записанной при первом замере.\n\n"
+                + ("" if steamid else "Сначала привяжи аккаунт: /inv <ссылка на профиль>"),
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(
+                f"📈 Слежу за ростом: порог {growth:g}%\n"
+                f"Точка отсчёта записана по {len(baseline)} предмет(ам).\n"
+                f"Проверка раз в {INVENTORY_INTERVAL_MINUTES:g} мин.\n\n"
+                "Поменять порог: /invwatch 25\nВыключить: /invwatch off"
+            )
+        return
+
+    if context.args[0].lower() in ("off", "выкл"):
+        await set_inventory_growth(chat_id, None)
+        for job in context.application.job_queue.get_jobs_by_name(f"{INVENTORY_JOB_PREFIX}{chat_id}"):
+            job.schedule_removal()
+        await update.message.reply_text("📈 Слежение за ростом инвентаря выключено.")
+        return
+
+    if not steamid:
+        await update.message.reply_text(
+            "Сначала привяжи аккаунт: <code>/inv https://steamcommunity.com/id/твой_ник</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        pct = float(context.args[0].replace("%", "").replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("Нужно число процентов. Пример: /invwatch 15")
+        return
+    if pct <= 0:
+        await update.message.reply_text("Процент должен быть больше нуля.")
+        return
+
+    await set_inventory_growth(chat_id, pct)
+    await update.message.reply_text(
+        f"📈 Слежу за инвентарём: сообщу, когда предмет подорожает на {pct:g}% "
+        f"от записанной цены.\nПроверка раз в {INVENTORY_INTERVAL_MINUTES:g} мин, "
+        f"первый замер — сейчас."
+    )
+
+    try:
+        await _run_inventory_scan(context.bot, chat_id, announce_baseline=True)
+    except (InventoryError, SteamRateLimited) as e:
+        await update.message.reply_text(f"⚠️ {e}")
+        return
+    _schedule_inventory_job(context.application.job_queue, chat_id)
+
+
 async def watchpause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /watchpause — остановить автоскан по расписанию (оба списка — обычный
@@ -3524,6 +3854,8 @@ BOT_COMMANDS = [
     BotCommand("watchpause", "Остановить автоскан"),
     BotCommand("watchresume", "Возобновить автоскан"),
     BotCommand("arbnow", "Проверить арбитраж CSFloat прямо сейчас"),
+    BotCommand("inv", "Инвентарь Steam: привязать аккаунт и оценить"),
+    BotCommand("invwatch", "Сообщать, когда скины в инвентаре дорожают"),
     BotCommand("markets", "Сравнить Steam с другими площадками (весь каталог)"),
     BotCommand("setmarkets", "Пороги для /markets: спред, продажи, прибыль"),
     BotCommand("proxycheck", "Проверить прокси: сколько работают, сколько отвалились"),
@@ -3607,6 +3939,21 @@ async def _on_startup(app: Application):
         arb_restored += 1
     if arb_restored:
         log.info("arb: восстановлены джобы арбитража для %d чат(ов)", arb_restored)
+
+    # Слежение за инвентарём — так же по настройкам, а не по вотчлисту. Без
+    # восстановления оно молча умирало бы на каждом передеплое Render, а
+    # передеплоивает он часто: пользователь включил /invwatch и потом неделю
+    # ждал бы уведомлений, которых никто не собирался слать.
+    inv_restored = 0
+    for chat_id in await all_chat_ids_with_settings():
+        if await get_inventory_growth(chat_id) is None:
+            continue
+        if not await get_inventory_steamid(chat_id):
+            continue
+        _schedule_inventory_job(app.job_queue, chat_id)
+        inv_restored += 1
+    if inv_restored:
+        log.info("inventory: восстановлены джобы слежения для %d чат(ов)", inv_restored)
 
 
 # ---------------------------------------------------------------------------
@@ -3898,6 +4245,8 @@ def _build_application(token: str):
     app.add_handler(CommandHandler("setarbvolume", setarbvolume))
     app.add_handler(CommandHandler("setarbstickers", setarbstickers))
     app.add_handler(CommandHandler("arbnow", arbnow))
+    app.add_handler(CommandHandler("inv", inv))
+    app.add_handler(CommandHandler("invwatch", invwatch))
     app.add_handler(CommandHandler("markets", markets))
     app.add_handler(CommandHandler("setmarkets", setmarkets))
     app.add_handler(CommandHandler("proxycheck", proxycheck))
