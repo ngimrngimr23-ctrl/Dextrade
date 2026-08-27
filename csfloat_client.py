@@ -89,6 +89,12 @@ CSFLOAT_BASE_URL = "https://csfloat.com/api/v1"
 # консервативно и смотрим на заголовки остатка — они скажут правду.
 MIN_REQUEST_INTERVAL = 1.5
 
+# Сколько разных адресов показывать CSFloat за прогон (см. fetch_market_wide).
+# Один — потому что квота у CSFloat считается по КЛЮЧУ, а не по адресу, а на
+# множество адресов с одного ключа он ругается напрямую: 2026-08-27 в теле 429
+# пришло "You've been making too many requests from too many IPs".
+CSFLOAT_MAX_ADDRESSES = int(os.environ.get("CSFLOAT_MAX_ADDRESSES", "1"))
+
 # Пауза между ЛЮБЫМИ двумя запросами, независимо от адреса.
 #
 # Появилась после прода 2026-08-20. Поадресной паузы оказалось мало: семь
@@ -1145,13 +1151,27 @@ async def fetch_market_wide(
     pages_per_band = max(1, -(-per_band // MAX_LIMIT))  # округление вверх
 
     proxies = CSFLOAT_POOL.proxies or [None]
+    # Сколько РАЗНЫХ адресов показывать CSFloat за прогон.
+    #
+    # Раньше полосы разбирали адреса по кругу, и шесть полос означали шесть
+    # разных IP на один API-ключ. Плюс это ротируемые сессии, меняющие адрес
+    # каждые 10 минут, — за час набегали десятки. 2026-08-27 CSFloat сказал об
+    # этом прямым текстом в теле 429:
+    #     "You've been making too many requests from too many IPs"
+    #
+    # Множество адресов здесь не даёт НИЧЕГО: квота считается по ключу (200 в
+    # час, проверено — числом прокси не умножается), а темп и так держит общий
+    # throttle по ключу. Прокси нужен ровно для одного — обойти блокировку
+    # датацентрового адреса Render. Для этого хватает одного.
+    lane_addresses = proxies[:max(1, CSFLOAT_MAX_ADDRESSES)]
     log.info(
-        "csfloat: широкий скан — цель %d лотов, %d полос по %d страниц, адресов %d",
-        target, len(bands), pages_per_band, len(proxies),
+        "csfloat: широкий скан — цель %d лотов, %d полос по %d страниц, "
+        "адресов в пуле %d, использую %d (больше не даёт квоты и злит антифрод)",
+        target, len(bands), pages_per_band, len(proxies), len(lane_addresses),
     )
 
     async def one_band(index: int, lo, hi, session):
-        proxy = proxies[index % len(proxies)]
+        proxy = lane_addresses[index % len(lane_addresses)]
         collected: list[CSFloatListing] = []
         cursor = None
         for _ in range(pages_per_band):

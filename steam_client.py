@@ -324,6 +324,27 @@ async def load_persisted_cooldown() -> None:
             )
 
 
+async def reset_cooldown(scope: str) -> float:
+    """
+    Снять кулдаун области вручную и обнулить её счётчик 429 подряд.
+    Возвращает, сколько оставалось до снятия (0 — кулдауна не было).
+
+    Зачем ручка. Кулдаун при повторных 429 растёт до шести часов и переживает
+    передеплой, так что без неё проверка правки упирается не в результат
+    правки, а в ожидание таймера, который к ней отношения не имеет. Ровно в это
+    и упёрлись 2026-08-27: залп запросов загнал pricing на 360 минут, залп
+    починили, а проверить починку стало нечем — /arbreset снимал только кулдаун
+    CSFloat и до областей Steam не дотягивался.
+    """
+    state = _cooldown_state(scope)
+    remaining = steam_cooldown_remaining(scope)
+    state["cooldown_until"] = 0.0
+    state["consecutive_429"] = 0
+    await _persist_cooldown(scope)
+    log.info("Steam (%s): кулдаун сброшен вручную (оставалось %.0f мин)", scope, remaining / 60)
+    return remaining
+
+
 async def note_steam_429(scope: str = "listings", headers: dict | None = None) -> float:
     """
     Зафиксировать 429 в указанной области. Возвращает длину кулдауна для неё.

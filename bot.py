@@ -61,6 +61,7 @@ from steam_client import (
     blocking_cooldown,
     load_persisted_cooldown,
     take_throttle_wait,
+    reset_cooldown as steam_reset_cooldown,
 )
 from csgo_api import search_items as search_csgo_items
 from http_session import close_session as close_http_session
@@ -3402,9 +3403,17 @@ async def arbreset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     cooldown = csfloat_client.cooldown_remaining()
     await csfloat_client.reset_cooldown()
+    # Арбитраж упирается в ДВА независимых кулдауна: CSFloat (сбор лотов) и
+    # Steam-область pricing (проверка цены живым priceoverview). Сбрасывать
+    # только первый бессмысленно — прогон соберёт лоты и снова не подтвердит ни
+    # одного кандидата, что 2026-08-27 и выглядело как «фикс не помог».
+    price_cooldown = await steam_reset_cooldown("pricing")
     was = f"был {cooldown / 60:.0f} мин" if cooldown > 0 else "кулдауна и не было"
     lines = [
         f"✅ Кулдаун CSFloat сброшен ({was}).",
+        f"✅ Кулдаун проверки цен Steam сброшен ("
+        + (f"был {price_cooldown / 60:.0f} мин" if price_cooldown > 0 else "кулдауна и не было")
+        + ").",
         f"Ключ: {csfloat_client.key_fingerprint()}",
         f"User-Agent: {csfloat_client.CSFLOAT_USER_AGENT}",
         f"Маршрут: {csfloat_client.route_description()}",
