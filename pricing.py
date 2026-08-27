@@ -516,6 +516,19 @@ PRICE_CONCURRENCY = int(os.environ.get("PRICE_CONCURRENCY", "2"))
 # пауза, не зависящая от MIN_REQUEST_INTERVAL листингов.
 PRICE_REQUEST_INTERVAL = float(os.environ.get("PRICE_REQUEST_INTERVAL", "6.0"))
 
+# Брать ли цену из листингов (/render/), когда priceoverview отказал.
+#
+# Размен осознанный. Плюс: /render/ у Steam зарезан несопоставимо мягче, и
+# 2026-08-27 он работал ровно в те часы, когда priceoverview отвечал 429 на всё
+# подряд — то есть без этого запасного пути проверка цен просто не работает.
+# Минус: проверка переезжает в область кулдауна "listings", то есть под общий
+# бюджет с вотчлистом, и если Steam забанит и её, встанет всё сразу. Объём при
+# этом невелик — 8 запросов за прогон арбитража против 110 у вотчлиста.
+#
+# priceoverview остаётся ПЕРВЫМ вариантом: он дешевле по трафику, отдаёт ещё и
+# объём продаж, и как только прямой адрес отлежится, всё вернётся к нему само.
+PRICE_FALLBACK_TO_LISTINGS = os.environ.get("PRICE_FALLBACK_TO_LISTINGS", "1") not in ("0", "false", "no")
+
 
 class RateLimited(Exception):
     """Внутренний маркер: Steam ответил 429 либо мы на кулдауне после недавнего 429."""
@@ -715,10 +728,58 @@ async def get_steam_market_price_retrying(
             return await get_steam_market_price(session, market_hash_name)
         except RateLimited:
             if attempt + 1 >= limit:
-                raise
+                break
             # Адрес уже помечен в _get_with_retry, следующий заход возьмёт другой.
             continue
-    return None
+
+    # priceoverview недоступен — берём цену из листингов.
+    #
+    # Это не «ещё одна попытка того же», а ДРУГОЙ эндпоинт с другим лимитом:
+    # /render/ у Steam режется несопоставимо мягче. 2026-08-27 это было видно
+    # в одном логе — все проверки цены получали 429, а вотчлист в те же часы
+    # собирал листинги с HTTP 200 и с того же прямого адреса.
+    if PRICE_FALLBACK_TO_LISTINGS:
+        listed = await _lowest_price_from_listings(market_hash_name)
+        if listed is not None:
+            return listed
+    raise RateLimited()
+
+
+async def _lowest_price_from_listings(market_hash_name: str) -> SteamMarketPrice | None:
+    """
+    Нижняя цена в стакане — из листингов (/render/) вместо priceoverview.
+
+    Steam отдаёт лоты отсортированными от дешёвых к дорогим (см. докстринг
+    steam_client.fetch_all_listings), поэтому цена первого лота и есть lowest —
+    ровно то же число, что даёт priceoverview.lowest_price.
+
+    Чего здесь НЕТ: медианы и объёма продаж за сутки. Медиана арбитражу не
+    нужна (он считает по lowest), а ликвидность и так определяется по окнам
+    прайс-листа и по reference.quantity от CSFloat — см. bot._fill_steam_prices.
+    Возвращаем volume=None честно, а не нулём: «не знаем» и «не продаётся» —
+    разные вещи, и на этом уже обжигались.
+
+    Запросов столько же, сколько у priceoverview: один на предмет. Дороже он
+    только по трафику (страница листингов против крошечного JSON), но входящий
+    трафик на Render бесплатен.
+    """
+    from steam_client import fetch_all_listings  # локально: steam_client импортирует pricing
+
+    try:
+        listings = await fetch_all_listings(market_hash_name, max_listings=1)
+    except Exception as e:
+        log.info("цена из листингов: %s — не получилось (%s)", market_hash_name, e)
+        return None
+
+    prices = [l.price for l in listings if l.price and l.price > 0]
+    if not prices:
+        return None
+    lowest = min(prices)
+    log.info(
+        "цена из листингов: %s — $%.2f (priceoverview недоступен, взяли из /render/)",
+        market_hash_name, lowest,
+    )
+    return SteamMarketPrice(lowest=lowest, median=None, volume=None)
 
 
 async def get_steam_market_price(

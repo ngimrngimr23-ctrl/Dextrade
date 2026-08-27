@@ -1774,8 +1774,13 @@ async def _verify_against_steam(offers, min_discount_pct: float) -> list:
             was, was_pct = o.steam_price, o.discount_pct
             o.steam_price = live.lowest
             o.steam_price_window = "живая цена Steam"
-            o.steam_volume = live.volume
-            o.steam_sales_recent = bool(live.volume)
+            # Объём перезаписываем ТОЛЬКО когда он известен. Цена из листингов
+            # (запасной путь при забаненном priceoverview) объёма не содержит, и
+            # безусловная запись затирала бы признак ликвидности, добытый ранее
+            # из окон прайс-листа и reference.quantity — см. _fill_steam_prices.
+            if live.volume is not None:
+                o.steam_volume = live.volume
+                o.steam_sales_recent = bool(live.volume)
             o.discount_pct = (live.lowest - o.csfloat_price) / live.lowest * 100
             o.net_after_fee = live.lowest * STEAM_FEE_MULTIPLIER - o.csfloat_price
             o.steam_price_second_opinion = (
@@ -3226,10 +3231,16 @@ async def _verify_markets_against_steam(offers, min_discount_pct: float, min_vol
             was = offer.steam_price
             offer.apply_live_steam(live.lowest, live.volume)
 
-            if (live.volume or 0) < min_volume:
+            # Неизвестный объём НЕ считаем нулевым. Цена, взятая из листингов
+            # (запасной путь, когда priceoverview забанен), объёма не содержит
+            # вовсе — и прежнее `(live.volume or 0)` молча отбраковало бы по
+            # ликвидности вообще всё, что пришло этим путём. Тот же урок уже
+            # выучен в analyzer.find_arbitrage_offers: «не знаем» и «не
+            # продаётся» — разные вещи.
+            if live.volume is not None and live.volume < min_volume:
                 log.info(
                     "markets: %s — продаж за сутки %s, меньше %d: перепродать будет некому",
-                    offer.market_hash_name, live.volume or 0, min_volume,
+                    offer.market_hash_name, live.volume, min_volume,
                 )
                 rejected += 1
                 continue
