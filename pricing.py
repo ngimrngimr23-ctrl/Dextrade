@@ -495,6 +495,27 @@ STEAM_PROXY_COOLDOWN_SECONDS = int(os.environ.get("STEAM_PROXY_COOLDOWN_SECONDS"
 # оставить предмет следующему прогону, кэш всё равно накапливается.
 STEAM_RETRY_CAP = int(os.environ.get("STEAM_RETRY_CAP", "4"))
 
+# Сколько проверок цены вести одновременно — НЕЗАВИСИМО от размера пула прокси.
+#
+# Раньше вызывающий код брал lanes = len(STEAM_POOL), и это оказалось ловушкой:
+# добавив 46 прокси, пользователь получил 46 одновременных полос. Диагностика
+# 2026-08-27 показала 53 запроса к priceoverview за минуту при заявленной паузе
+# в 4 секунды — потому что пауза считается ПО ПОЛОСЕ, и 46 полос дают 46
+# независимых очередей. priceoverview у Steam зарезан жёстче всех эндпоинтов и
+# такого залпа не прощает: 429 прилетел на все маршруты, включая прямой.
+#
+# Больше адресов здесь не помогает вообще: лимит на этом эндпоинте, судя по
+# поведению, не только поадресный. Поэтому потолок фиксированный и маленький.
+PRICE_CONCURRENCY = int(os.environ.get("PRICE_CONCURRENCY", "2"))
+
+# Пауза между запросами цены — ГЛОБАЛЬНАЯ, одна очередь на весь процесс.
+#
+# Для листингов пауза поадресная и это правильно: там бан подтверждённо
+# поадресный, и N адресов честно дают N полос. Для priceoverview так не
+# работает — см. выше. Поэтому здесь одна общая очередь и своя, более длинная
+# пауза, не зависящая от MIN_REQUEST_INTERVAL листингов.
+PRICE_REQUEST_INTERVAL = float(os.environ.get("PRICE_REQUEST_INTERVAL", "6.0"))
+
 
 class RateLimited(Exception):
     """Внутренний маркер: Steam ответил 429 либо мы на кулдауне после недавнего 429."""
@@ -540,10 +561,17 @@ async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict
     кулдауна, и он ставится только когда кончились все маршруты — ровно как в
     steam_client.fetch_all_listings.
     """
-    # Прямой маршрут пробуем первым, если он не на кулдауне после недавнего 429.
-    routes: list[str | None] = []
-    if steam_cooldown_remaining(scope="pricing") <= 0:
-        routes.append(None)
+    # Область уже на кулдауне — не лезем вообще, ни прямо, ни через прокси.
+    #
+    # Раньше здесь при кулдауне сразу брался прокси, и это выходило боком: в
+    # прогоне арбитража первый же исчерпавший маршруты кандидат ставил кулдаун,
+    # а остальные семь продолжали долбить Steam через пул — то есть ровно во
+    # время бана, продлевая его. У priceoverview лимит не только поадресный,
+    # так что «на другом адресе можно» здесь не работает.
+    if steam_cooldown_remaining(scope="pricing") > 0:
+        raise RateLimited()
+
+    routes: list[str | None] = [None]  # прямой маршрут пробуем первым
     tries_left = min(max(1, len(STEAM_POOL)), STEAM_RETRY_CAP)
 
     last_status: int | None = None
@@ -567,9 +595,16 @@ async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict
         # нужен, а bMarketOptOut=1 работает и без него.
         headers = _steam_request_headers() if proxy is None else {"Cookie": "bMarketOptOut=1"}
 
-        # Пауза считается ПО АДРЕСУ: Steam банит по IP, значит и темп надо
-        # держать по IP — иначе N адресов дают не N полос, а N раз по одной.
-        await throttle_steam_request(scope="pricing", lane=proxy or "")
+        # Пауза ОБЩАЯ на всю область, а не по адресу (lane пустой намеренно).
+        #
+        # Для листингов пауза поадресная, и там это верно. Здесь пробовали так
+        # же — и получили 53 запроса в минуту при «паузе 4 сек»: 46 адресов
+        # дали 46 независимых очередей, priceoverview ответил 429 на всё
+        # подряд, включая прямой адрес. Один этот эндпоинт держим одной
+        # очередью и с более длинной паузой (PRICE_REQUEST_INTERVAL).
+        await throttle_steam_request(
+            scope="pricing", lane="", interval=PRICE_REQUEST_INTERVAL
+        )
         resp_ctx = session.get(url, params=params, headers=headers, proxy=proxy)
         try:
             resp = await resp_ctx.__aenter__()

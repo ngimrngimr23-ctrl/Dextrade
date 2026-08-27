@@ -127,6 +127,7 @@ from storage import (
 )
 import csfloat_client
 import market_prices
+import pricing
 import proxy_pool
 from csfloat_client import CSFloatError, CSFloatRateLimited
 
@@ -1724,7 +1725,10 @@ async def _verify_against_steam(offers, min_discount_pct: float) -> list:
     cached = await get_steam_prices_batch([o.market_hash_name for o in todo])
     fresh_budget = [o for o in todo if o.market_hash_name not in cached][:STEAM_LIVE_BUDGET]
 
-    lanes = max(1, len(STEAM_POOL))
+    # Полос столько, сколько выдержит priceoverview, а НЕ сколько адресов в
+    # пуле: этот эндпоинт режется жёстче всех, и 46 прокси означали 46
+    # одновременных полос и 53 запроса в минуту (диагностика 2026-08-27).
+    lanes = pricing.PRICE_CONCURRENCY
     log.info(
         "arb: %d кандидат(ов) из %d: в кэше %d, спрошу у Steam %d, полос %d",
         len(todo), len(offers), len(cached), len(fresh_budget), lanes,
@@ -3174,7 +3178,10 @@ async def _verify_markets_against_steam(offers, min_discount_pct: float, min_vol
     misses = [o for o in offers if o.market_hash_name not in cached]
     fresh_budget = misses[:STEAM_LIVE_BUDGET]
 
-    lanes = max(1, len(STEAM_POOL))
+    # Полос столько, сколько выдержит priceoverview, а НЕ сколько адресов в
+    # пуле: этот эндпоинт режется жёстче всех, и 46 прокси означали 46
+    # одновременных полос и 53 запроса в минуту (диагностика 2026-08-27).
+    lanes = pricing.PRICE_CONCURRENCY
     semaphore = asyncio.Semaphore(lanes)
     log.info(
         "markets: %d кандидат(ов): в кэше %d, спрошу у Steam %d (потолок %d), полос %d",

@@ -85,6 +85,10 @@ MIN_REQUEST_INTERVAL = 4.0  # секунд между ЛЮБЫМИ двумя з
 # постоянный поток — нет.
 MANUAL_REQUEST_INTERVAL = float(os.environ.get("MANUAL_REQUEST_INTERVAL", "2.0"))
 COOLDOWN_AFTER_429_SECONDS = 30 * 60  # получили 429 -> не трогаем Steam столько времени
+# За сколько секунд подряд идущие 429 считаются ОДНИМ инцидентом и не наращивают
+# эскалацию (см. note_steam_429). Параллельные проверки цен успевают собрать
+# десяток отказов за секунды — это один залп, а не десять провинностей.
+ESCALATION_DEBOUNCE_SECONDS = float(os.environ.get("ESCALATION_DEBOUNCE_SECONDS", "120"))
 COOLDOWN_MAX_SECONDS = 6 * 60 * 60  # потолок при повторных 429 подряд (бан может быть длинным)
 
 STEAM_PROXY_URL = os.environ.get("STEAM_PROXY_URL", "").rstrip("/")
@@ -340,11 +344,28 @@ async def note_steam_429(scope: str = "listings", headers: dict | None = None) -
     забаненный IP им нельзя.
     """
     state = _cooldown_state(scope)
-    state["consecutive_429"] += 1
+
+    # Эскалация — не чаще раза в ESCALATION_DEBOUNCE_SECONDS.
+    #
+    # Удвоение рассчитано на «инцидент раз в час»: словили бан, отдохнули,
+    # словили снова — значит пауза мала, удваиваем. Но 2026-08-27 в область
+    # pricing прилетело ВОСЕМЬ 429 за десять секунд (по одному на каждого
+    # кандидата арбитража, у которого кончились маршруты), счётчик прыгнул с 8
+    # до 16, и кулдаун улетел в потолок — шесть часов, заодно похоронив prewarm.
+    # Это был один инцидент, а не восемь: наказывать за него восьмикратной
+    # эскалацией бессмысленно.
+    #
+    # Кулдаун при этом ставится в любом случае — гасится только РОСТ.
+    since_last = time.time() - state["last_429_at"]
+    burst = state["last_429_at"] > 0 and since_last < ESCALATION_DEBOUNCE_SECONDS
+    if not burst:
+        state["consecutive_429"] += 1
     seconds = min(COOLDOWN_AFTER_429_SECONDS * (2 ** (state["consecutive_429"] - 1)), COOLDOWN_MAX_SECONDS)
     log.warning(
-        "Steam (%s) вернул 429 (%s-й подряд) — кулдаун на %.0f мин для этой области",
-        scope, state["consecutive_429"], seconds / 60,
+        "Steam (%s) вернул 429 (%s-й подряд%s) — кулдаун на %.0f мин для этой области",
+        scope, state["consecutive_429"],
+        f", залп: {since_last:.0f} с с прошлого, эскалацию не наращиваю" if burst else "",
+        seconds / 60,
     )
     # Слепок снимаем ДО обновления last_429_at, чтобы в нём было видно, сколько
     # времени прошло с ПРОШЛОГО бана, а не ноль.
