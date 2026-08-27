@@ -514,94 +514,119 @@ def _steam_request_headers() -> dict:
 
 async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict, label: str):
     """
-    Один запрос к Steam через общий с steam_client троттлинг + СВОЙ,
-    отдельный от листингов, кулдаун (scope="pricing") — priceoverview и
-    market/search банятся Steam независимо от /render/ и заметно охотнее
-    (см. steam_client.py), поэтому бан здесь не должен тормозить листинги.
+    Один запрос к Steam за ценой, с перебором маршрутов внутри.
 
-    Ретраев на 429 больше нет: у Steam это временный бан IP, который
-    ПРОДЛЕВАЕТСЯ каждой новой попыткой — повторы только усугубляли бы бан.
-    Вместо этого ставим кулдаун для этой области.
+    Область кулдауна своя (scope="pricing"), отдельная от листингов:
+    priceoverview и market/search Steam банит независимо от /render/ и заметно
+    охотнее (см. steam_client.py), поэтому бан здесь не должен тормозить сбор
+    листингов.
+
+    ПОРЯДОК МАРШРУТОВ: сначала прямой, потом прокси. Раньше было наоборот — при
+    непустом пуле прокси брался всегда, а прямой адрес не пробовался ни разу.
+    Это дало парадокс, пойманный на проде 2026-08-27: пока пул был мёртвый,
+    проверка цен ходила напрямую и работала; как только в пул добавили живые
+    резидентные адреса, ВСЕ восемь проверок за прогон стали получать 429 с
+    первого же запроса, и арбитраж перестал подтверждать хоть что-нибудь. Дешёвые
+    резидентные IP у Steam давно в чёрных списках (их жгли другие клиенты
+    провайдера), тогда как прямой адрес Render в тот же час спокойно отдавал
+    листингам HTTP 200.
+
+    ПОЧЕМУ ПЕРЕБОР ЗДЕСЬ, А НЕ СНАРУЖИ. Напрашивалось проще: поймать 429 на
+    прямом, поставить кулдаун области и дать внешнему циклу
+    (get_steam_market_price_retrying) уйти на прокси. Так делать нельзя —
+    note_steam_429 через _apply_collateral_cooldown придерживает ОСТАЛЬНЫЕ
+    области, то есть один 429 на проверке цены остановил бы вотчлист на
+    полчаса. Поэтому смена маршрута происходит тут же, без глобального
+    кулдауна, и он ставится только когда кончились все маршруты — ровно как в
+    steam_client.fetch_all_listings.
     """
-    # С пулом резидентных прокси кулдаун области больше не приговор: бан у
-    # Steam всегда поадресный, и пока в пуле есть свободный адрес, запрос имеет
-    # смысл отправить с него. Проверку кулдауна оставляем только для прямого
-    # маршрута, где менять действительно нечего.
-    proxy = STEAM_POOL.next() if STEAM_POOL.enabled() else None
-    if proxy is None and steam_cooldown_remaining(scope="pricing") > 0:
-        raise RateLimited()
+    # Прямой маршрут пробуем первым, если он не на кулдауне после недавнего 429.
+    routes: list[str | None] = []
+    if steam_cooldown_remaining(scope="pricing") <= 0:
+        routes.append(None)
+    tries_left = min(max(1, len(STEAM_POOL)), STEAM_RETRY_CAP)
 
-    # Через прокси куку аккаунта НЕ шлём.
-    #
-    # steamLoginSecure — авторизация конкретной сессии, и Steam привязывает её
-    # к адресу. Гонять один логин одновременно с шести резидентных IP выглядит
-    # ровно как кража сессии: в лучшем случае разлогинит, в худшем пометит
-    # аккаунт. priceoverview — публичный эндпоинт, логин ему не нужен, а
-    # bMarketOptOut=1 работает и без него (см. steam_client.steam_cookie_header).
-    #
-    # Защиту от рейт-лимитов, ради которой куку и слали, при этом даёт сам пул:
-    # у каждого адреса свой бюджет.
-    headers = _steam_request_headers()
-    if proxy:
-        headers = {"Cookie": "bMarketOptOut=1"}
+    last_status: int | None = None
+    while True:
+        if routes:
+            proxy = routes.pop(0)
+        else:
+            if tries_left <= 0:
+                break
+            proxy = STEAM_POOL.next() if STEAM_POOL.enabled() else None
+            if proxy is None:
+                break
+            tries_left -= 1
 
-    # Пауза считается ПО АДРЕСУ: Steam банит по IP, значит и темп надо держать
-    # по IP — иначе шесть адресов дают не шесть полос, а шесть раз по одной.
-    await throttle_steam_request(scope="pricing", lane=proxy or "")
-    try:
+        # Через прокси куку аккаунта НЕ шлём.
+        #
+        # steamLoginSecure — авторизация конкретной сессии, и Steam привязывает
+        # её к адресу. Гонять один логин одновременно с десятков резидентных IP
+        # выглядит ровно как кража сессии: в лучшем случае разлогинит, в худшем
+        # пометит аккаунт. priceoverview — публичный эндпоинт, логин ему не
+        # нужен, а bMarketOptOut=1 работает и без него.
+        headers = _steam_request_headers() if proxy is None else {"Cookie": "bMarketOptOut=1"}
+
+        # Пауза считается ПО АДРЕСУ: Steam банит по IP, значит и темп надо
+        # держать по IP — иначе N адресов дают не N полос, а N раз по одной.
+        await throttle_steam_request(scope="pricing", lane=proxy or "")
         resp_ctx = session.get(url, params=params, headers=headers, proxy=proxy)
-        resp = await resp_ctx.__aenter__()
-    except aiohttp.ClientError as e:
-        # Тот же класс бага, что чинили в steam_client.fetch_all_listings:
-        # прокси не смог даже соединиться (или сам отверг CONNECT, как
-        # ClientHttpProxyError 403 при протухшем аккаунте flameproxies) — это
-        # НЕ ответ Steam. Раньше такое исключение улетало наверх мимо ветки
-        # "resp.status == 429" (она просто не срабатывала — до неё не
-        # доходило) и мимо retry-цикла get_steam_market_price_retrying (он
-        # ловит только RateLimited), поэтому кандидат сразу считался
-        # "Steam не ответил" вместо того, чтобы попробовать другой адрес.
-        # На проде это выглядело как "25 из 25 запросов не прошли — Steam
-        # ограничил доступ", хотя на деле Steam тут был ни при чём.
-        if proxy:
-            status = getattr(e, "status", None)
-            if status == 403:
-                STEAM_POOL.mark_refused(proxy, STEAM_PROXY_COOLDOWN_SECONDS, f"HTTP 403: {e}")
-            else:
-                STEAM_POOL.mark_exhausted(proxy, STEAM_PROXY_COOLDOWN_SECONDS, f"ошибка соединения: {e}")
-        log.warning(
-            "%s: маршрут %s не работает (%s) для запроса %r",
-            label, mask_proxy(proxy) if proxy else "прямой", e,
-            params.get("query") or params.get("market_hash_name"),
-        )
-        # RateLimited — тот же сигнал, что и на реальный 429: вызывающий код
-        # (get_steam_market_price_retrying) уже умеет на него реагировать
-        # повторной попыткой с другого адреса пула.
-        raise RateLimited()
-
-    try:
-        if resp.status == 429:
-            log.warning(
-                "%s: HTTP 429 для запроса %r (маршрут: %s)",
-                label, params.get("query") or params.get("market_hash_name"),
-                mask_proxy(proxy) if proxy else "напрямую",
-            )
+        try:
+            resp = await resp_ctx.__aenter__()
+        except aiohttp.ClientError as e:
+            # Сбой САМОГО соединения (в т.ч. ClientHttpProxyError 403, когда
+            # провайдер отказал в обслуживании) — это НЕ ответ Steam. Раньше
+            # такое исключение улетало наверх мимо ветки "resp.status == 429" и
+            # мимо retry-цикла снаружи, и кандидат сразу считался «Steam не
+            # ответил». На проде это выглядело как «25 из 25 запросов не прошли —
+            # Steam ограничил доступ», хотя Steam тут был ни при чём.
             if proxy:
-                # Забанен адрес, а не мы целиком: откладываем его и живём
-                # дальше. Общий кулдаун области ставим только без пула — иначе
-                # один плохой адрес тормозил бы все остальные.
-                STEAM_POOL.mark_exhausted(proxy, STEAM_PROXY_COOLDOWN_SECONDS, "Steam ответил 429")
-            else:
-                await note_steam_429(scope="pricing", headers=dict(resp.headers))
-            raise RateLimited()
-        await note_steam_ok(scope="pricing")
-        # Запрос прошёл — сбрасываем накопленные отказы этого адреса.
-        STEAM_POOL.mark_ok(proxy)
-        if resp.status != 200:
-            log.warning("%s: HTTP %s для запроса %r", label, resp.status, params.get("query") or params.get("market_hash_name"))
-            return None
-        return await resp.json()
-    finally:
-        await resp_ctx.__aexit__(None, None, None)
+                if getattr(e, "status", None) == 403:
+                    STEAM_POOL.mark_refused(proxy, STEAM_PROXY_COOLDOWN_SECONDS, f"HTTP 403: {e}")
+                else:
+                    STEAM_POOL.mark_exhausted(proxy, STEAM_PROXY_COOLDOWN_SECONDS, f"ошибка соединения: {e}")
+            log.warning(
+                "%s: маршрут %s не работает (%s) для запроса %r",
+                label, mask_proxy(proxy) if proxy else "прямой", e,
+                params.get("query") or params.get("market_hash_name"),
+            )
+            continue
+
+        try:
+            if resp.status == 429:
+                log.warning(
+                    "%s: HTTP 429 для запроса %r (маршрут: %s)",
+                    label, params.get("query") or params.get("market_hash_name"),
+                    mask_proxy(proxy) if proxy else "напрямую",
+                )
+                last_status = 429
+                if proxy:
+                    # Забанен адрес, а не мы целиком: откладываем его и берём
+                    # следующий. Общий кулдаун области — только когда маршруты
+                    # кончатся совсем (см. ниже), иначе один плохой адрес
+                    # тормозил бы вообще всё, включая вотчлист.
+                    STEAM_POOL.mark_exhausted(proxy, STEAM_PROXY_COOLDOWN_SECONDS, "Steam ответил 429")
+                continue
+
+            await note_steam_ok(scope="pricing")
+            STEAM_POOL.mark_ok(proxy)  # прошло — забываем прошлые отказы адреса
+            if resp.status != 200:
+                log.warning(
+                    "%s: HTTP %s для запроса %r",
+                    label, resp.status, params.get("query") or params.get("market_hash_name"),
+                )
+                return None
+            return await resp.json()
+        finally:
+            await resp_ctx.__aexit__(None, None, None)
+
+    # Маршруты кончились. Кулдаун области ставим только теперь и только если
+    # причиной был именно 429 — на сетевых сбоях прокси Steam ни при чём, и
+    # наказывать за них прямой адрес (а через collateral — ещё и вотчлист)
+    # было бы прямо вредно.
+    if last_status == 429:
+        await note_steam_429(scope="pricing", headers={})
+    raise RateLimited()
 
 
 def _money(raw) -> float | None:
