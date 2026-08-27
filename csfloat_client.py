@@ -930,11 +930,17 @@ async def fetch_listings_page(
     sort_by: str = "most_recent",
     min_price: float | None = None,
     max_price: float | None = None,
+    market_hash_name: str | None = None,
     proxy: str | None = None,
 ) -> tuple[list[CSFloatListing], str | None]:
     """
     Одна страница лотов CSFloat. Возвращает (лоты, курсор_следующей_страницы).
     Цены на вход — в долларах, наружу в API уходят центами.
+
+    market_hash_name — сузить выборку до одного предмета. Параметр
+    документированный, широкому скану не нужен (он смотрит рынок целиком), а
+    вот для разбора одного предмета — единственный способ не выкачивать всё
+    подряд.
     """
     if not csfloat_enabled():
         raise CSFloatError("CSFLOAT_API_KEY не задан")
@@ -954,6 +960,8 @@ async def fetch_listings_page(
         params["min_price"] = str(int(min_price * 100))
     if max_price is not None:
         params["max_price"] = str(int(max_price * 100))
+    if market_hash_name:
+        params["market_hash_name"] = market_hash_name
 
     url, request_params = _build_request("/listings", params)
 

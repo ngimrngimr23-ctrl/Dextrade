@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import re
+import statistics
 import subprocess
 import tempfile
 import threading
@@ -172,6 +173,11 @@ SCAN_CONCURRENCY = int(os.environ.get("SCAN_CONCURRENCY", "4"))
 # количество прокси ничем не ограничено.
 PROXYCHECK_CONCURRENCY = int(os.environ.get("PROXYCHECK_CONCURRENCY", "10"))
 PROXYCHECK_DETAIL_LIMIT = int(os.environ.get("PROXYCHECK_DETAIL_LIMIT", "20"))
+
+# /floatcheck: с какой разницы медиан считать, что за флоат реально доплачивают.
+# Ниже этого — шум выборки: на проде AWP | Black Nile (FN) с флоатом 0.00585
+# стоил на 0.8% дороже обычного, и называть это наценкой было бы враньём.
+FLOATCHECK_MEANINGFUL_PREMIUM_PCT = float(os.environ.get("FLOATCHECK_MEANINGFUL_PREMIUM_PCT", "10"))
 
 # Ожидание выбора варианта после неоднозначного поиска по названию (несколько
 # степеней износа и т.п.) — chat_id -> {"results": [...], "min_value":..., "max_markup":...}
@@ -2671,6 +2677,168 @@ async def setarbstickers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def floatcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /floatcheck <предмет> [флоат] — платит ли рынок за низкий флоат ИМЕННО тут.
+
+    Зачем команда. Общего ответа на «сколько стоит хороший флоат» не
+    существует: на одном скине за 0.005 доплачивают кратно, на другом — ноль.
+    Разбираться надо по конкретному предмету, и вот наглядный случай с прода
+    2026-08-27: AWP | Black Nile (FN) с флоатом 0.00585 стоил на Steam $36.60
+    при цене обычного экземпляра $36.30 — наценка 0.8%, то есть шум.
+
+    Причина, по которой это вообще возможно: Steam флоат НЕ ПОКАЗЫВАЕТ — ни в
+    поиске, ни в фильтрах. Покупателю пришлось бы открывать инспект-ссылку
+    каждого лота вручную, поэтому низкий флоат там лежит по цене обычного. А
+    CSFloat вырос из FloatDB, у него флоат — первоклассный признак с
+    сортировкой и рангом. Разница между этими двумя площадками и есть весь
+    смысл охоты за флоатом; команда отвечает, есть ли она на данном предмете.
+
+    Как считается: два запроса к CSFloat — самые низкофлоатные лоты и самые
+    высокофлоатные, в пределах ОДНОГО market_hash_name (а он включает износ,
+    так что категория зафиксирована и сравниваются сопоставимые вещи).
+    Сравниваем медианные цены двух групп.
+    """
+    chat_id = update.effective_chat.id
+    if not context.args:
+        await update.message.reply_text(
+            "Проверить, платят ли за низкий флоат на конкретном скине.\n\n"
+            "<code>/floatcheck AWP | Black Nile (Factory New)</code>\n"
+            "<code>/floatcheck AWP | Black Nile (Factory New) 0.00585</code>\n\n"
+            "Во втором виде скажу ещё и про твой флоат: насколько он низкий "
+            "для этого предмета и попадает ли в ценимую зону.",
+            parse_mode="HTML",
+        )
+        return
+    if not csfloat_client.csfloat_enabled():
+        await update.message.reply_text("Не задан CSFLOAT_API_KEY — спрашивать цены не у кого.")
+        return
+
+    # Последний аргумент может быть флоатом пользователя. Отделяем его от
+    # названия так же, как это делает _split_args для мин$/макс% в /scan.
+    args = list(context.args)
+    my_float: float | None = None
+    if len(args) > 1:
+        try:
+            candidate = float(args[-1].replace(",", "."))
+        except ValueError:
+            candidate = None
+        if candidate is not None and 0 <= candidate <= 1:
+            my_float = candidate
+            args = args[:-1]
+
+    raw = " ".join(args)
+    market_hash_name = await _resolve_market_hash_name(
+        update, raw, "floatcheck", DEFAULT_MIN_VALUE, DEFAULT_MAX_MARKUP
+    )
+    if market_hash_name is None:
+        return  # либо ошибка уже сообщена, либо ждём выбора номера
+
+    await update.message.reply_text(f"Смотрю лоты «{market_hash_name}» на CSFloat…")
+    proxy = csfloat_client.CSFLOAT_POOL.next() if csfloat_client.CSFLOAT_POOL.enabled() else None
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=60), headers=csfloat_client._API_HEADERS,
+        ) as session:
+            # Два конца выборки: самые низкофлоатные лоты и самые высокофлоатные.
+            # Оба в пределах одного market_hash_name, а он включает износ — то
+            # есть категория зафиксирована и сравниваются сопоставимые вещи.
+            low, _ = await csfloat_client.fetch_listings_page(
+                session, sort_by="lowest_float",
+                market_hash_name=market_hash_name, proxy=proxy,
+            )
+            high, _ = await csfloat_client.fetch_listings_page(
+                session, sort_by="highest_float",
+                market_hash_name=market_hash_name, proxy=proxy,
+            )
+    except CSFloatRateLimited as e:
+        await update.message.reply_text(f"⏸ {e}")
+        return
+    except CSFloatError as e:
+        await update.message.reply_text(f"⚠️ {e}")
+        return
+
+    priced = [l for l in low + high if l.float_value is not None and l.price > 0]
+    if not priced:
+        await update.message.reply_text(
+            f"На CSFloat сейчас нет лотов «{market_hash_name}» с известным флоатом — "
+            "сравнивать нечего."
+        )
+        return
+
+    # Дубликаты: если лотов у предмета меньше сотни, обе выборки пересекаются.
+    by_id = {l.listing_id: l for l in priced}
+    lots = sorted(by_id.values(), key=lambda l: l.float_value)
+
+    lines = [
+        f"🔍 <b>{html_module.escape(market_hash_name)}</b>",
+        f"Лотов на CSFloat в выборке: {len(lots)} "
+        f"(флоат {lots[0].float_value:.5f} … {lots[-1].float_value:.5f})",
+    ]
+
+    if len(lots) < 4:
+        # Двух-трёх лотов не хватает даже на грубое сравнение: одна случайная
+        # цена сделает «наценку» любой. Честнее сказать, что вывода нет.
+        lines.append(
+            "\n⚠️ Лотов слишком мало для вывода — на такой выборке «наценка» "
+            "будет случайной. Смотри руками."
+        )
+    else:
+        half = len(lots) // 2
+        low_group, high_group = lots[:half], lots[half:]
+        low_med = statistics.median(l.price for l in low_group)
+        high_med = statistics.median(l.price for l in high_group)
+        premium = (low_med - high_med) / high_med * 100 if high_med > 0 else 0.0
+
+        lines.append(
+            f"\n<b>Нижняя половина по флоату</b> ({low_group[0].float_value:.5f}"
+            f"–{low_group[-1].float_value:.5f})\n"
+            f"  медиана цены ${low_med:.2f}"
+        )
+        lines.append(
+            f"<b>Верхняя половина</b> ({high_group[0].float_value:.5f}"
+            f"–{high_group[-1].float_value:.5f})\n"
+            f"  медиана цены ${high_med:.2f}"
+        )
+
+        if premium >= FLOATCHECK_MEANINGFUL_PREMIUM_PCT:
+            lines.append(
+                f"\n✅ <b>За низкий флоат доплачивают: +{premium:.0f}%</b>\n"
+                f"<i>Значит охота за флоатом на этом предмете имеет смысл.</i>"
+            )
+        elif premium <= -FLOATCHECK_MEANINGFUL_PREMIUM_PCT:
+            lines.append(
+                f"\n↕️ Низкофлоатные тут <b>дешевле</b> на {abs(premium):.0f}% — "
+                "скорее всего цену определяет что-то другое (паттерн, наклейки), "
+                "а не флоат."
+            )
+        else:
+            lines.append(
+                f"\n❌ <b>Наценки за флоат нет</b> (разница {premium:+.0f}%).\n"
+                "<i>Покупать этот экземпляр ради флоата смысла нет: продать "
+                "дороже обычного не выйдет.</i>"
+            )
+
+    if my_float is not None:
+        lower = sum(1 for l in lots if l.float_value < my_float)
+        cheapest = min(lots, key=lambda l: l.price)
+        lines.append(
+            f"\n<b>Твой флоат {my_float:.5f}</b>\n"
+            f"  ниже него в выборке: {lower} из {len(lots)} лотов\n"
+            f"  самый дешёвый лот на CSFloat: ${cheapest.price:.2f} "
+            f"(флоат {cheapest.float_value:.5f})"
+        )
+
+    lines.append(
+        "\n<i>Steam флоат не показывает вовсе — там низкий флоат лежит по цене "
+        "обычного. CSFloat его ищет и ранжирует. В этом зазоре и есть смысл "
+        "охоты; цифры выше говорят, есть ли он на этом предмете.</i>"
+    )
+
+    for chunk in _chunk_lines(lines):
+        await update.message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
+
+
 async def arbnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/arbnow — проверить арбитраж прямо сейчас, не дожидаясь расписания."""
     chat_id = update.effective_chat.id
@@ -3933,6 +4101,7 @@ BOT_COMMANDS = [
     BotCommand("watchpause", "Остановить автоскан"),
     BotCommand("watchresume", "Возобновить автоскан"),
     BotCommand("arbnow", "Проверить арбитраж CSFloat прямо сейчас"),
+    BotCommand("floatcheck", "Платят ли за низкий флоат на этом скине"),
     BotCommand("inv", "Инвентарь Steam: привязать аккаунт и оценить"),
     BotCommand("invwatch", "Сообщать, когда скины в инвентаре дорожают"),
     BotCommand("markets", "Сравнить Steam с другими площадками (весь каталог)"),
@@ -4325,6 +4494,7 @@ def _build_application(token: str):
     app.add_handler(CommandHandler("setarbvolume", setarbvolume))
     app.add_handler(CommandHandler("setarbstickers", setarbstickers))
     app.add_handler(CommandHandler("arbnow", arbnow))
+    app.add_handler(CommandHandler("floatcheck", floatcheck))
     app.add_handler(CommandHandler("inv", inv))
     app.add_handler(CommandHandler("invwatch", invwatch))
     app.add_handler(CommandHandler("markets", markets))
