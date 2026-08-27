@@ -538,10 +538,26 @@ async def handle_text_selection(update: Update, context: ContextTypes.DEFAULT_TY
     min_value = pending["min_value"]
     max_markup = pending["max_markup"]
 
-    if pending["mode"] == "scan":
+    # Разбор ПО ИМЕНИ режима, без ветки "всё остальное".
+    #
+    # Раньше здесь стояло `if mode == "scan" ... else scanfile`, и это была
+    # мина: любой новый режим молча уезжал в ручной сбор файлов. На ней и
+    # подорвался /floatcheck — пользователь выбирал номер варианта и получал
+    # инструкцию «сохрани страницу как .json и пришли файл», не имевшую к
+    # его команде никакого отношения.
+    mode = pending["mode"]
+    if mode == "scan":
         await _proceed_scan(update, market_hash_name, min_value, max_markup)
-    else:
+    elif mode == "scanfile":
         await _proceed_scanfile(update, market_hash_name, min_value, max_markup)
+    elif mode == "floatcheck":
+        await _proceed_floatcheck(update, market_hash_name, pending.get("float"))
+    else:
+        log.error("handle_text_selection: неизвестный режим %r — обработчик не найден", mode)
+        await update.message.reply_text(
+            f"Внутренняя ошибка: не знаю, что делать с режимом {mode!r}. "
+            "Повтори команду заново."
+        )
 
 
 def _decode_floats(listings: list, limit: int | None = None) -> dict[str, float]:
@@ -2732,8 +2748,18 @@ async def floatcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update, raw, "floatcheck", DEFAULT_MIN_VALUE, DEFAULT_MAX_MARKUP
     )
     if market_hash_name is None:
-        return  # либо ошибка уже сообщена, либо ждём выбора номера
+        # Ждём выбора номера. Флоат пользователя надо пронести через это
+        # ожидание, иначе после выбора он потеряется.
+        pending = _pending_search.get(update.effective_chat.id)
+        if pending is not None:
+            pending["float"] = my_float
+        return
 
+    await _proceed_floatcheck(update, market_hash_name, my_float)
+
+
+async def _proceed_floatcheck(update: Update, market_hash_name: str, my_float: float | None):
+    """Собственно разбор предмета — отдельно, чтобы вызываться и после выбора номера."""
     await update.message.reply_text(f"Смотрю лоты «{market_hash_name}» на CSFloat…")
     proxy = csfloat_client.CSFLOAT_POOL.next() if csfloat_client.CSFLOAT_POOL.enabled() else None
     try:
