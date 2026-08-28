@@ -3843,6 +3843,14 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
         try:
             source, steam_prices, by_market, counts = await _collect_market_prices(session)
+        except sih_client.SihKeyError as e:
+            # Различие между двумя ключами SIH неочевидное, и без объяснения
+            # «api key is wrong» отправляет проверять правильный ключ вместо
+            # того, чтобы взять другой.
+            await update.message.reply_text(
+                f"⚠️ {e}\n\n{sih_client.key_help()}", parse_mode="HTML"
+            )
+            return
         except (sih_client.SihError, MarketsUnavailable) as e:
             await update.message.reply_text(f"⚠️ {e}")
             return
@@ -4690,6 +4698,33 @@ async def _apply_setting(chat_id: int, key: str, value, context) -> str:
     raise ValueError(f"Неизвестный порог {key!r}")
 
 
+async def _check_sih_key(update) -> None:
+    """
+    Годится ли ключ SIH для цен — отдельной кнопкой.
+
+    Нужна потому, что негодный ключ проявляется не при настройке, а через
+    прогон /markets, и выглядит как поломка сравнения цен. Здесь ответ
+    получается одним запросом к самому простому эндпоинту.
+    """
+    if not sih_client.enabled():
+        await update.message.reply_text(
+            "SIH_API_KEY не задан — цены берутся из csgotrader.\n"
+            "Ключ ставится переменной окружения на Render."
+        )
+        return
+
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+        try:
+            result = await sih_client.check_key(session)
+        except sih_client.SihError as e:
+            await update.message.reply_text(f"⚠️ {e}", parse_mode="HTML")
+            return
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            await update.message.reply_text(f"⚠️ Не достучался до SIH: {type(e).__name__}")
+            return
+    await update.message.reply_text(result)
+
+
 async def _menu_screen(chat_id: int, node: str, context) -> tuple[str, object]:
     """Текст и клавиатура для узла меню. Один вход — чтобы «назад» и «обновить» шли тем же путём."""
     if node == "root":
@@ -4870,6 +4905,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif payload == "proxyclear":
         await proxyclear(shim, _SubCtx(context, []))
         await _show_menu(query, chat_id, "proxy", context)
+    elif payload == "sihkey":
+        await _check_sih_key(shim)
     elif payload == "pricefile":
         await pricefile(shim, context)
     elif payload == "clearprices":

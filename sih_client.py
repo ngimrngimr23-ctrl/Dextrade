@@ -67,6 +67,50 @@ class SihRateLimited(SihError):
         self.retry_after = retry_after
 
 
+class SihKeyError(SihError):
+    """Ключ не подходит. Лечится заменой ключа, и ничем другим."""
+
+
+# Признаки того, что дело в ключе, а не в запросе.
+#
+# Нужны потому, что SIH отвечает на неверный ключ кодом 400 («api key is
+# wrong»), а не 401/403, как обещает его же документация. Разбирать это по
+# статусу нельзя: 400 у него означает и «параметры не те», и «ключ не тот», а
+# лечатся они противоположным образом. На проде это стоило целого прогона —
+# бот честно перебрал четыре написания параметров и получил один и тот же
+# ответ про ключ.
+_KEY_PROBLEM_MARKERS = (
+    "api key", "api-key", "apikey", "ключ",
+    "unauthorized", "access denied", "not allowed",
+)
+
+
+def _looks_like_key_problem(text: str) -> bool:
+    low = text.lower()
+    return any(marker in low for marker in _KEY_PROBLEM_MARKERS)
+
+
+def key_help() -> str:
+    """
+    Почему верный на вид ключ не подходит.
+
+    Текст отдельной функцией, потому что нужен в двух местах и потому что
+    различие неочевидное: у SIH два разных ключа с почти одинаковыми именами
+    заголовков, и подписка выдаёт НЕ тот, который нужен ценам.
+    """
+    return (
+        f"Ключ сейчас: {key_fingerprint()}\n\n"
+        "У SIH ДВА разных ключа, и они не взаимозаменяемы:\n"
+        "• пользовательский публичный — заголовок <code>api-key</code> (с дефисом), "
+        "база core.steaminventoryhelper.com. Им работает пополнение кошелька Steam. "
+        "Его и даёт подписка.\n"
+        "• ключ ПРОЕКТА — заголовок <code>apikey</code> (без дефиса), "
+        "база api.sih.market. Только он открывает цены (get-items).\n\n"
+        "Нужен второй. Он создаётся в разделе проектов Market "
+        "(там же, где webhook и sandbox), а не в настройках аккаунта."
+    )
+
+
 class SihItem(NamedTuple):
     """Одна запись каталога. Любое поле, кроме price, может отсутствовать."""
 
@@ -204,8 +248,10 @@ async def _get(session: aiohttp.ClientSession, path: str, params: dict) -> dict:
             # Параметры в сообщении — намеренно: без них «неверный запрос»
             # не отличить от «неверный запрос ИМЕННО с этим appId».
             shown = ", ".join(f"{k}={v}" for k, v in params.items()) or "без параметров"
-            if resp.status in (401, 403):
-                raise SihError(
+            # Ключ определяем по ТЕКСТУ, а не по статусу: SIH отвечает на
+            # неверный ключ кодом 400 наравне с неверными параметрами.
+            if resp.status in (401, 403) or _looks_like_key_problem(detail):
+                raise SihKeyError(
                     f"SIH отклонил ключ (HTTP {resp.status}): {detail or 'без пояснения'}"
                 )
             raise SihError(
@@ -257,14 +303,14 @@ async def _fetch_items_payload(session: aiohttp.ClientSession, app_id: int) -> d
         label, build = _ITEMS_PARAM_VARIANTS[index]
         try:
             payload = await _get(session, "get-items", build(app_id))
-        except SihRateLimited:
+        except (SihRateLimited, SihKeyError):
+            # Ни то, ни другое к написанию параметров отношения не имеет.
+            # Перебирать варианты дальше значит четыре раза получить один и
+            # тот же ответ и спрятать его смысл за списком попыток.
             raise
         except SihError as e:
-            text = str(e)
-            if "отклонил ключ" in text:
-                raise
-            problems.append(f"{label}: {text}")
-            log.info("sih: вариант «%s» не подошёл — %s", label, text)
+            problems.append(f"{label}: {e}")
+            log.info("sih: вариант «%s» не подошёл — %s", label, e)
             continue
         if _working_variant != index:
             log.info("sih: get-items отвечает на вариант «%s», запоминаю", label)
@@ -273,6 +319,27 @@ async def _fetch_items_payload(session: aiohttp.ClientSession, app_id: int) -> d
 
     raise SihError(
         "SIH не принял ни одно написание параметров get-items.\n" + "\n".join(problems)
+    )
+
+
+async def check_key(session: aiohttp.ClientSession) -> str:
+    """
+    Проверить ключ самым простым эндпоинтом и объяснить результат.
+
+    GET /project — канонический ответ на вопрос «годится ли этот ключ для
+    api.sih.market»: он ничего не принимает и ничего не меняет, так что
+    отказ на нём означает ровно одно.
+    """
+    try:
+        payload = await _get(session, "project", {})
+    except SihKeyError as e:
+        raise SihKeyError(f"{e}\n\n{key_help()}") from None
+
+    project = payload.get("project") or {}
+    name = project.get("name") or "без названия"
+    return (
+        f"✅ Ключ подходит. Проект «{name}» (id {project.get('id', '?')}), "
+        f"баланс ${project.get('balance', 0)}"
     )
 
 
