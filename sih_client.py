@@ -225,15 +225,38 @@ async def _error_detail(resp) -> str:
     return ""
 
 
-async def _get(session: aiohttp.ClientSession, path: str, params: dict) -> dict:
+# Как передавать ключ. Документация Market показывает apikey без дефиса, но у
+# SIH рядом живёт второй API с заголовком api-key, и перепутать написание —
+# ровно тот сорт ошибки, который выглядит как «ключ не тот». Проверить это
+# стоит четырёх read-only запросов к /project, а отправить человека искать
+# несуществующий проект — полчаса впустую. Сработавшее запоминается.
+_HEADER_VARIANTS = (
+    ("apikey", lambda key: {"apikey": key}),
+    ("api-key", lambda key: {"api-key": key}),
+    ("x-api-key", lambda key: {"x-api-key": key}),
+    ("Authorization: Bearer", lambda key: {"Authorization": f"Bearer {key}"}),
+)
+
+_working_header = 0
+
+
+async def _get(
+    session: aiohttp.ClientSession,
+    path: str,
+    params: dict,
+    header_index: int | None = None,
+) -> dict:
     if not SIH_API_KEY:
         raise SihError("не задан SIH_API_KEY")
 
+    _, build_headers = _HEADER_VARIANTS[
+        _working_header if header_index is None else header_index
+    ]
     url = f"{BASE_URL}/{path.lstrip('/')}"
     async with session.get(
         url,
         params=params,
-        headers={"apikey": SIH_API_KEY},
+        headers=build_headers(SIH_API_KEY),
         timeout=REQUEST_TIMEOUT,
     ) as resp:
         if resp.status == 429:
@@ -330,16 +353,43 @@ async def check_key(session: aiohttp.ClientSession) -> str:
     api.sih.market»: он ничего не принимает и ничего не меняет, так что
     отказ на нём означает ровно одно.
     """
-    try:
-        payload = await _get(session, "project", {})
-    except SihKeyError as e:
-        raise SihKeyError(f"{e}\n\n{key_help()}") from None
+    global _working_header
 
-    project = payload.get("project") or {}
-    name = project.get("name") or "без названия"
-    return (
-        f"✅ Ключ подходит. Проект «{name}» (id {project.get('id', '?')}), "
-        f"баланс ${project.get('balance', 0)}"
+    # Запомненное написание пробуем первым: после того как оно найдено,
+    # начинать проверку с documented-варианта значит каждый раз получать
+    # заведомый отказ перед заведомым успехом.
+    order = list(range(len(_HEADER_VARIANTS)))
+    order.remove(_working_header)
+    order.insert(0, _working_header)
+
+    refusals: list[str] = []
+    for index in order:
+        label = _HEADER_VARIANTS[index][0]
+        try:
+            payload = await _get(session, "project", {}, header_index=index)
+        except SihRateLimited:
+            raise
+        except SihError as e:
+            refusals.append(f"{label}: {e}")
+            log.info("sih: заголовок «%s» не принят — %s", label, e)
+            continue
+
+        if _working_header != index:
+            log.info("sih: ключ принят заголовком «%s», запоминаю", label)
+            _working_header = index
+        project = payload.get("project") or {}
+        name = project.get("name") or "без названия"
+        note = "" if index == 0 else f"\nЗаголовок: {label} (не тот, что в документации)"
+        return (
+            f"✅ Ключ подходит. Проект «{name}» (id {project.get('id', '?')}), "
+            f"баланс ${project.get('balance', 0)}{note}"
+        )
+
+    # Ни одно написание не подошло — значит дело точно в самом ключе.
+    raise SihKeyError(
+        "Ключ не принят ни одним написанием заголовка:\n"
+        + "\n".join(f"  • {r}" for r in refusals)
+        + f"\n\n{key_help()}"
     )
 
 
