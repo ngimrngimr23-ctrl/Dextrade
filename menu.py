@@ -311,6 +311,7 @@ def proxy() -> InlineKeyboardMarkup:
 
 def prices() -> InlineKeyboardMarkup:
     return _rows(
+        [InlineKeyboardButton("🔬 Сверить источники цен", callback_data=f"{ACT}|pricecheck")],
         [InlineKeyboardButton("🔑 Проверить ключ SIH", callback_data=f"{ACT}|sihkey")],
         [InlineKeyboardButton("📥 Загрузить прайс-лист", callback_data=f"{ACT}|pricefile")],
         [InlineKeyboardButton("🗑 Очистить прайс-лист", callback_data=f"{ACT}|clearprices")],

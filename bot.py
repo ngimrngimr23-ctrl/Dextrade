@@ -4698,6 +4698,180 @@ async def _apply_setting(chat_id: int, key: str, value, context) -> str:
     raise ValueError(f"Неизвестный порог {key!r}")
 
 
+# Сколько предметов сверять. Двадцати хватает с запасом: если расхождение
+# систематическое (а отношение 2.3-2.7 держалось на 1290 предметах подряд —
+# рынки так не расходятся, их разногласия случайны), постоянный множитель
+# виден уже на десятке точек, а случайный разброс на них же рассыпается.
+PRICECHECK_SAMPLE = int(os.environ.get("PRICECHECK_SAMPLE", "20"))
+
+
+def _ratio_verdict(ratios: list[float]) -> str:
+    """
+    Что означает набор отношений «оценка / живая цена».
+
+    Разделяем два случая, которые по одному предмету неразличимы: рынок
+    разошёлся (разброс большой, медиана около единицы) и шкала сдвинута
+    (разброс маленький, медиана далеко от единицы). Второе — арифметика:
+    валюта, единицы, не то окно, — и лечится оно правкой кода, а не порогов.
+    """
+    if not ratios:
+        return "Сверить не удалось ни одного предмета."
+
+    median = statistics.median(ratios)
+    within = sum(1 for r in ratios if 0.9 <= r <= 1.1)
+    spread = (max(ratios) - min(ratios)) if len(ratios) > 1 else 0.0
+
+    if 0.9 <= median <= 1.1 and within >= len(ratios) * 0.6:
+        return (
+            f"✅ Оценка сходится с живой ценой: медиана ×{median:.2f}, "
+            f"{within} из {len(ratios)} в пределах ±10%.\n"
+            "Источник цен исправен — расхождение искать не здесь."
+        )
+    if spread < median * 0.5:
+        return (
+            f"⚠️ Шкала сдвинута: медиана ×{median:.2f} при узком разбросе "
+            f"({min(ratios):.2f}…{max(ratios):.2f}).\n"
+            "Почти постоянный множитель на несвязанных предметах — это не спор "
+            "о стоимости, а арифметика: валюта, единицы или не то окно."
+        )
+    return (
+        f"❓ Разброс широкий: медиана ×{median:.2f}, "
+        f"от {min(ratios):.2f} до {max(ratios):.2f}, в пределах ±10% — "
+        f"{within} из {len(ratios)}.\n"
+        "На системную ошибку не похоже: скорее оценка просто неточная "
+        "на части предметов."
+    )
+
+
+async def pricecheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /pricecheck [сколько] — сверить оценки цен с живой ценой Steam.
+
+    Зачем. Арбитраж месяц не подтверждал ни одного кандидата, а два источника
+    оценки — прайс-лист csgotrader и справка CSFloat — расходились на 97%
+    предметов с отношением, устойчиво державшимся около 2.3-2.7. Разрешить
+    спор двоих нечем: нужен третий, и притом настоящий.
+
+    Настоящий у нас есть — живой priceoverview, тот самый, которым
+    _verify_against_steam проверяет находки. Дорог он только по запросам,
+    поэтому целый каталог им не сверить. Но целый и не нужен: систематический
+    сдвиг виден на выборке, случайный разброс на ней же рассыпается.
+
+    Берём одну страницу CSFloat (один запрос — там сразу и справочная цена, и
+    market_hash_name), пересекаем с прайс-листом и спрашиваем Steam про
+    несколько предметов. Так воспроизводится ровно та ситуация, в которой
+    расхождение и наблюдалось.
+    """
+    chat_id = update.effective_chat.id
+    try:
+        sample = int(context.args[0]) if context.args else PRICECHECK_SAMPLE
+    except ValueError:
+        await update.message.reply_text("Нужно число. Пример: /pricecheck 20")
+        return
+    sample = max(3, min(sample, 40))
+
+    if not csfloat_client.csfloat_enabled():
+        await update.message.reply_text("Не задан CSFLOAT_API_KEY — брать справочные цены неоткуда.")
+        return
+
+    await update.message.reply_text(
+        f"Сверяю {sample} предметов с живой ценой Steam.\n"
+        f"Пауза между запросами {pricing.PRICE_REQUEST_INTERVAL:g} с, "
+        f"это примерно {sample * pricing.PRICE_REQUEST_INTERVAL / 60:.0f}-"
+        f"{sample * pricing.PRICE_REQUEST_INTERVAL / 60 + 1:.0f} мин."
+    )
+
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+        # 1. Одна страница CSFloat — оттуда и справочные цены, и имена.
+        try:
+            proxy = csfloat_client.CSFLOAT_POOL.next() or None
+            lots, _ = await csfloat_client.fetch_listings_page(session, proxy=proxy)
+        except (CSFloatError, CSFloatRateLimited) as e:
+            await update.message.reply_text(f"⚠️ CSFloat: {e}")
+            return
+
+        # 2. Прайс-лист — второй спорщик.
+        prices = await get_csgotrader_price_details()
+        if not prices:
+            await update.message.reply_text("⚠️ Прайс-лист csgotrader пуст — сверять не с чем.")
+            return
+
+        # Берём только те, где ОБА мнения есть: иначе сравнивать нечего, а
+        # живой запрос всё равно потратится.
+        rows = []
+        seen: set[str] = set()
+        for lot in lots:
+            name = lot.market_hash_name
+            if not name or name in seen or not lot.reference_price:
+                continue
+            found = prices.get(name)
+            listed = found.windows.get(ARB_PRICE_WINDOW) if found else None
+            if not listed:
+                continue
+            seen.add(name)
+            rows.append((name, listed, lot.reference_price, lot.price))
+            if len(rows) >= sample:
+                break
+
+        if not rows:
+            await update.message.reply_text(
+                f"Из {len(lots)} лотов CSFloat ни один не нашёлся в прайс-листе "
+                f"с окном {ARB_PRICE_WINDOW} — сверять нечего."
+            )
+            return
+
+        # 3. Живая цена Steam — эталон.
+        semaphore = asyncio.Semaphore(pricing.PRICE_CONCURRENCY)
+
+        async def live(name: str):
+            async with semaphore:
+                try:
+                    return await get_steam_market_price_retrying(session, name)
+                except Exception as e:
+                    log.info("pricecheck: %s — Steam не ответил (%s)", name, e)
+                    return None
+
+        results = await asyncio.gather(*(live(name) for name, *_ in rows))
+
+    lines = [
+        f"🔬 <b>Сверка источников цен</b> ({len(rows)} предметов)\n"
+        "<i>ПЛ — прайс-лист csgotrader, CSF — справка CSFloat, "
+        "Steam — живая цена сейчас.</i>"
+    ]
+    pl_ratios: list[float] = []
+    csf_ratios: list[float] = []
+    unchecked = 0
+
+    for (name, listed, reference, lot_price), live_price in zip(rows, results):
+        if not live_price or not live_price.lowest:
+            unchecked += 1
+            continue
+        real = live_price.lowest
+        pl_ratios.append(listed / real)
+        csf_ratios.append(reference / real)
+        lines.append(
+            f"<code>{html_module.escape(name[:42])}</code>\n"
+            f"  ПЛ ${listed:.2f} (×{listed / real:.2f}) | "
+            f"CSF ${reference:.2f} (×{reference / real:.2f}) | "
+            f"<b>Steam ${real:.2f}</b> | лот ${lot_price:.2f}"
+        )
+
+    lines.append("")
+    lines.append("<b>Прайс-лист csgotrader против живого Steam</b>")
+    lines.append(_ratio_verdict(pl_ratios))
+    lines.append("")
+    lines.append("<b>Справка CSFloat против живого Steam</b>")
+    lines.append(_ratio_verdict(csf_ratios))
+    if unchecked:
+        lines.append("")
+        lines.append(
+            f"<i>{unchecked} предмет(ов) Steam не подтвердил — они в выводах не учтены.</i>"
+        )
+
+    for chunk in _chunk_lines(lines, sep="\n"):
+        await update.message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
+
+
 async def _check_sih_key(update) -> None:
     """
     Годится ли ключ SIH для цен — отдельной кнопкой.
@@ -4905,6 +5079,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif payload == "proxyclear":
         await proxyclear(shim, _SubCtx(context, []))
         await _show_menu(query, chat_id, "proxy", context)
+    elif payload == "pricecheck":
+        await pricecheck(shim, _SubCtx(context, []))
     elif payload == "sihkey":
         await _check_sih_key(shim)
     elif payload == "pricefile":
@@ -5114,6 +5290,12 @@ COMMANDS: tuple[Command, ...] = (
         "/proxyadd <адреса> — добавить прокси без передеплоя. Сколько угодно "
         "за раз: через запятую, пробел или с новой строки. Проверить и "
         "почистить — /start → Прокси.",
+    ),
+    Command(
+        "pricecheck", pricecheck, "Служебное", None,
+        "/pricecheck [сколько] — сверить оценки цен с живой ценой Steam "
+        "(по умолчанию 20 предметов, около двух минут). Отвечает на вопрос, "
+        "чья шкала сдвинута, когда источники расходятся.",
     ),
     Command(
         "scanfile", scanfile, "Служебное", None,
