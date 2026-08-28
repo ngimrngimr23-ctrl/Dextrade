@@ -1,25 +1,36 @@
 """
 Telegram-бот.
 
-Использование в чате с ботом:
-    /scan <ссылка на предмет на Steam Market> [мин_стоимость_стикеров] [макс_наценка_%]
+Поверхность команд устроена так: ДЕЙСТВИЯ — командами, ПОРОГИ — кнопками.
 
-Пример:
-    /scan https://steamcommunity.com/market/listings/730/AK-47%20%7C%20Slate%20%28Field-Tested%29 5 7
+    /start     меню: сканы, списки, состояние, пороги, прокси
+    /scanall   прогнать оба списка прямо сейчас
+    /scan      разовая проверка одного предмета
+    /watch     вотчлист по стикерам: показать, добавить, убрать, пауза
+    /float     охота за флоатом: список + «/float чек» по конкретному скину
+    /setarb    арбитраж CSFloat: порог, интервал, сброс кулдауна
+    /arbnow    проверить арбитраж немедленно
+    /markets   сравнить Steam со сторонними площадками
+    /inv       инвентарь: оценить и следить за ростом цен
+    /proxyadd  добавить прокси без передеплоя
+    /help      справочник (собирается из реестра COMMANDS, не пишется руками)
 
-Бот сам сходит в Steam за листингами и посчитает офферы — прямой автоматический
-запрос, без ручной передачи файлов (актуально с тех пор, как разобрались с
-Market Beta и рейт-лимитами, см. steam_client.py). Если не указать числа —
-по умолчанию 5 баксов и 7%.
+Разделение не косметическое. Действие ты знаешь заранее, и напечатать его
+быстрее, чем открыть меню; порог трогают раз в месяц, у него числовой
+параметр, и синтаксис к следующему разу забывается. Живой пример: /setdefaults
+5 7 задавала «минимум наклеек $5» и «доплата не выше 7% их стоимости», причём
+второе число регулярно читали как «лот дороже голого скина на 7%» — разные
+вещи, разница в деньгах кратная. Кнопка с подписью и примером в долларах эту
+ошибку делает невозможной.
 
-Если автоматический запрос всё же не удался (например, IP временно на
-кулдауне после 429) — резервный ручной путь:
+Старые имена (watchadd, floatlist, setdefaults, arbreset и ещё два десятка)
+работают как прежде — они перечислены в COMMANDS и просто убраны из меню
+Telegram.
 
-    /scanfile <ссылка на предмет> [мин$] [макс%]
-
-Бот пришлёт ссылку на страницу JSON — открываете её в своём браузере,
-сохраняете как .json (Ctrl+S) и присылаете файл боту. Он спарсит, попросит
-следующую страницу, если лотов больше 100, и в конце сам посчитает офферы.
+Резервный ручной путь, если Steam не отвечает (например, IP на кулдауне
+после 429): /scanfile <ссылка> — бот пришлёт ссылку на JSON, его надо
+сохранить в браузере (Ctrl+S) и прислать файлом. Файл можно слать и без
+команды.
 
 Запуск:
     export TG_BOT_TOKEN=твой_токен_от_BotFather
@@ -46,7 +57,14 @@ from urllib.parse import quote
 
 import aiohttp
 from telegram import BotCommand, Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from steam_client import (
     MANUAL_REQUEST_INTERVAL,
@@ -129,6 +147,7 @@ from storage import (
 )
 import csfloat_client
 import market_prices
+import menu
 import pricing
 import proxy_pool
 from csfloat_client import CSFloatError, CSFloatRateLimited
@@ -515,7 +534,18 @@ async def _proceed_scanfile(update: Update, market_hash_name: str, min_value: fl
 
 
 async def handle_text_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает ответ номером после неоднозначного поиска по названию."""
+    """
+    Свободный текст: либо значение порога, которого ждёт меню, либо номер
+    варианта после неоднозначного поиска по названию.
+
+    Порядок важен. Ожидание порога проверяется первым: если чат ждёт число
+    для настройки, трактовать это сообщение как номер предмета нельзя — оба
+    ожидания выглядят одинаково («пришли число»), и перепутать их значит
+    молча применить ввод не туда.
+    """
+    if await _handle_pending_setting(update, context):
+        return
+
     chat_id = update.effective_chat.id
     pending = _pending_search.get(chat_id)
     if not pending:
@@ -1085,12 +1115,12 @@ async def watchadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not context.args:
         await update.message.reply_text(
-            "Формат: /watchadd <предмет1>, <предмет2>, ...\n"
+            "Формат: /watch <предмет1>, <предмет2>, ...\n"
             "Можно ссылку или название (на английском), через запятую для нескольких сразу.\n"
-            "Пример: /watchadd AK-47 | Slate (Field-Tested), M4A4 | Asiimov (Field-Tested)\n\n"
+            "Пример: /watch AK-47 | Slate (Field-Tested), M4A4 | Asiimov (Field-Tested)\n\n"
             "Степень износа можно не расписывать на каждый предмет, а указать один раз "
             "последним элементом — подойдёт и сокращение (FN/MW/FT/WW/BS):\n"
-            "/watchadd AK-47 | Redline, AWP | Redline, Field-Tested"
+            "/watch AK-47 | Redline, AWP | Redline, Field-Tested"
         )
         return
 
@@ -1145,8 +1175,8 @@ async def watchdel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not context.args:
         await update.message.reply_text(
-            "Формат: /watchdel <номер из /watchlist или точное название>\n"
-            "Пример: /watchdel 2"
+            "Формат: /watch убрать <номер из /watch или точное название>\n"
+            "Пример: /watch убрать 2, или короче /watch -2"
         )
         return
     if not current:
@@ -1163,7 +1193,7 @@ async def watchdel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         match = next((x for x in current if x.lower() == arg.lower()), None)
         if match is None:
-            await update.message.reply_text(f"«{arg}» не найден в списке. Точное название смотри в /watchlist.")
+            await update.message.reply_text(f"«{arg}» не найден в списке. Точное название смотри в /watch.")
             return
         current.remove(match)
         removed = match
@@ -1215,7 +1245,7 @@ async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not items:
         await update.message.reply_text(
-            "Вотчлист пуст. Добавь предметы: /watchadd <предмет1>, <предмет2>, ...\n"
+            "Вотчлист пуст. Добавь предметы: /watch <предмет1>, <предмет2>, ...\n"
             f"Пауза между прогонами: {interval:g} мин после конца предыдущего."
         )
         return
@@ -1225,6 +1255,98 @@ async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{i}. {name}")
     for chunk in _chunk_lines(lines):
         await update.message.reply_text(chunk)
+
+
+# ---------------------------------------------------------------------------
+# Подкоманды: /watch убрать 3 вместо /watchdel 3
+#
+# Команд накопилось 39, и половина из них была одним и тем же действием над
+# разными списками: watchadd/floatadd, watchdel/floatdel, watchlist/floatlist.
+# Имена приходилось держать в голове словарём, потому что по самому имени
+# нельзя было понять, к какому списку оно относится.
+#
+# Теперь у каждого списка одна команда, а действие — первым словом. Старые
+# имена остались рабочими алиасами (см. _build_application): они ничего не
+# стоят, а мышечная память у них уже есть.
+# ---------------------------------------------------------------------------
+
+class _SubCtx:
+    """
+    Тот же context, но с подменёнными args.
+
+    Нужен, чтобы подкоманда делегировала работу в уже написанный и
+    оттестированный обработчик, а не дублировала его логику: /watch убрать 3
+    попадает в watchdel ровно тем же путём, что и /watchdel 3. Всё, кроме
+    args, отдаём настоящему context — job_queue, bot, application.
+    """
+
+    def __init__(self, base, args: list[str]):
+        self._base = base
+        self.args = args
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+
+
+def _subcommand(args: list[str], table: dict[str, tuple]) -> tuple | None:
+    """
+    Разобрать первое слово как действие. Возвращает (обработчик, остаток
+    аргументов) либо None, если слово действием не является.
+    """
+    if not args:
+        return None
+    head = args[0].lower().strip()
+    if head in table:
+        return table[head], args[1:]
+    return None
+
+
+_WATCH_ACTIONS = {
+    "список": "list", "list": "list", "покажи": "list",
+    "убрать": "del", "удалить": "del", "del": "del", "-": "del",
+    "очистить": "clear", "очисти": "clear", "clear": "clear",
+    "стоп": "pause", "пауза": "pause", "стой": "pause", "pause": "pause", "stop": "pause",
+    "старт": "resume", "пуск": "resume", "resume": "resume", "start": "resume", "вкл": "resume",
+}
+
+
+async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /watch                     — показать вотчлист и состояние автоскана
+    /watch <предмет1>, <...>   — добавить предметы
+    /watch -3                  — убрать третий (можно «/watch убрать 3»)
+    /watch очистить            — очистить список
+    /watch стоп | старт        — пауза автоскана и обратно
+
+    Всё, что не опознано как действие, считается названием предмета: имена
+    скинов бывают какими угодно, а список действий короткий и закрытый, так
+    что неоднозначность возможна только если скин назвали словом «очистить».
+    """
+    args = list(context.args)
+
+    if not args:
+        return await watchlist_cmd(update, context)
+
+    head = args[0].lower().strip()
+
+    # «-3» и «- 3»: минус вплотную к номеру — самая короткая запись удаления,
+    # и она не может быть началом названия скина.
+    if head.startswith("-") and head[1:].strip().isdigit():
+        return await watchdel(update, _SubCtx(context, [head[1:].strip()]))
+
+    action = _WATCH_ACTIONS.get(head)
+    if action == "list":
+        return await watchlist_cmd(update, _SubCtx(context, args[1:]))
+    if action == "del":
+        return await watchdel(update, _SubCtx(context, args[1:]))
+    if action == "clear":
+        return await watchclear(update, _SubCtx(context, args[1:]))
+    if action == "pause":
+        return await watchpause(update, _SubCtx(context, args[1:]))
+    if action == "resume":
+        return await watchresume(update, _SubCtx(context, args[1:]))
+
+    return await watchadd(update, context)
 
 
 # --- Отдельный список под охоту за редким флоатом (/floatadd) ---------------
@@ -1244,16 +1366,16 @@ async def floatadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         low, high = await get_float_filter(chat_id)
         hint = (
             "\n\n⚠️ Порог флоата пока не задан — без него охота не идёт. "
-            "Задай: /setfloatfilter 0.01 0.99"
+            "Задай: /start → Пороги → Флоат"
             if low is None or high is None else ""
         )
         await update.message.reply_text(
-            "Формат: /floatadd <предмет1>, <предмет2>, ...\n"
+            "Формат: /float <предмет1>, <предмет2>, ...\n"
             "Можно ссылку или название (на английском), через запятую для нескольких сразу.\n"
-            "Пример: /floatadd AK-47 | Redline (Field-Tested)\n\n"
+            "Пример: /float AK-47 | Redline (Field-Tested)\n\n"
             "Степень износа можно указать один раз последним элементом (FN/MW/FT/WW/BS):\n"
-            "/floatadd AK-47 | Redline, AWP | Asiimov, Factory New\n\n"
-            "Это ОТДЕЛЬНЫЙ список от /watchadd — флоат ищется только по нему." + hint
+            "/float AK-47 | Redline, AWP | Asiimov, Factory New\n\n"
+            "Это ОТДЕЛЬНЫЙ список от /watch — флоат ищется только по нему." + hint
         )
         return
 
@@ -1299,7 +1421,7 @@ async def floatadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     low, high = await get_float_filter(chat_id)
     if low is None or high is None:
-        lines.append("⚠️ Порог флоата не задан — охота не пойдёт. Задай: /setfloatfilter 0.01 0.99")
+        lines.append("⚠️ Порог флоата не задан — охота не пойдёт. Задай: /start → Пороги → Флоат")
     lines.append(f"Всего в списке флоата: {len(current)}.")
     await update.message.reply_text("\n\n".join(lines))
 
@@ -1311,7 +1433,7 @@ async def floatdel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not context.args:
         await update.message.reply_text(
-            "Формат: /floatdel <номер из /floatlist или точное название>\nПример: /floatdel 2"
+            "Формат: /float убрать <номер из /float или точное название>\nПример: /float убрать 2, или короче /float -2"
         )
         return
     if not current:
@@ -1328,7 +1450,7 @@ async def floatdel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         match = next((x for x in current if x.lower() == arg.lower()), None)
         if match is None:
-            await update.message.reply_text(f"«{arg}» не найден. Точное название смотри в /floatlist.")
+            await update.message.reply_text(f"«{arg}» не найден. Точное название смотри в /float.")
             return
         current.remove(match)
         removed = match
@@ -1359,12 +1481,12 @@ async def floatlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not items:
         await update.message.reply_text(
             "Список охоты за флоатом пуст — флоат сейчас не ищется ни по одному предмету.\n"
-            "Добавить: /floatadd <предмет>"
+            "Добавить: /float <предмет>"
         )
         return
 
     if low is None or high is None:
-        threshold = "⚠️ порог не задан (/setfloatfilter 0.01 0.99) — охота не идёт"
+        threshold = "⚠️ порог не задан (/start → Пороги → Флоат) — охота не идёт"
     else:
         threshold = f"флоат ≤{low:g} или ≥{high:g}"
         if markup is not None:
@@ -1375,6 +1497,51 @@ async def floatlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{i}. {name}")
     for chunk in _chunk_lines(lines):
         await update.message.reply_text(chunk)
+
+
+_FLOAT_ACTIONS = {
+    "список": "list", "list": "list", "покажи": "list",
+    "убрать": "del", "удалить": "del", "del": "del", "-": "del",
+    "очистить": "clear", "очисти": "clear", "clear": "clear",
+    "чек": "check", "check": "check", "проверь": "check", "проверить": "check",
+}
+
+
+async def float_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /float                        — список охоты за флоатом и условие отбора
+    /float <предмет1>, <...>      — добавить предметы
+    /float -2                     — убрать второй (можно «/float убрать 2»)
+    /float очистить               — очистить список
+    /float чек <предмет> [флоат]  — платят ли за низкий флоат на этом скине
+
+    «чек» — единственное тут, что не про список: это разовый разбор одного
+    предмета (бывшая /floatcheck). Раньше он делил префикс со списком,
+    ничего с ним не разделяя, и это была прямая ловушка — /floatlist и
+    /floatcheck выглядели родственниками, будучи разными вещами. Внутри одной
+    команды родство хотя бы честное: и то, и другое про флоат.
+    """
+    args = list(context.args)
+
+    if not args:
+        return await floatlist_cmd(update, context)
+
+    head = args[0].lower().strip()
+
+    if head.startswith("-") and head[1:].strip().isdigit():
+        return await floatdel(update, _SubCtx(context, [head[1:].strip()]))
+
+    action = _FLOAT_ACTIONS.get(head)
+    if action == "list":
+        return await floatlist_cmd(update, _SubCtx(context, args[1:]))
+    if action == "del":
+        return await floatdel(update, _SubCtx(context, args[1:]))
+    if action == "clear":
+        return await floatclear(update, _SubCtx(context, args[1:]))
+    if action == "check":
+        return await floatcheck(update, _SubCtx(context, args[1:]))
+
+    return await floatadd(update, context)
 
 
 def _offer_key(market_hash_name: str, offer: Offer) -> str:
@@ -1631,6 +1798,52 @@ async def watchlist_scan_job(context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # Кросс-маркет арбитраж: сканируем рынок CSFloat и сравниваем с ценой Steam
 # ---------------------------------------------------------------------------
+
+def _arb_interval(settings: dict) -> float:
+    """
+    Интервал автоскана арбитража для чата: заданный командой /setarb, иначе
+    общий из окружения. Отдельной функцией, потому что спрашивают его четыре
+    разных места, и «забыл посмотреть в настройки чата» здесь означает тихий
+    возврат к старому расписанию.
+    """
+    value = settings.get("interval")
+    return float(value) if value else ARB_INTERVAL_MINUTES
+
+
+# Часовая квота CSFloat на КЛЮЧ (x-ratelimit-limit). Не умножается числом
+# прокси — проверено в проде: при семи адресах счётчик шёл одной цепочкой.
+CSFLOAT_HOURLY_BUDGET = 200
+
+
+def _arb_budget_problem(interval_minutes: float) -> str | None:
+    """
+    Влезает ли выбранный интервал в квоту CSFloat — и если нет, чем это
+    кончится и что с этим делать.
+
+    Считать надо явно и говорить вслух, потому что перебор проявляется не
+    ошибкой, а тишиной: первые прогоны часа отрабатывают, дальше квота
+    выбрана, всё падает на 429 и подборка приходит пустой. Со стороны это
+    неотличимо от «ничего выгодного не нашлось».
+    """
+    if interval_minutes <= 0:
+        return None
+    per_scan = -(-ARB_TARGET_LISTINGS // csfloat_client.MAX_LIMIT)  # округление вверх
+    scans_per_hour = 60 / interval_minutes
+    needed = per_scan * scans_per_hour
+    if needed <= CSFLOAT_HOURLY_BUDGET:
+        return None
+
+    safe_interval = 60 * per_scan / CSFLOAT_HOURLY_BUDGET
+    safe_target = int(CSFLOAT_HOURLY_BUDGET / scans_per_hour) * csfloat_client.MAX_LIMIT
+    return (
+        f"⚠️ {ARB_TARGET_LISTINGS} лотов каждые {interval_minutes:g} мин = "
+        f"{needed:.0f} запросов в час при доступных {CSFLOAT_HOURLY_BUDGET}.\n"
+        f"Квота кончится к середине часа, дальше прогоны будут падать на 429 "
+        f"и подборка придёт пустой.\n"
+        f"Влезет: интервал от {safe_interval:.0f} мин, либо ARB_TARGET_LISTINGS="
+        f"{safe_target} при нынешнем интервале."
+    )
+
 
 def _schedule_arb_job(job_queue, chat_id: int, delay_minutes: float = ARB_INTERVAL_MINUTES) -> None:
     """Следующий прогон арбитража — одноразовой джобой, как и у вотчлиста (без наложений)."""
@@ -2127,7 +2340,7 @@ async def arb_scan_job(context: ContextTypes.DEFAULT_TYPE):
     finally:
         settings = await get_arb_settings(chat_id)
         if settings["min_discount"] is not None:
-            _schedule_arb_job(context.job_queue, chat_id)
+            _schedule_arb_job(context.job_queue, chat_id, _arb_interval(settings))
 
 
 # ---------------------------------------------------------------------------
@@ -2302,13 +2515,25 @@ async def inventory_scan_job(context: ContextTypes.DEFAULT_TYPE):
             _schedule_inventory_job(context.job_queue, chat_id)
 
 
+_INV_WATCH_WORDS = ("следить", "рост", "watch", "invwatch")
+
+
 async def inv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /inv                  — показать привязанный аккаунт и оценку инвентаря
     /inv <ссылка|steamid> — привязать аккаунт
-    /inv off              — отвязать и забыть снимок цен
+    /inv следить <%>      — сообщать, когда скин подорожал на N% (бывш. /invwatch)
+    /inv следить off      — выключить слежение
+    /inv off              — отвязать аккаунт и забыть снимок цен
+
+    «следить» проверяется ДО разбора аргумента как ссылки на профиль: иначе
+    слово уехало бы в resolve_steamid и вернулось ошибкой «не нашёл такой
+    профиль», что к делу отношения не имеет.
     """
     chat_id = update.effective_chat.id
+
+    if context.args and context.args[0].lower() in _INV_WATCH_WORDS:
+        return await invwatch(update, _SubCtx(context, list(context.args[1:])))
 
     if context.args and context.args[0].lower() in ("off", "выкл"):
         await set_inventory_steamid(chat_id, None)
@@ -2380,7 +2605,7 @@ async def inv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     growth = await get_inventory_growth(chat_id)
     lines.append(
         f"\nСлежение за ростом: {f'включено, порог {growth:g}%' if growth is not None else 'выключено'}\n"
-        "Включить: /invwatch 15"
+        "Включить: /inv следить 15"
     )
     for chunk in _chunk_lines(lines, sep="\n"):
         await update.message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
@@ -2400,7 +2625,7 @@ async def invwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if growth is None:
             await update.message.reply_text(
                 "📈 Слежение за ростом инвентаря выключено.\n\n"
-                "Включить: <code>/invwatch 15</code> — сообщу, когда предмет "
+                "Включить: <code>/inv следить 15</code> — сообщу, когда предмет "
                 "подорожает на 15% от цены, записанной при первом замере.\n\n"
                 + ("" if steamid else "Сначала привяжи аккаунт: /inv <ссылка на профиль>"),
                 parse_mode="HTML",
@@ -2410,7 +2635,7 @@ async def invwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📈 Слежу за ростом: порог {growth:g}%\n"
                 f"Точка отсчёта записана по {len(baseline)} предмет(ам).\n"
                 f"Проверка раз в {INVENTORY_INTERVAL_MINUTES:g} мин.\n\n"
-                "Поменять порог: /invwatch 25\nВыключить: /invwatch off"
+                "Поменять порог: /inv следить 25\nВыключить: /inv следить off"
             )
         return
 
@@ -2431,7 +2656,7 @@ async def invwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         pct = float(context.args[0].replace("%", "").replace(",", "."))
     except ValueError:
-        await update.message.reply_text("Нужно число процентов. Пример: /invwatch 15")
+        await update.message.reply_text("Нужно число процентов. Пример: /inv следить 15")
         return
     if pct <= 0:
         await update.message.reply_text("Процент должен быть больше нуля.")
@@ -2466,9 +2691,9 @@ async def watchpause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     float_items = await get_float_watchlist(chat_id)
     await update.message.reply_text(
         f"⏸ Автоскан остановлен: вотчлист ({len(sticker_items)} шт.) и охота за флоатом "
-        f"({len(float_items)} шт.) сохранены — их можно смотреть /watchlist, /floatlist и чистить "
-        f"/watchdel, /floatdel.\n"
-        f"Возобновить оба сразу: /watchresume. Разовый скан вручную по-прежнему работает: /scanall."
+        f"({len(float_items)} шт.) сохранены — их можно смотреть /watch, /float и чистить "
+        f"/watch -N, /float -N.\n"
+        f"Возобновить оба сразу: /watch старт. Разовый скан вручную по-прежнему работает: /scanall."
     )
 
 
@@ -2513,28 +2738,42 @@ async def watchresume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+_ARB_RESET_WORDS = ("сброс", "сбросить", "reset", "arbreset", "кулдаун")
+
+
 async def setarb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /setarb              — показать настройки арбитража
-    /setarb <мин%>       — включить: слать лоты CSFloat, которые дешевле Steam на мин%
-    /setarb off          — выключить
+    /setarb                  — показать настройки арбитража
+    /setarb <мин%>           — включить: слать лоты CSFloat дешевле Steam на мин%
+    /setarb <мин%> <минут>   — то же плюс пауза между автоматическими прогонами
+    /setarb сброс            — снять кулдаун CSFloat (бывшая /arbreset)
+    /setarb off              — выключить
+
+    Интервал живёт ЗДЕСЬ, а не отдельной командой, потому что он не
+    самостоятельная настройка: он осмысленен только вместе с процентом и
+    упирается в ту же квоту CSFloat. Разнесённые по разным командам, процент и
+    частота выглядели независимыми — а на деле частота решает, доживёт ли
+    прогон до конца часа (см. _arb_budget_problem).
     """
     chat_id = update.effective_chat.id
     args = context.args
     settings = await get_arb_settings(chat_id)
+    interval = _arb_interval(settings)
 
     if not args:
         if settings["min_discount"] is None:
             await update.message.reply_text(
                 "💱 Арбитраж CSFloat ↔ Steam выключен.\n\n"
-                "Включить: /setarb <мин%>\nПример: /setarb 20 — слать лоты, которые "
-                f"на CSFloat дешевле цены Steam минимум на 20%.\n"
-                f"Проверка каждые {ARB_INTERVAL_MINUTES:g} мин, до "
-                f"{ARB_TARGET_LISTINGS} лотов за прогон.\n\n"
+                "Включить: /setarb <мин%> [минут между прогонами]\n"
+                "Пример: /setarb 20 — слать лоты, которые на CSFloat дешевле цены "
+                "Steam минимум на 20%.\n"
+                "Пример: /setarb 30 9 — то же с порогом 30% и проверкой каждые 9 мин.\n"
+                f"Сейчас интервал {interval:g} мин, до {ARB_TARGET_LISTINGS} лотов за прогон.\n\n"
                 "Дополнительно:\n"
                 "/setarbprice <мин$> <макс$> — ограничить диапазон цены\n"
                 "/setarbvolume <шт> — только ликвидное (продаж на Steam за сутки)\n"
                 "/setarbstickers <макс%> — ещё и лоты, где наклейки почти даром\n"
+                "/setarb сброс — снять кулдаун CSFloat\n"
                 "/arbnow — проверить прямо сейчас"
             )
         else:
@@ -2547,11 +2786,23 @@ async def setarb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"Ликвидность: от {settings['min_volume']} продаж на Steam")
             if settings["sticker_markup"] is not None:
                 lines.append(f"Плюс лоты с наценкой за наклейки ≤{settings['sticker_markup']:g}%")
-            lines.append(f"Проверка каждые {ARB_INTERVAL_MINUTES:g} мин. Выключить: /setarb off")
+            lines.append(f"Проверка каждые {interval:g} мин.")
+            problem = _arb_budget_problem(interval)
+            if problem:
+                lines.append("")
+                lines.append(problem)
+            lines.append("")
+            lines.append("Поменять: /setarb <мин%> [минут]. Выключить: /setarb off")
             await update.message.reply_text("\n".join(lines))
         return
 
-    if args[0].lower() == "off":
+    head = args[0].lower()
+
+    if head in _ARB_RESET_WORDS:
+        await _arb_reset(update)
+        return
+
+    if head == "off":
         await set_arb_setting(chat_id, "min_discount", None)
         for job in context.application.job_queue.get_jobs_by_name(f"{ARB_JOB_PREFIX}{chat_id}"):
             job.schedule_removal()
@@ -2567,23 +2818,51 @@ async def setarb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        pct = float(args[0])
+        pct = float(args[0].replace("%", "").replace(",", "."))
     except ValueError:
-        await update.message.reply_text("Нужно число процентов. Пример: /setarb 20")
+        await update.message.reply_text(
+            f"{args[0]!r} — не число. Формат: /setarb <мин%> [минут между прогонами], "
+            "например /setarb 30 9"
+        )
         return
     if pct <= 0:
         await update.message.reply_text("Процент должен быть больше нуля.")
         return
 
+    if len(args) >= 2:
+        try:
+            minutes = float(args[1].replace(",", "."))
+        except ValueError:
+            await update.message.reply_text(
+                f"{args[1]!r} — не число минут. Формат: /setarb 30 9"
+            )
+            return
+        if minutes <= 0:
+            await update.message.reply_text("Интервал должен быть больше нуля.")
+            return
+        await set_arb_setting(chat_id, "interval", minutes)
+        interval = minutes
+
     await set_arb_setting(chat_id, "min_discount", pct)
     _schedule_arb_job(context.application.job_queue, chat_id, delay_minutes=0.2)
-    await update.message.reply_text(
-        f"💱 Арбитраж включён: ищу лоты CSFloat дешевле цены Steam минимум на {pct:g}%.\n"
-        f"Проверка каждые {ARB_INTERVAL_MINUTES:g} мин, первый прогон — прямо сейчас.\n\n"
+
+    lines = [
+        f"💱 Арбитраж включён: ищу лоты CSFloat дешевле цены Steam минимум на {pct:g}%.",
+        f"Проверка каждые {interval:g} мин, первый прогон — прямо сейчас.",
+    ]
+    problem = _arb_budget_problem(interval)
+    if problem:
+        # Не запрещаем: интервал пользователь выбрал сам и вправе его оставить.
+        # Но молчать нельзя — последствия видны только через полчаса тишины.
+        lines.append("")
+        lines.append(problem)
+    lines.append("")
+    lines.append(
         f"⚠️ Учти: выручка от продажи в Steam попадает на кошелёк Steam и не выводится. "
-        f"В сообщениях показываю «чистыми» с учётом комиссии ~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%, "
-        f"чтобы процент не обманывал."
+        f"В сообщениях показываю «чистыми» с учётом комиссии "
+        f"~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%, чтобы процент не обманывал."
     )
+    await update.message.reply_text("\n".join(lines))
 
 
 async def setarbprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2719,8 +2998,8 @@ async def floatcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "Проверить, платят ли за низкий флоат на конкретном скине.\n\n"
-            "<code>/floatcheck AWP | Black Nile (Factory New)</code>\n"
-            "<code>/floatcheck AWP | Black Nile (Factory New) 0.00585</code>\n\n"
+            "<code>/float чек AWP | Black Nile (Factory New)</code>\n"
+            "<code>/float чек AWP | Black Nile (Factory New) 0.00585</code>\n\n"
             "Во втором виде скажу ещё и про твой флоат: насколько он низкий "
             "для этого предмета и попадает ли в ценимую зону.",
             parse_mode="HTML",
@@ -2880,7 +3159,7 @@ async def arbnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cooldown > 0:
         await update.message.reply_text(
             f"CSFloat на кулдауне после 429 — ещё {cooldown / 60:.0f} мин.\n"
-            "Сбросить и попробовать сразу: /arbreset"
+            "Сбросить и попробовать сразу: /setarb сброс"
         )
         return
 
@@ -3599,12 +3878,20 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def arbreset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/arbreset — старое имя, живёт как алиас. Смысл — в /setarb сброс."""
+    await _arb_reset(update)
+
+
+async def _arb_reset(update):
     """
-    /arbreset — снять кулдаун CSFloat вручную и показать, с чем мы к нему ходим.
+    Снять кулдаун CSFloat вручную и показать, с чем мы к нему ходим.
 
     Кулдаун при блокировке по IP длинный (3 ч) и переживает передеплой, поэтому
     без ручного сброса нельзя проверить, помогла ли правка запроса: ждёшь не
     результат правки, а истечение таймера, который к ней отношения не имеет.
+
+    Отдельной функцией от команды, потому что зовётся из трёх мест: старого
+    /arbreset, подкоманды /setarb сброс и кнопки в разделе «Состояние».
     """
     cooldown = csfloat_client.cooldown_remaining()
     await csfloat_client.reset_cooldown()
@@ -3648,8 +3935,8 @@ async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not items:
         await update.message.reply_text(
-            "Оба списка пусты. Добавь предметы: /watchadd <предмет1>, <предмет2>, ... "
-            "(охота по стикерам) или /floatadd <предмет> (охота за флоатом)."
+            "Оба списка пусты. Добавь предметы: /watch <предмет1>, <предмет2>, ... "
+            "(охота по стикерам) или /float <предмет> (охота за флоатом)."
         )
         return
     if chat_id in _watchlist_running:
@@ -3858,7 +4145,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"Файл принят без команды, начинаю сбор «{market_hash_name or 'предмет'}» "
             f"с параметрами по умолчанию (мин$ стикеров={def_min:.0f}, макс наценка={def_max:.0f}%).\n"
-            f"Сменить дефолты: /setdefaults <мин$> <макс%>. "
+            f"Сменить пороги: /start → Пороги → Стикеры. "
             f"Или задать разово: /scanfile <ссылка> [мин$] [макс%]."
         )
 
@@ -3915,18 +4202,24 @@ def _next_run_in(job_queue, name: str) -> float | None:
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/status — старое имя, живёт как алиас. Смысл — в разделе «Состояние» меню /start."""
+    for chunk in _chunk_lines(await _status_lines(update.effective_chat.id, context.job_queue)):
+        await update.message.reply_text(chunk, parse_mode="HTML")
+
+
+async def _status_lines(chat_id: int, jq) -> list[str]:
     """
-    /status — одна сводка: что запущено, что на паузе, что на кулдауне, какие
-    пороги отбора действуют.
+    Одна сводка: что запущено, что на паузе, что на кулдауне, какие пороги
+    отбора действуют.
 
     Появилась потому, что почти все вопросы при отладке были вида "почему
     ничего не приходит", а ответ приходилось собирать из логов Render: списки —
     в одной команде, пауза — во второй, кулдауны — вообще нигде. Здесь всё
     сразу и в одном месте.
-    """
-    chat_id = update.effective_chat.id
-    jq = context.job_queue
 
+    Возвращает строки, а не шлёт их: то же самое показывает раздел «Состояние»
+    в меню, и рисовать его надо правкой существующего сообщения, а не новым.
+    """
     sticker_items = await get_watchlist(chat_id)
     float_items = await get_float_watchlist(chat_id)
     paused = await get_watch_paused(chat_id)
@@ -3945,12 +4238,12 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"  Вотчлист (стикеры): {len(sticker_items)}")
     lines.append(f"  Охота за флоатом: {len(float_items)}")
     if not sticker_items and not float_items:
-        lines.append("  ⚠️ оба пусты — сканировать нечего (/watchadd, /floatadd)")
+        lines.append("  ⚠️ оба пусты — сканировать нечего (/watch, /float)")
 
     lines.append("")
     lines.append("<b>Автоскан Steam</b>")
     if paused:
-        lines.append("  ⏸ на паузе — /watchresume чтобы включить")
+        lines.append("  ⏸ на паузе — /watch старт чтобы включить")
     else:
         nxt = _next_run_in(jq, f"{WATCHLIST_JOB_PREFIX}{chat_id}")
         when = f"следующий прогон через {_fmt_mins(nxt)}" if nxt is not None else "прогон не запланирован"
@@ -3986,7 +4279,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not csfloat_client.csfloat_enabled():
         lines.append("  CSFloat: ⚠️ нет ключа (CSFLOAT_API_KEY)")
     else:
-        lines.append("  CSFloat: " + (f"⏸ кулдаун ещё {_fmt_mins(cf)} (/arbreset)" if cf > 0 else "✅ свободен"))
+        lines.append("  CSFloat: " + (f"⏸ кулдаун ещё {_fmt_mins(cf)} (/setarb сброс)" if cf > 0 else "✅ свободен"))
         lines.append(f"  маршрут CSFloat: {csfloat_client.route_description()}")
         proxy_problem = csfloat_client.http_proxy_problem()
         if proxy_problem:
@@ -4014,140 +4307,746 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hi = f"${p_hi:.2f}" if p_hi is not None else "—"
         lines.append(f"  Цена лота: {lo} … {hi}")
     if f_lo is None or f_hi is None:
-        lines.append("  Флоат: ⚠️ порог не задан — охота за флоатом не идёт (/setfloatfilter 0.01 0.99)")
+        lines.append("  Флоат: ⚠️ порог не задан — охота за флоатом не идёт (/start → Пороги → Флоат)")
     else:
         extra = f", наценка ≤{f_markup:g}%" if f_markup is not None else ""
         lines.append(f"  Флоат: ≤{f_lo:g} или ≥{f_hi:g}{extra}")
 
-    for chunk in _chunk_lines(lines):
-        await update.message.reply_text(chunk, parse_mode="HTML")
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Меню на кнопках
+#
+# Разделение простое: действия остались командами, пороги переехали сюда.
+# Команду выигрывает частота — набрать /scanall быстрее, чем открыть меню и
+# ткнуть. Кнопку выигрывает редкость плюс числовой параметр: пороги трогают
+# раз в месяц, их восемнадцать, и синтаксис к следующему разу забывается.
+# Подпись с примером в долларах прямо на экране объясняет порог так, как
+# позиционные аргументы /setdefaults 5 7 не объяснят никогда.
+#
+# Старые команды никуда не делись и работают как раньше (см.
+# _build_application) — меню их не заменяет, а даёт второй путь.
+# ---------------------------------------------------------------------------
+
+# Чат ждёт, что следующим сообщением придёт значение порога: chat_id -> key.
+# Отдельно от _pending_search, потому что это разные ожидания и путать их
+# нельзя: там ждут номер варианта предмета, здесь — число.
+_pending_setting: dict[int, str] = {}
+
+
+class _MenuMessage:
+    """
+    Подменяет update.message для команд, запущенных кнопкой.
+
+    Обработчики написаны под update.message.reply_text, а у callback-запроса
+    message — это сообщение с самим меню, отвечать в которое неправильно:
+    ответ должен прийти новым сообщением, а меню остаться на месте.
+    """
+
+    def __init__(self, chat_id: int, bot):
+        self.chat_id = chat_id
+        self.text = ""
+        self._bot = bot
+
+    async def reply_text(self, text, **kwargs):
+        return await self._bot.send_message(chat_id=self.chat_id, text=text, **kwargs)
+
+
+class _MenuUpdate:
+    """Переходник Update -> обработчик команды, когда команду запустили кнопкой."""
+
+    def __init__(self, query, bot):
+        self.callback_query = query
+        self.effective_chat = query.message.chat
+        self.effective_user = query.from_user
+        self.message = _MenuMessage(query.message.chat.id, bot)
+
+
+def _fmt_money(value) -> str:
+    return "не задано" if value is None else f"${value:,.2f}".replace(",", " ")
+
+
+def _fmt_pct(value) -> str:
+    return "выключено" if value is None else f"{value:g}%"
+
+
+async def _settings_snapshot(chat_id: int) -> dict[str, str]:
+    """Текущее значение каждого порога человеческой строкой, по ключам menu.SETTINGS."""
+    def_min, def_max = await _get_defaults(chat_id)
+    streak = await get_streak_markup(chat_id)
+    ratio = await get_sticker_ratio(chat_id)
+    p_lo, p_hi = await get_price_filter(chat_id)
+    f_lo, f_hi = await get_float_filter(chat_id)
+    f_markup = await get_float_markup(chat_id)
+    arb = await get_arb_settings(chat_id)
+    mk = await get_market_settings(chat_id)
+    watch_interval = await _get_watch_interval(chat_id)
+
+    def pair(lo, hi, fmt=_fmt_money) -> str:
+        if lo is None and hi is None:
+            return "выключено"
+        return f"{fmt(lo)} … {fmt(hi)}"
+
+    def mk_value(key, default, fmt):
+        value = mk[key] if mk[key] is not None else default
+        return fmt(value)
+
+    return {
+        "st_min": _fmt_money(def_min),
+        "st_markup": f"{def_max:g}% их цены",
+        "st_streak": _fmt_pct(streak),
+        "st_ratio": "выключено" if ratio is None else f"×{ratio:g}",
+        "st_price": pair(p_lo, p_hi),
+        "fl_range": (
+            "выключено"
+            if f_lo is None or f_hi is None
+            else f"≤{f_lo:g} или ≥{f_hi:g}"
+        ),
+        "fl_markup": _fmt_pct(f_markup),
+        "ar_disc": _fmt_pct(arb["min_discount"]),
+        "ar_int": f"{_arb_interval(arb):g} мин",
+        "ar_price": pair(arb["min_price"], arb["max_price"]),
+        "ar_vol": (
+            "выключено"
+            if arb["min_volume"] is None
+            else f"от {arb['min_volume']} продаж"
+        ),
+        "ar_stick": _fmt_pct(arb["sticker_markup"]),
+        "mk_disc": mk_value("min_discount", MARKETS_DEFAULT_DISCOUNT, _fmt_pct),
+        "mk_max": mk_value("max_discount", market_prices.MAX_SANE_DISCOUNT_PCT, _fmt_pct),
+        "mk_vol": mk_value("min_volume", MARKETS_MIN_VOLUME, lambda v: f"от {v:g} продаж"),
+        "mk_profit": mk_value("min_profit", market_prices.MIN_NET_PROFIT, _fmt_money),
+        "mk_price": mk_value("min_price", market_prices.MIN_MARKET_PRICE, _fmt_money),
+        "wt_int": f"{watch_interval:g} мин",
+    }
+
+
+def _parse_setting(setting: menu.Setting, raw: str):
+    """
+    Разобрать введённое значение. Бросает ValueError с человеческим текстом —
+    он и уйдёт пользователю, поэтому формулировки тут не отладочные.
+
+    Возвращает готовое к записи значение: число, пару чисел или None для
+    «выключить».
+    """
+    text = raw.strip().lower().replace(",", ".").replace("$", "").replace("%", "")
+
+    if text in ("off", "выкл", "выключить", "убрать", "-"):
+        if not setting.can_off:
+            raise ValueError(f"«{setting.label}» нельзя выключить — нужно число.")
+        return None
+
+    parts = text.split()
+
+    if setting.kind in ("pair_money", "pair_float"):
+        if len(parts) != 2:
+            raise ValueError(f"Нужно два числа через пробел. Пример: {setting.example}")
+        try:
+            lo, hi = float(parts[0]), float(parts[1])
+        except ValueError:
+            raise ValueError(f"Оба значения должны быть числами. Пример: {setting.example}")
+        if setting.kind == "pair_float":
+            if not (0.0 <= lo <= 1.0 and 0.0 <= hi <= 1.0):
+                raise ValueError("Флоат — число от 0 до 1.")
+            if lo >= hi:
+                raise ValueError("Первое число (низкий флоат) должно быть меньше второго.")
+        elif lo > hi:
+            raise ValueError("Минимум не может быть больше максимума.")
+        return (lo, hi)
+
+    if len(parts) != 1:
+        raise ValueError(f"Нужно одно число. Пример: {setting.example}")
+    try:
+        value = float(parts[0])
+    except ValueError:
+        raise ValueError(f"{raw.strip()!r} — не число. Пример: {setting.example}")
+
+    if setting.kind == "int":
+        if value < 0:
+            raise ValueError("Число не может быть отрицательным.")
+        return int(value)
+    if setting.kind in ("minutes", "ratio"):
+        if value <= 0:
+            raise ValueError("Значение должно быть больше нуля.")
+        return value
+    if value < 0:
+        raise ValueError("Отрицательное значение не имеет смысла.")
+    return value
+
+
+async def _apply_setting(chat_id: int, key: str, value, context) -> str:
+    """
+    Записать порог и вернуть подтверждение.
+
+    Здесь же — побочные эффекты расписания: интервалы и включение арбитража
+    меняют джобы, и без пересоздания новое значение вступило бы в силу только
+    после следующего прогона, то есть через старый интервал. На этом уже
+    обжигались в /setinterval, поэтому повторяем то же и тут.
+    """
+    setting = menu.BY_KEY[key]
+    jq = context.application.job_queue
+
+    if key in ("st_min", "st_markup"):
+        cur_min, cur_max = await _get_defaults(chat_id)
+        if key == "st_min":
+            await set_chat_defaults(chat_id, value, cur_max)
+            return f"✅ Минимум наклеек на лоте: {_fmt_money(value)}"
+        await set_chat_defaults(chat_id, cur_min, value)
+        return (
+            f"✅ Доплата за наклейки: не больше {value:g}% их цены.\n"
+            f"Например: наклеек на $40 — берём лот, если он дороже голого скина "
+            f"не больше чем на ${40 * value / 100:.2f}."
+        )
+
+    if key == "st_streak":
+        await set_streak_markup(chat_id, value)
+        return (
+            "✅ Стрик-лоты снова по общему порогу."
+            if value is None
+            else f"✅ Доплата для стрик-лотов ({STREAK_THRESHOLD}+ подряд): ≤{value:g}%"
+        )
+
+    if key == "st_ratio":
+        await set_sticker_ratio(chat_id, value)
+        return (
+            "✅ Фильтр по весу наклеек выключен."
+            if value is None
+            else f"✅ Наклейки должны быть дороже голого скина в {value:g} раз."
+        )
+
+    if key == "st_price":
+        lo, hi = (None, None) if value is None else value
+        await set_price_filter(chat_id, lo, hi)
+        return (
+            "✅ Фильтр цены лота убран."
+            if value is None
+            else f"✅ Цена лота: {_fmt_money(lo)} … {_fmt_money(hi)}"
+        )
+
+    if key == "fl_range":
+        lo, hi = (None, None) if value is None else value
+        await set_float_filter(chat_id, lo, hi)
+        return (
+            "✅ Охота за флоатом выключена."
+            if value is None
+            else f"✅ Ищу флоат ≤{lo:g} или ≥{hi:g}."
+        )
+
+    if key == "fl_markup":
+        await set_float_markup(chat_id, value)
+        return (
+            "✅ Ограничение по цене для флоат-находок убрано."
+            if value is None
+            else f"✅ Флоат-находка проходит, если дороже дешёвого лота не более чем на {value:g}%."
+        )
+
+    if key == "ar_disc":
+        await set_arb_setting(chat_id, "min_discount", value)
+        if value is None:
+            for job in jq.get_jobs_by_name(f"{ARB_JOB_PREFIX}{chat_id}"):
+                job.schedule_removal()
+            return "✅ Арбитраж выключен."
+        _schedule_arb_job(jq, chat_id, delay_minutes=0.2)
+        return f"✅ Арбитраж включён: дешевле Steam минимум на {value:g}%. Первый прогон — сейчас."
+
+    if key == "ar_int":
+        await set_arb_setting(chat_id, "interval", value)
+        arb = await get_arb_settings(chat_id)
+        text = f"✅ Интервал автоскана арбитража: {value:g} мин."
+        if arb["min_discount"] is not None:
+            _schedule_arb_job(jq, chat_id, value)
+            text += "\nРасписание обновлено."
+        problem = _arb_budget_problem(value)
+        if problem:
+            text += "\n\n" + problem
+        return text
+
+    if key == "ar_price":
+        lo, hi = (None, None) if value is None else value
+        await set_arb_setting(chat_id, "min_price", lo)
+        await set_arb_setting(chat_id, "max_price", hi)
+        return (
+            "✅ Ограничение по цене в арбитраже снято."
+            if value is None
+            else f"✅ Арбитраж: лоты {_fmt_money(lo)} … {_fmt_money(hi)}"
+        )
+
+    if key == "ar_vol":
+        await set_arb_setting(chat_id, "min_volume", value)
+        return (
+            "✅ Фильтр ликвидности в арбитраже снят."
+            if value is None
+            else f"✅ Арбитраж: только предметы с {value}+ продаж на Steam."
+        )
+
+    if key == "ar_stick":
+        await set_arb_setting(chat_id, "sticker_markup", value)
+        return (
+            "✅ Отбор по наклейкам в арбитраже выключен."
+            if value is None
+            else f"✅ Арбитраж: плюс лоты с доплатой за наклейки ≤{value:g}%."
+        )
+
+    if key.startswith("mk_"):
+        storage_key = {
+            "mk_disc": "min_discount", "mk_max": "max_discount",
+            "mk_vol": "min_volume", "mk_profit": "min_profit",
+            "mk_price": "min_price",
+        }[key]
+        await set_market_setting(chat_id, storage_key, value)
+        return f"✅ {setting.label}: {value:g}\n\nПроверить прямо сейчас: /markets"
+
+    if key == "wt_int":
+        await set_watch_gap(chat_id, value)
+        text = f"✅ Пауза между прогонами автоскана: {value:g} мин."
+        if not await get_watch_paused(chat_id):
+            _schedule_watchlist_job(jq, chat_id, value)
+            text += "\nРасписание обновлено."
+        return text
+
+    raise ValueError(f"Неизвестный порог {key!r}")
+
+
+async def _menu_screen(chat_id: int, node: str, context) -> tuple[str, object]:
+    """Текст и клавиатура для узла меню. Один вход — чтобы «назад» и «обновить» шли тем же путём."""
+    if node == "root":
+        return (
+            "🤖 <b>Dextrade</b>\n"
+            "Слежу за скинами CS2 и присылаю выгодные лоты.\n\n"
+            "<i>Команды никуда не делись: /watch, /float, /scan, /setarb, "
+            "/inv, /markets. Полный список — /help.</i>",
+            menu.root(),
+        )
+
+    if node == "lists":
+        sticker_items = await get_watchlist(chat_id)
+        float_items = await get_float_watchlist(chat_id)
+        paused = await get_watch_paused(chat_id)
+        interval = await _get_watch_interval(chat_id)
+        lines = [
+            "📋 <b>Списки</b>",
+            "",
+            f"Вотчлист (стикеры): <b>{len(sticker_items)}</b> — /watch",
+            f"Охота за флоатом: <b>{len(float_items)}</b> — /float",
+            "",
+            (
+                "⏸ Автоскан на паузе."
+                if paused
+                else f"▶️ Автоскан включён, пауза между прогонами {interval:g} мин."
+            ),
+        ]
+        if not sticker_items and not float_items:
+            lines.append("")
+            lines.append(
+                "⚠️ Оба списка пусты — сканировать нечего.\n"
+                "Добавить: <code>/watch AK-47 | Redline (Field-Tested)</code>"
+            )
+        return "\n".join(lines), menu.lists(paused)
+
+    if node == "state":
+        text = "\n".join(await _status_lines(chat_id, context.job_queue))
+        show_reset = (
+            csfloat_client.cooldown_remaining() > 0
+            or steam_cooldown_remaining("pricing") > 0
+        )
+        return text, menu.state(show_reset)
+
+    if node == "set":
+        return (
+            "⚙️ <b>Пороги</b>\n\n"
+            "Что и когда бот считает находкой. Выбери раздел — внутри видно "
+            "текущие значения и что каждое означает.",
+            menu.sections(),
+        )
+
+    if node.startswith("set:"):
+        section_key = node.split(":", 1)[1]
+        section = menu.SECTION_BY_KEY.get(section_key)
+        if section is None:
+            return "Такого раздела нет.", menu.sections()
+        values = await _settings_snapshot(chat_id)
+        lines = [f"<b>{html_module.escape(section.title)}</b>", "", f"<i>{section.intro}</i>", ""]
+        for setting in menu.BY_SECTION[section_key]:
+            lines.append(f"<b>{html_module.escape(setting.label)}</b>: {values[setting.key]}")
+        lines.append("")
+        lines.append("<i>Нажми на порог, чтобы поменять.</i>")
+        return "\n".join(lines), menu.section(section_key)
+
+    if node == "proxy":
+        stored = await get_extra_proxies()
+        lines = [
+            "🌐 <b>Прокси</b>",
+            "",
+            f"Всего в пуле CSFloat: <b>{len(csfloat_client.CSFLOAT_POOL)}</b>",
+            f"Пул Steam: {STEAM_POOL.describe()}",
+            f"Добавлено через бота: {len(stored)}",
+            "",
+            "Добавить: <code>/proxyadd http://логин:пароль@хост:порт</code>\n"
+            "<i>Можно сколько угодно за раз — через запятую, пробел или с новой строки.</i>",
+        ]
+        return "\n".join(lines), menu.proxy()
+
+    if node == "prices":
+        return (
+            "📄 <b>Прайс-лист стикеров</b>\n\n"
+            f"Сейчас в нём <b>{manual_prices_count()}</b> цен.\n\n"
+            "<i>Нужен, когда автоматические цены стикеров недоступны. "
+            "Файл можно и просто прислать в чат — команда не обязательна.</i>",
+            menu.prices(),
+        )
+
+    return "Не знаю такого экрана.", menu.root()
+
+
+async def _show_menu(query, chat_id: int, node: str, context) -> None:
+    """Перерисовать меню на месте. Одинаковый текст Telegram отвергает — это не ошибка."""
+    text, keyboard = await _menu_screen(chat_id, node, context)
+    try:
+        await query.edit_message_text(
+            text, parse_mode="HTML", reply_markup=keyboard, disable_web_page_preview=True
+        )
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            raise
+
+
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Единая точка разбора нажатий: навигация, правка порога, действие."""
+    query = update.callback_query
+    # Отвечаем сразу: пока answer() не пришёл, у пользователя крутится
+    # ожидание на кнопке, а действия вроде /scanall идут минутами.
+    await query.answer()
+
+    chat_id = query.message.chat.id
+    data = query.data or ""
+    kind, _, payload = data.partition("|")
+
+    if kind == menu.NAV:
+        await _show_menu(query, chat_id, payload or "root", context)
+        return
+
+    if kind == menu.EDIT:
+        setting = menu.BY_KEY.get(payload)
+        if setting is None:
+            await _show_menu(query, chat_id, "set", context)
+            return
+        _pending_setting[chat_id] = setting.key
+        values = await _settings_snapshot(chat_id)
+        text = (
+            f"<b>{html_module.escape(setting.label)}</b>\n"
+            f"сейчас: {values[setting.key]}\n\n"
+            f"<i>{html_module.escape(setting.hint)}</i>\n\n"
+            f"Пришли новое значение сообщением. Пример: <code>{setting.example}</code>"
+        )
+        try:
+            await query.edit_message_text(
+                text, parse_mode="HTML", reply_markup=menu.editing(setting)
+            )
+        except Exception:
+            log.exception("menu: не смог показать экран правки %s", setting.key)
+        return
+
+    if kind != menu.ACT:
+        return
+
+    # --- Действия ----------------------------------------------------------
+    shim = _MenuUpdate(query, context.bot)
+
+    if payload.startswith("off:"):
+        key = payload.split(":", 1)[1]
+        setting = menu.BY_KEY.get(key)
+        if setting is None or not setting.can_off:
+            return
+        _pending_setting.pop(chat_id, None)
+        try:
+            confirmation = await _apply_setting(chat_id, key, None, context)
+        except ValueError as e:
+            await shim.message.reply_text(str(e))
+            return
+        await shim.message.reply_text(confirmation)
+        await _show_menu(query, chat_id, f"set:{setting.section}", context)
+        return
+
+    if payload == "scanall":
+        await scanall(shim, context)
+    elif payload == "arbnow":
+        await arbnow(shim, context)
+    elif payload == "markets":
+        await markets(shim, _SubCtx(context, []))
+    elif payload == "pause":
+        await watchpause(shim, context)
+        await _show_menu(query, chat_id, "lists", context)
+    elif payload == "resume":
+        await watchresume(shim, context)
+        await _show_menu(query, chat_id, "lists", context)
+    elif payload == "arbreset":
+        await _arb_reset(shim)
+        await _show_menu(query, chat_id, "state", context)
+    elif payload == "proxycheck":
+        await proxycheck(shim, context)
+    elif payload == "proxyclear":
+        await proxyclear(shim, _SubCtx(context, []))
+        await _show_menu(query, chat_id, "proxy", context)
+    elif payload == "pricefile":
+        await pricefile(shim, context)
+    elif payload == "clearprices":
+        await clearprices(shim, context)
+        await _show_menu(query, chat_id, "prices", context)
+    else:
+        log.warning("menu: неизвестное действие %r", payload)
+
+
+async def _handle_pending_setting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Значение порога, присланное после нажатия кнопки. True — сообщение съедено.
+
+    Вызывается ПЕРВЫМ в обработчике текста: если чат ждёт число для порога,
+    трактовать это сообщение как что-то ещё нельзя.
+    """
+    chat_id = update.effective_chat.id
+    key = _pending_setting.get(chat_id)
+    if key is None:
+        return False
+
+    setting = menu.BY_KEY.get(key)
+    if setting is None:
+        del _pending_setting[chat_id]
+        return False
+
+    raw = (update.message.text or "").strip()
+    try:
+        value = _parse_setting(setting, raw)
+    except ValueError as e:
+        # Ожидание НЕ снимаем: человек ошибся в формате, а не передумал.
+        await update.message.reply_text(f"{e}\n\nПришли значение ещё раз или /start, чтобы выйти.")
+        return True
+
+    del _pending_setting[chat_id]
+    try:
+        confirmation = await _apply_setting(chat_id, key, value, context)
+    except ValueError as e:
+        await update.message.reply_text(str(e))
+        return True
+
+    await update.message.reply_text(confirmation)
+    return True
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /start — короткая карточка на один экран. Полный справочник вынесен в
-    /help: раньше всё жило в одном сообщении, и оно разрослось так, что
-    прочитать его целиком было невозможно, а /scanall терялся в середине.
-    """
-    await update.message.reply_text(
-        "Привет! Я слежу за скинами CS2 и присылаю выгодные лоты.\n\n"
-        "▶️ <b>Начать</b>\n"
-        "/status — что сейчас происходит: списки, автоскан, кулдауны, пороги\n"
-        "/scanall — проверить оба списка прямо сейчас\n"
-        "/scan [предмет] — разовая проверка одного предмета\n\n"
-        "📋 <b>Списки</b> (по ним идёт автоскан)\n"
-        "/watchadd, /watchdel, /watchlist — охота по стикерам\n"
-        "/floatadd, /floatdel, /floatlist — охота за редким флоатом\n"
-        "/watchpause, /watchresume — пауза автоскана\n\n"
-        "💱 <b>Арбитраж CSFloat ↔ Steam</b>\n"
-        "/setarb [мин%] — включить, /arbnow — проверить сейчас\n\n"
-        "⚙️ <b>Пороги</b>: /setdefaults, /setfloatfilter и другие — см. /help\n\n"
-        "📖 <b>/help</b> — полный справочник со всеми командами и пояснениями",
-        parse_mode="HTML",
-    )
+    """/start — главное меню. Всё остальное достижимо отсюда в один-два нажатия."""
+    _pending_setting.pop(update.effective_chat.id, None)
+    text, keyboard = await _menu_screen(update.effective_chat.id, "root", context)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+# Порядок групп в /help — по сценарию, а не по алфавиту: сначала то, с чего
+# начинают, в конце служебное.
+_HELP_GROUPS = (
+    "Начать",
+    "Списки",
+    "Арбитраж CSFloat ↔ Steam",
+    "Площадки",
+    "Инвентарь",
+    "Служебное",
+)
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/help — полный справочник. Длинный намеренно: это место, куда идут за деталями."""
-    chat_id = update.effective_chat.id
-    def_min, def_max = await _get_defaults(chat_id)
-    text = (
-        "Привет! Пришли:\n"
-        "/scan <ссылка или название предмета> [мин$ стикеров] [макс наценка%]\n"
-        "Название — на английском, с | или без: /scan AK-47 | Slate или /scan AK-47 Slate\n"
-        "Бот сам сходит в Steam за листингами и посчитает офферы.\n\n"
-        "/scanfile — резервный ручной путь, если автоматический запрос не удался "
-        "(например, IP временно на кулдауне после 429 у Steam): бот пришлёт ссылку "
-        "на JSON, открой её в браузере, сохрани (Ctrl+S) и пришли файл сюда — можно "
-        "и без команды, просто скинуть файл.\n\n"
-        "/pricefile — загрузить прайс-лист цен на стикеры вручную (Steam market/search JSON), "
-        "/clearprices — очистить его перед обновлением.\n\n"
-        "/watchadd <предмет1>, <предмет2>, ... — добавить предметы в вотчлист на автоскан\n"
-        "/watchdel <номер или название> — убрать предмет из вотчлиста\n"
-        "/watchclear — полностью очистить вотчлист\n"
-        f"/watchlist — показать вотчлист; следующий прогон стартует через {WATCH_GAP_MINUTES:g} мин "
-        "после конца предыдущего (сам прогон списка уже безопасно троттлится по времени, так что "
-        "отдельно ждать дольше для больших списков не нужно); бот пришлёт сообщение, только если "
-        "найдёт новые офферы (один и тот же лот повторно не пришлёт в течение 5 часов).\n"
-        "/scanall — сканировать оба списка прямо сейчас, не дожидаясь расписания.\n"
-        "/watchpause — остановить автоскан (список сохраняется), /watchresume — возобновить.\n\n"
-        "🔍 Охота за редким флоатом идёт по ОТДЕЛЬНОМУ списку — флоат имеет смысл искать на "
-        "конкретных скинах, а не по всему вотчлисту:\n"
-        "/floatadd <предмет1>, <предмет2>, ... — добавить предметы в охоту за флоатом\n"
-        "/floatdel <номер или название> — убрать, /floatclear — очистить весь список\n"
-        "/floatlist — показать список и текущее условие отбора\n"
-        "(предмет может быть в обоих списках — тогда за прогон он тянется из Steam один раз "
-        "и проверяется сразу по обоим критериям)\n\n"
-        f"/setdefaults <мин$> <макс%> — поменять значения по умолчанию "
-        f"(сейчас: {def_min:.0f}$ / {def_max:.0f}%).\n"
-        f"/setstreakmarkup <%> — отдельный порог наценки для лотов с {STREAK_THRESHOLD}+ "
-        f"подряд одинаковыми стикерами (\"стрик\").\n"
-        f"/setpricefilter <мин$> <макс$> — показывать только лоты в этом диапазоне цены "
-        f"(со стикерами); /setpricefilter off — убрать фильтр.\n"
-        f"/setfloatfilter <низкий> <высокий> — искать лоты с редким флоатом (близко к 0 — топ "
-        f"для Factory New, близко к 1 — топ для Battle-Scarred), не связано со стикерами; "
-        f"/setfloatfilter off — убрать фильтр.\n"
-        f"/setfloatmarkup <макс%> — показывать флоат-находку, только если её цена не больше "
-        f"чем на макс% выше самого дешёвого лота этого предмета (иначе продавец уже в курсе "
-        f"и заложил редкость в цену); /setfloatmarkup off — без ограничения по цене.\n\n"
-        "💱 Арбитраж CSFloat ↔ Steam (по умолчанию выключен, вотчлист не нужен — "
-        "сканируется весь рынок CSFloat):\n"
-        "/setarb <мин%> — включить: слать лоты, которые на CSFloat дешевле цены Steam "
-        "минимум на мин%; /setarb off — выключить\n"
-        "/setarbprice <мин$> <макс$> — ограничить диапазон цены лота\n"
-        "/setarbvolume <шт> — только ликвидное (сколько продаётся на Steam)\n"
-        "/setarbstickers <макс%> — ещё и лоты, где наклейки достаются почти даром\n"
-        "/arbnow — проверить прямо сейчас\n"
-        "/arbreset — снять кулдаун CSFloat и показать, чем мы к нему стучимся\n"
-        f"Учти: выручка от продажи в Steam приходит на кошелёк и не выводится, "
-        f"поэтому в сообщениях показываю «чистыми» с учётом комиссии "
-        f"~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%."
+    """/help — справочник, собранный из реестра команд, а не написанный руками."""
+    blocks = [
+        "🤖 <b>Dextrade</b> — слежу за скинами CS2 и присылаю выгодные лоты.\n"
+        "Пороги отбора живут в меню: /start → Пороги."
+    ]
+
+    for group in _HELP_GROUPS:
+        entries = [c for c in COMMANDS if c.group == group and c.help]
+        if not entries:
+            continue
+        blocks.append(f"<b>{group}</b>")
+        blocks.extend(html_module.escape(c.help) for c in entries)
+
+    aliases = [c.name for c in COMMANDS if c.group == "Старые имена"]
+    blocks.append(
+        "<b>Старые имена</b>\n"
+        "Работают по-прежнему, просто убраны из меню:\n"
+        + ", ".join(f"/{name}" for name in aliases)
     )
-    # Справочник давно перерос лимит Telegram в 4096 символов — режем на части
-    # тем же helper'ом, что и списки (см. _chunk_lines).
-    for chunk in _chunk_lines(text.split("\n\n"), sep="\n\n"):
-        await update.message.reply_text(chunk)
+
+    blocks.append(
+        f"<i>Выручка от продажи в Steam приходит на кошелёк и не выводится, "
+        f"поэтому в сообщениях показываю «чистыми» с учётом комиссии "
+        f"~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%.</i>"
+    )
+
+    for chunk in _chunk_lines(blocks, sep="\n\n"):
+        await update.message.reply_text(chunk, parse_mode="HTML")
 
 
-# Меню команд Telegram (то, что видно при вводе "/"). Здесь НЕ все команды:
-# их 27, и списком в четыре экрана пользоваться невозможно. Оставлены те, что
-# нужны регулярно, в порядке реального сценария — сначала "посмотреть и
-# проверить", потом списки, потом настройка. Остальные продолжают работать и
-# перечислены в /help: команда, которой нет в меню, не перестаёт существовать.
-BOT_COMMANDS = [
-    BotCommand("status", "Что сейчас происходит: списки, автоскан, кулдауны"),
-    BotCommand("scanall", "Проверить оба списка прямо сейчас"),
-    BotCommand("scan", "Проверить один предмет"),
-    BotCommand("watchlist", "Показать вотчлист (стикеры)"),
-    BotCommand("watchadd", "Добавить предмет(ы) в вотчлист"),
-    BotCommand("watchdel", "Убрать предмет из вотчлиста"),
-    BotCommand("floatlist", "Показать список охоты за флоатом"),
-    BotCommand("floatadd", "Добавить предмет в охоту за флоатом"),
-    BotCommand("floatdel", "Убрать предмет из охоты за флоатом"),
-    BotCommand("watchpause", "Остановить автоскан"),
-    BotCommand("watchresume", "Возобновить автоскан"),
-    BotCommand("arbnow", "Проверить арбитраж CSFloat прямо сейчас"),
-    BotCommand("floatcheck", "Платят ли за низкий флоат на этом скине"),
-    BotCommand("inv", "Инвентарь Steam: привязать аккаунт и оценить"),
-    BotCommand("invwatch", "Сообщать, когда скины в инвентаре дорожают"),
-    BotCommand("markets", "Сравнить Steam с другими площадками (весь каталог)"),
-    BotCommand("setmarkets", "Пороги для /markets: спред, продажи, прибыль"),
-    BotCommand("proxycheck", "Проверить прокси: сколько работают, сколько отвалились"),
-    BotCommand("setinterval", "Пауза между прогонами автоскана"),
-    BotCommand("setratio", "Наклейки дороже скина во сколько раз"),
-    BotCommand("proxyadd", "Добавить прокси прямо из чата"),
-    BotCommand("setarb", "Арбитраж: CSFloat дешевле Steam на N%"),
-    BotCommand("help", "Полный справочник по всем командам"),
-]
+# ---------------------------------------------------------------------------
+# Реестр команд: одно место, из которого берутся и меню Telegram, и /help,
+# и регистрация обработчиков.
+#
+# Раньше это были три независимых списка, и они разъехались: в /help,
+# заявленном как «полный справочник», не хватало тринадцати команд из
+# тридцати девяти — целых функций вроде инвентаря, площадок и прокси. Причём
+# заметить это было нельзя: справочник был литеральной строкой, и добавить
+# команду, не тронув её, ничего не мешало.
+#
+# Теперь источник один. Забыть описать команду больше не выйдет: она просто
+# не зарегистрируется, потому что _build_application ходит по этому же списку.
+# ---------------------------------------------------------------------------
 
-# Команды, которых нет в меню, но которые работают. Держим списком имён, чтобы
-# /help мог свериться и не забыть про них при добавлении новых.
-_UNLISTED_COMMANDS = (
-    "start", "help", "scanfile", "watchclear", "floatclear",
-    "arbreset", "setarbprice", "setarbvolume", "setarbstickers",
-    "setdefaults", "setstreakmarkup", "setpricefilter",
-    "setfloatfilter", "setfloatmarkup", "pricefile", "clearprices",
+class Command(NamedTuple):
+    name: str
+    handler: object
+    group: str
+    # Подпись в меню Telegram (то, что видно при вводе "/"). None — команда
+    # работает, но в меню не показывается: список в тридцать строк
+    # бесполезен, туда идут только регулярно нужные.
+    menu: str | None
+    # Строка в /help. None — это старое имя-алиас, оно попадёт в общий
+    # список в конце справочника, а не отдельным абзацем.
+    help: str | None = None
+
+
+COMMANDS: tuple[Command, ...] = (
+    # --- С чего начать -----------------------------------------------------
+    Command(
+        "start", start, "Начать",
+        "Меню: сканы, списки, состояние, пороги",
+        "/start — меню на кнопках. Оттуда доступны все пороги отбора, "
+        "состояние бота и прокси — синтаксис помнить не нужно.",
+    ),
+    Command(
+        "scanall", scanall, "Начать",
+        "Проверить оба списка прямо сейчас",
+        "/scanall — прогнать вотчлист и охоту за флоатом немедленно, "
+        "не дожидаясь расписания.",
+    ),
+    Command(
+        "scan", scan, "Начать",
+        "Проверить один предмет",
+        "/scan <ссылка или название> [мин$ стикеров] [макс наценка%] — разовая "
+        "проверка одного предмета. Название на английском, с | или без: "
+        "/scan AK-47 | Slate или /scan AK-47 Slate.",
+    ),
+    # --- Списки ------------------------------------------------------------
+    Command(
+        "watch", watch, "Списки",
+        "Вотчлист: показать, добавить, убрать",
+        "/watch — показать вотчлист (охота по стикерам)\n"
+        "/watch <предмет1>, <предмет2> — добавить; степень износа можно указать "
+        "один раз последним элементом (FN/MW/FT/WW/BS)\n"
+        "/watch -3 — убрать третий (или /watch убрать 3)\n"
+        "/watch очистить — очистить список\n"
+        "/watch стоп | /watch старт — пауза автоскана и обратно",
+    ),
+    Command(
+        "float", float_cmd, "Списки",
+        "Флоат: список и проверка скина",
+        "/float — список охоты за редким флоатом и условие отбора\n"
+        "/float <предмет1>, <предмет2> — добавить\n"
+        "/float -2 — убрать второй, /float очистить — очистить\n"
+        "/float чек <предмет> [флоат] — платят ли за низкий флоат именно на "
+        "этом скине\n"
+        "Список отдельный от /watch: флоат имеет смысл искать на конкретных "
+        "скинах. Предмет может быть в обоих — тогда за прогон он тянется из "
+        "Steam один раз и проверяется по обоим критериям.",
+    ),
+    # --- Арбитраж ----------------------------------------------------------
+    Command(
+        "arbnow", arbnow, "Арбитраж CSFloat ↔ Steam",
+        "Проверить арбитраж прямо сейчас",
+        "/arbnow — проверить рынок CSFloat немедленно.",
+    ),
+    Command(
+        "setarb", setarb, "Арбитраж CSFloat ↔ Steam",
+        "Арбитраж: порог, интервал, сброс",
+        "/setarb — показать настройки\n"
+        "/setarb <мин%> — включить: слать лоты CSFloat дешевле цены Steam\n"
+        "/setarb <мин%> <минут> — то же плюс пауза между прогонами, "
+        "например /setarb 30 9\n"
+        "/setarb сброс — снять кулдаун CSFloat\n"
+        "/setarb off — выключить\n"
+        "Остальные пороги арбитража — /start → Пороги → Арбитраж.",
+    ),
+    # --- Площадки ----------------------------------------------------------
+    Command(
+        "markets", markets, "Площадки",
+        "Сравнить Steam с другими площадками",
+        "/markets [мин%] — сравнить цены Steam со сторонними площадками по "
+        "всему каталогу. Пороги — /start → Пороги → Площадки.",
+    ),
+    # --- Инвентарь ---------------------------------------------------------
+    Command(
+        "inv", inv, "Инвентарь",
+        "Инвентарь Steam: оценить и следить",
+        "/inv — оценка привязанного инвентаря\n"
+        "/inv <ссылка на профиль> — привязать аккаунт (инвентарь должен быть "
+        "открыт)\n"
+        "/inv следить 15 — сообщать, когда предмет подорожал на 15%\n"
+        "/inv следить off — выключить слежение, /inv off — отвязать аккаунт",
+    ),
+    # --- Служебное ---------------------------------------------------------
+    Command(
+        "proxyadd", proxyadd, "Служебное",
+        "Добавить прокси прямо из чата",
+        "/proxyadd <адреса> — добавить прокси без передеплоя. Сколько угодно "
+        "за раз: через запятую, пробел или с новой строки. Проверить и "
+        "почистить — /start → Прокси.",
+    ),
+    Command(
+        "scanfile", scanfile, "Служебное", None,
+        "/scanfile <ссылка> — резервный ручной путь, когда автоматический "
+        "запрос не удался (например, IP на кулдауне после 429). Бот пришлёт "
+        "ссылку на JSON: открой в браузере, сохрани Ctrl+S и пришли файл сюда. "
+        "Файл можно слать и без команды.",
+    ),
+    Command(
+        "help", help_cmd, "Служебное",
+        "Справочник по всем командам",
+        "/help — то, что ты сейчас читаешь.",
+    ),
+
+    # --- Старые имена ------------------------------------------------------
+    # Ничего не стоят, а мышечная память на них уже есть. Из меню Telegram
+    # убраны, в справочнике перечислены одной строкой.
+    Command("watchadd", watchadd, "Старые имена", None),
+    Command("watchdel", watchdel, "Старые имена", None),
+    Command("watchlist", watchlist_cmd, "Старые имена", None),
+    Command("watchclear", watchclear, "Старые имена", None),
+    Command("watchpause", watchpause, "Старые имена", None),
+    Command("watchresume", watchresume, "Старые имена", None),
+    Command("floatadd", floatadd, "Старые имена", None),
+    Command("floatdel", floatdel, "Старые имена", None),
+    Command("floatlist", floatlist_cmd, "Старые имена", None),
+    Command("floatclear", floatclear, "Старые имена", None),
+    Command("floatcheck", floatcheck, "Старые имена", None),
+    Command("invwatch", invwatch, "Старые имена", None),
+    Command("arbreset", arbreset, "Старые имена", None),
+    Command("status", status, "Старые имена", None),
+    Command("setdefaults", setdefaults, "Старые имена", None),
+    Command("setstreakmarkup", setstreakmarkup, "Старые имена", None),
+    Command("setpricefilter", setpricefilter, "Старые имена", None),
+    Command("setfloatfilter", setfloatfilter, "Старые имена", None),
+    Command("setfloatmarkup", setfloatmarkup, "Старые имена", None),
+    Command("setratio", setratio, "Старые имена", None),
+    Command("setinterval", setinterval, "Старые имена", None),
+    Command("setmarkets", setmarkets, "Старые имена", None),
+    Command("setarbprice", setarbprice, "Старые имена", None),
+    Command("setarbvolume", setarbvolume, "Старые имена", None),
+    Command("setarbstickers", setarbstickers, "Старые имена", None),
+    Command("proxycheck", proxycheck, "Старые имена", None),
+    Command("proxyclear", proxyclear, "Старые имена", None),
+    Command("pricefile", pricefile, "Старые имена", None),
+    Command("clearprices", clearprices, "Старые имена", None),
 )
+
+
+BOT_COMMANDS = [
+    BotCommand(cmd.name, cmd.menu) for cmd in COMMANDS if cmd.menu
+]
 
 
 async def _on_startup(app: Application):
@@ -4210,7 +5109,7 @@ async def _on_startup(app: Application):
         settings = await get_arb_settings(chat_id)
         if settings["min_discount"] is None:
             continue
-        _schedule_arb_job(app.job_queue, chat_id)
+        _schedule_arb_job(app.job_queue, chat_id, _arb_interval(settings))
         arb_restored += 1
     if arb_restored:
         log.info("arb: восстановлены джобы арбитража для %d чат(ов)", arb_restored)
@@ -4492,45 +5391,11 @@ def _build_application(token: str):
     дважды инициализировать один и тот же Application нельзя.
     """
     app = Application.builder().token(token).post_init(_on_startup).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("scan", scan))
-    app.add_handler(CommandHandler("scanfile", scanfile))
-    app.add_handler(CommandHandler("setdefaults", setdefaults))
-    app.add_handler(CommandHandler("setstreakmarkup", setstreakmarkup))
-    app.add_handler(CommandHandler("setpricefilter", setpricefilter))
-    app.add_handler(CommandHandler("setfloatfilter", setfloatfilter))
-    app.add_handler(CommandHandler("setfloatmarkup", setfloatmarkup))
-    app.add_handler(CommandHandler("pricefile", pricefile))
-    app.add_handler(CommandHandler("clearprices", clearprices))
-    app.add_handler(CommandHandler("watchadd", watchadd))
-    app.add_handler(CommandHandler("watchdel", watchdel))
-    app.add_handler(CommandHandler("watchclear", watchclear))
-    app.add_handler(CommandHandler("floatadd", floatadd))
-    app.add_handler(CommandHandler("floatdel", floatdel))
-    app.add_handler(CommandHandler("floatlist", floatlist_cmd))
-    app.add_handler(CommandHandler("floatclear", floatclear))
-    app.add_handler(CommandHandler("watchlist", watchlist_cmd))
-    app.add_handler(CommandHandler("watchpause", watchpause))
-    app.add_handler(CommandHandler("watchresume", watchresume))
-    app.add_handler(CommandHandler("scanall", scanall))
-    app.add_handler(CommandHandler("setarb", setarb))
-    app.add_handler(CommandHandler("setarbprice", setarbprice))
-    app.add_handler(CommandHandler("setarbvolume", setarbvolume))
-    app.add_handler(CommandHandler("setarbstickers", setarbstickers))
-    app.add_handler(CommandHandler("arbnow", arbnow))
-    app.add_handler(CommandHandler("floatcheck", floatcheck))
-    app.add_handler(CommandHandler("inv", inv))
-    app.add_handler(CommandHandler("invwatch", invwatch))
-    app.add_handler(CommandHandler("markets", markets))
-    app.add_handler(CommandHandler("setmarkets", setmarkets))
-    app.add_handler(CommandHandler("proxycheck", proxycheck))
-    app.add_handler(CommandHandler("setinterval", setinterval))
-    app.add_handler(CommandHandler("setratio", setratio))
-    app.add_handler(CommandHandler("proxyadd", proxyadd))
-    app.add_handler(CommandHandler("proxyclear", proxyclear))
-    app.add_handler(CommandHandler("arbreset", arbreset))
+    # Из одного реестра — и обработчики, и меню Telegram, и /help. Раньше это
+    # были три списка, и справочник от них отставал на треть команд.
+    for cmd in COMMANDS:
+        app.add_handler(CommandHandler(cmd.name, cmd.handler))
+    app.add_handler(CallbackQueryHandler(menu_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_selection))
     return app

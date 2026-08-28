@@ -354,8 +354,10 @@ async def set_float_markup(chat_id: int, pct: Optional[float]) -> None:
 async def get_arb_settings(chat_id: int) -> dict:
     """
     {'min_discount': %, 'min_price': $, 'max_price': $, 'min_volume': шт,
-     'sticker_markup': %} — любое поле может быть None.
+     'sticker_markup': %, 'interval': мин} — любое поле может быть None.
     min_discount = None означает, что арбитраж выключен целиком.
+    interval = None означает «интервал не задан руками», и тогда действует
+    ARB_INTERVAL_MINUTES из окружения.
     """
     s = await _get_chat_settings(chat_id)
     return {
@@ -364,12 +366,13 @@ async def get_arb_settings(chat_id: int) -> dict:
         "max_price": s.get("arb_max_price"),
         "min_volume": s.get("arb_min_volume"),
         "sticker_markup": s.get("arb_sticker_markup"),
+        "interval": s.get("arb_interval"),
     }
 
 
 async def set_arb_setting(chat_id: int, key: str, value) -> None:
-    """key — одно из: min_discount, min_price, max_price, min_volume, sticker_markup."""
-    allowed = {"min_discount", "min_price", "max_price", "min_volume", "sticker_markup"}
+    """key — одно из: min_discount, min_price, max_price, min_volume, sticker_markup, interval."""
+    allowed = {"min_discount", "min_price", "max_price", "min_volume", "sticker_markup", "interval"}
     if key not in allowed:
         raise ValueError(f"неизвестная настройка арбитража: {key}")
     settings = await _get_chat_settings(chat_id)
