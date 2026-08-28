@@ -3780,21 +3780,49 @@ async def _collect_market_prices(session):
         try:
             items = await sih_client.fetch_items(session)
             steam_prices, by_market, counts = sih_client.split_by_market(items)
-            if not steam_prices:
-                raise sih_client.SihError(
-                    f"отдал {len(items)} предметов, но ни у одного нет цены Steam — "
-                    "похоже, изменился формат ответа get-items"
+
+            if steam_prices:
+                log.info(
+                    "markets: источник SIH — %d предметов, с ценой Steam %d, площадок %d",
+                    len(items), len(steam_prices), len(by_market),
                 )
-            log.info(
-                "markets: источник SIH — %d предметов, с ценой Steam %d, площадок %d",
-                len(items), len(steam_prices), len(by_market),
+                return "SIH", steam_prices, by_market, counts, ""
+
+            # Цены Steam в get-items нет — но каталог площадок пришёл, и он
+            # ценнее того, что было: 28 площадок против восьми, плюс число
+            # лотов. Берём цену Steam из прайс-листа.
+            #
+            # Это та самая сшивка двух источников, которой я избегал. Тогда
+            # избегать было правильно: сшивка и породила расхождение 2.3-2.7x,
+            # а разрешить его было нечем. Сейчас нечего опасаться — прайс-лист
+            # проверен живым Steam (/pricecheck, медиана x1.13 = ширина
+            # стакана), то есть известно, что он не врёт.
+            fallback = await get_csgotrader_prices(session)
+            if fallback:
+                log.info(
+                    "markets: SIH дал %d предметов на %d площадках без цены Steam — "
+                    "беру её из прайс-листа",
+                    len(items), len(by_market),
+                )
+                return (
+                    "SIH + прайс-лист",
+                    fallback,
+                    by_market,
+                    counts,
+                    f"ℹ️ SIH не отдаёт цену Steam в get-items, поэтому площадки "
+                    f"({len(by_market)}) от него, а цена Steam из прайс-листа.",
+                )
+            raise sih_client.SihError(
+                f"отдал {len(items)} предметов без цены Steam, а прайс-лист не скачался"
             )
-            return "SIH", steam_prices, by_market, counts, ""
         except (sih_client.SihError, aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.warning("markets: SIH недоступен (%s), беру csgotrader", e)
-            reason = str(e).split("\n", 1)[0]
+            # Причину НЕ обрезаем до первой строки. Обрезали — и ровно та
+            # диагностика, ради которой сообщение писалось (какие поля пришли
+            # вместо цены Steam), не доехала до чата.
             note = (
-                f"⚠️ SIH недоступен ({reason}), цены взяты из csgotrader.\n"
+                f"⚠️ SIH недоступен: {e}\n\n"
+                "Цены взяты из csgotrader.\n"
                 "Проверить ключ: /start → Прайс-лист → Проверить ключ SIH"
             )
     else:
