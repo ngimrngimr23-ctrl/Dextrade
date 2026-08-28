@@ -217,7 +217,7 @@ class MarketOffer:
 
     __slots__ = (
         "market", "market_hash_name", "market_price", "steam_price", "discount_pct",
-        "steam_volume", "verified", "estimated_price",
+        "steam_volume", "verified", "estimated_price", "listing_count",
     )
 
     def __init__(self, market: str, name: str, market_price: float, steam_price: float):
@@ -231,6 +231,10 @@ class MarketOffer:
         self.steam_volume: int | None = None
         self.verified = False
         self.estimated_price: float | None = None
+        # Сколько лотов на площадке. Ликвидность на стороне ПОКУПКИ: скидка на
+        # единственном экземпляре и та же скидка на трёх десятках лотов — разные
+        # вещи. csgotrader этого не отдавал вовсе, SIH отдаёт полем count.
+        self.listing_count: int | None = None
 
     def apply_live_steam(self, lowest: float, volume: int | None) -> None:
         """Заменить оценку настоящей ценой из Steam и пересчитать выгоду."""

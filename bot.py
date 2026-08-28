@@ -150,6 +150,7 @@ import market_prices
 import menu
 import pricing
 import proxy_pool
+import sih_client
 from csfloat_client import CSFloatError, CSFloatRateLimited
 
 logging.basicConfig(level=logging.INFO)
@@ -3738,18 +3739,68 @@ async def _verify_markets_against_steam(offers, min_discount_pct: float, min_vol
     return verified, rejected, unavailable
 
 
+class MarketsUnavailable(Exception):
+    """Цены площадок не собрались. Текст уходит пользователю как есть."""
+
+
+async def _collect_market_prices(session):
+    """
+    Цены площадок и Steam для сравнения: (источник, цены Steam, по площадкам, лотов).
+
+    Основной источник — SIH: один запрос отдаёт весь каталог, причём цена
+    покупки и цена Steam лежат в ОДНОЙ записи. Это не мелочь. Раньше два числа
+    приходили из двух разных мест и сшивались у нас, и на проде они разошлись
+    на 97% предметов с устойчивым отношением 2.3-2.7x — то есть кто-то из двоих
+    считал в других единицах, а понять кто, имея только их спор, было нечем.
+    Когда оба числа считает одна сторона, такого расхождения не может быть
+    по построению.
+
+    csgotrader остаётся запасным путём ровно на один случай — пока не задан
+    SIH_API_KEY. Это не второй источник «для надёжности», а страховка от того,
+    чтобы /markets не отвечал пустотой на боте без ключа.
+    """
+    if sih_client.enabled():
+        items = await sih_client.fetch_items(session)
+        steam_prices, by_market, counts = sih_client.split_by_market(items)
+        if not steam_prices:
+            raise MarketsUnavailable(
+                f"SIH отдал {len(items)} предметов, но ни у одного нет цены Steam — "
+                "сравнивать не с чем. Похоже, изменился формат ответа get-items."
+            )
+        log.info(
+            "markets: источник SIH — %d предметов, с ценой Steam %d, площадок %d",
+            len(items), len(steam_prices), len(by_market),
+        )
+        return "SIH", steam_prices, by_market, counts
+
+    steam_prices = await get_csgotrader_prices(session)
+    if not steam_prices:
+        raise MarketsUnavailable(
+            "Прайс-лист Steam не скачался — сравнивать не с чем.\n"
+            "Основной источник цен теперь SIH: задай SIH_API_KEY в переменных "
+            "окружения на Render."
+        )
+    by_market = await market_prices.load_markets(session)
+    if not by_market:
+        raise MarketsUnavailable(
+            "Ни один файл площадок не открылся. Похоже, состав файлов на "
+            "prices.csgotrader.app изменился.\n"
+            "Основной источник цен теперь SIH: задай SIH_API_KEY на Render."
+        )
+    return "csgotrader", steam_prices, by_market, {}
+
+
 async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /markets [%] — сравнить Steam с площадками из прайс-листов csgotrader.
+    /markets [%] — сравнить Steam с площадками (источник — SIH).
 
-    Отдельный от CSFloat канал арбитража, и главное его свойство — отсутствие
-    ограничений. Это статические файлы на CDN: ни ключа, ни квоты, ни банов по
-    IP. Поэтому сравнивается ВЕСЬ каталог целиком, а не выборка лотов, и
-    вопрос «почему только тысяча предметов» тут просто не возникает.
+    Отдельный от CSFloat канал арбитража, и главное его свойство — охват. Весь
+    каталог приходит одним запросом, поэтому сравнивается он целиком, а не
+    выборка лотов, и вопрос «почему только тысяча предметов» тут не возникает.
 
-    Цена — агрегат по предмету, а не конкретный лот: ни флоата, ни наклеек, ни
-    ссылки на лот. Для сигнала «предмет дешевле на площадке» этого хватает,
-    дальше человек открывает площадку сам.
+    Цена — лучшее предложение по предмету, а не конкретный лот: ни флоата, ни
+    наклеек, ни прямой ссылки на лот. Зато есть count (сколько лотов) и market
+    (на какой площадке) — этого раньше не было вовсе.
     """
     chat_id = update.effective_chat.id
     saved = await get_market_settings(chat_id)
@@ -3775,23 +3826,25 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     min_item_price = setting("min_price", market_prices.MIN_MARKET_PRICE)
 
     await update.message.reply_text(
-        f"Сравниваю Steam с площадками.\n"
+        f"Сравниваю Steam с площадками ({'SIH' if sih_client.enabled() else 'csgotrader'}).\n"
         f"Спред от {threshold:g}% до {max_discount:g}%, прибыль от ${min_profit:g}, "
         f"продаж в Steam от {min_volume} за сутки.\n"
-        f"Пороги: /setmarkets"
+        f"Пороги: /start → Пороги → Площадки"
     )
 
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
-        steam_prices = await get_csgotrader_prices(session)
-        if not steam_prices:
-            await update.message.reply_text("⚠️ Прайс-лист Steam не скачался — сравнивать не с чем.")
+        try:
+            source, steam_prices, by_market, counts = await _collect_market_prices(session)
+        except (sih_client.SihError, MarketsUnavailable) as e:
+            await update.message.reply_text(f"⚠️ {e}")
             return
-
-        by_market = await market_prices.load_markets(session)
-        if not by_market:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            # Сетевую ошибку ловим отдельно от отказа источника: молча упасть
+            # в обработчик PTB значит оставить человека вообще без ответа.
+            log.warning("markets: источник цен недоступен: %s", e)
             await update.message.reply_text(
-                "⚠️ Ни один файл площадок не открылся. Похоже, состав файлов на "
-                "prices.csgotrader.app изменился — надо смотреть, какие есть сейчас."
+                f"⚠️ Не достучался до источника цен ({type(e).__name__}). "
+                "Попробуй ещё раз через минуту."
             )
             return
 
@@ -3808,10 +3861,26 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     fee_multiplier=STEAM_FEE_MULTIPLIER,
                 )
             )
+        for offer in found:
+            offer.listing_count = counts.get(offer.market_hash_name)
+
+    # Сколько лотов на площадке — это ликвидность на стороне ПОКУПКИ, и её
+    # стоит показать до того, как человек пойдёт покупать: скидка на
+    # единственном экземпляре живёт минуты.
+    if counts:
+        no_stock = sum(1 for o in found if o.listing_count == 0)
+        if no_stock:
+            found = [o for o in found if o.listing_count != 0]
+            log.info("markets: отброшено %d находок без лотов в наличии", no_stock)
 
     if not found:
+        # Площадок у SIH под три десятка — перечислять все значит утопить
+        # смысл сообщения в списке названий.
+        shown = ", ".join(sorted(available)[:8])
+        if len(available) > 8:
+            shown += f" и ещё {len(available) - 8}"
         await update.message.reply_text(
-            f"Проверил площадки ({', '.join(available)}) — дешевле Steam на {threshold:g}% "
+            f"Проверил площадки ({shown}) — дешевле Steam на {threshold:g}% "
             "ничего нет. Попробуй порог ниже."
         )
         return
@@ -3858,18 +3927,23 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     found.sort(key=lambda o: o.discount_pct, reverse=True)
     lines = [
         f"🏪 Дешевле Steam — найдено {len(found)}\n"
-        f"<i>Цены из прайс-листов, обновляются примерно раз в час. Это средняя цена "
+        f"<i>Источник: {source}, кэш обновляется раз в час. Это лучшее предложение "
         f"по предмету, а не конкретный лот: проверяй на площадке перед покупкой. "
         f"«Чистыми» — за вычетом комиссии Steam ~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%.</i>"
     ]
     for o in found[:15]:
         net = o.net_after_fee(STEAM_FEE_MULTIPLIER)
+        # Число лотов знает только SIH. Пишем строку, лишь когда оно есть, —
+        # «лотов: ?» рядом с реальными числами читается как сбой, а не как
+        # «этот источник такого не отдаёт».
+        stock = f" | лотов: {o.listing_count}" if o.listing_count else ""
         lines.append(
             f"<code>{html_module.escape(o.market_hash_name)}</code>\n"
             f"  {html_module.escape(o.market)} ${o.market_price:.2f} | "
             f"Steam ${o.steam_price:.2f} | дешевле на {o.discount_pct:.1f}%\n"
             f"  чистыми при перепродаже: {'+' if net >= 0 else '-'}${abs(net):.2f}"
-            f" | продаж в Steam за сутки: {o.steam_volume if o.steam_volume is not None else '?'}\n"
+            f" | продаж в Steam за сутки: {o.steam_volume if o.steam_volume is not None else '?'}"
+            f"{stock}\n"
             f'  <a href="{o.steam_url}">Проверить в Steam</a>'
         )
 
