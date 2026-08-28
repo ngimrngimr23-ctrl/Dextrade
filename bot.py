@@ -156,6 +156,14 @@ from csfloat_client import CSFloatError, CSFloatRateLimited
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("steam_bot")
 
+# httpx на INFO печатает полный URL каждого запроса к Telegram, а токен бота —
+# часть этого URL. То есть весь лог Render, включая любой кусок, отправленный
+# в переписку или в тикет, содержит рабочий токен. Полезного в этих строках
+# ничего: успешный sendMessage и так виден по результату, а ошибки PTB
+# логирует сам.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # Состояние активных /scanfile-сессий по chat_id. В памяти процесса —
 # сессия живёт, пока бот не перезапустится; для одного скана этого достаточно,
 # долговременно ничего хранить тут не нужно.

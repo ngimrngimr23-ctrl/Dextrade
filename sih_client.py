@@ -157,6 +157,30 @@ def parse_items(payload: dict) -> tuple[dict[str, SihItem], int]:
     return items, skipped
 
 
+async def _error_detail(resp) -> str:
+    """
+    Объяснение отказа из тела ответа.
+
+    У SIH все ошибки описаны одинаково — {"success": false, "error": "..."} —
+    и текст там конкретный: «Minimum amount is 50 RUB», «API key disabled by
+    the administrator». Выбрасывать его и показывать один голый код статуса
+    значит превращать готовый ответ на вопрос «что не так» в загадку. На 400
+    ровно это и вышло: HTTP 400 без единого слова о причине.
+    """
+    try:
+        body = await resp.json(content_type=None)
+    except Exception:
+        try:
+            text = (await resp.text())[:300].strip()
+        except Exception:
+            return ""
+        return text
+    if isinstance(body, dict):
+        detail = body.get("error") or body.get("message") or ""
+        return str(detail)
+    return ""
+
+
 async def _get(session: aiohttp.ClientSession, path: str, params: dict) -> dict:
     if not SIH_API_KEY:
         raise SihError("не задан SIH_API_KEY")
@@ -174,18 +198,20 @@ async def _get(session: aiohttp.ClientSession, path: str, params: dict) -> dict:
             except Exception:
                 body = {}
             raise SihRateLimited(float(body.get("retryAfter") or 10))
-        if resp.status in (401, 403):
-            # Текст ошибки от SIH здесь важнее кода: он различает «ключ
-            # отключён тобой» и «ключ отключён администратором», а это разные
-            # действия со стороны владельца.
-            try:
-                body = await resp.json(content_type=None)
-                detail = body.get("error") or ""
-            except Exception:
-                detail = ""
-            raise SihError(f"SIH отклонил ключ (HTTP {resp.status}): {detail or 'без пояснения'}")
+
         if resp.status != 200:
-            raise SihError(f"SIH ответил HTTP {resp.status}")
+            detail = await _error_detail(resp)
+            # Параметры в сообщении — намеренно: без них «неверный запрос»
+            # не отличить от «неверный запрос ИМЕННО с этим appId».
+            shown = ", ".join(f"{k}={v}" for k, v in params.items()) or "без параметров"
+            if resp.status in (401, 403):
+                raise SihError(
+                    f"SIH отклонил ключ (HTTP {resp.status}): {detail or 'без пояснения'}"
+                )
+            raise SihError(
+                f"SIH ответил HTTP {resp.status} на {path} ({shown}): "
+                f"{detail or 'тело ответа пустое'}"
+            )
 
         payload = await resp.json(content_type=None)
 
@@ -194,6 +220,60 @@ async def _get(session: aiohttp.ClientSession, path: str, params: dict) -> dict:
     if payload.get("success") is False:
         raise SihError(f"SIH: {payload.get('error') or 'запрос отклонён без пояснения'}")
     return payload
+
+
+# Как звать get-items. Документация описывает appId числом, но живой сервис на
+# этом ответил 400 без пояснения, а гадать по одному варианту за деплой дорого:
+# каждая попытка стоит перезапуска на Render. Эндпоинт read-only, поэтому
+# перебрать несколько написаний за один заход дешевле и безопаснее, чем гонять
+# круги. Первый сработавший запоминается на процесс.
+_ITEMS_PARAM_VARIANTS = (
+    ("appId числом", lambda app_id: {"appId": app_id}),
+    ("appId строкой", lambda app_id: {"appId": str(app_id)}),
+    ("app_id строкой", lambda app_id: {"app_id": str(app_id)}),
+    ("без параметров", lambda app_id: {}),
+)
+
+_working_variant: int | None = None
+
+
+async def _fetch_items_payload(session: aiohttp.ClientSession, app_id: int) -> dict:
+    """
+    Позвать get-items, подобрав написание параметров.
+
+    Рейт-лимит и отказ по ключу перебирать бессмысленно — они не про
+    параметры, поэтому пробрасываются сразу. Перебираем только «неверный
+    запрос»: именно он означает, что сервис ждёт что-то другое.
+    """
+    global _working_variant
+
+    order = list(range(len(_ITEMS_PARAM_VARIANTS)))
+    if _working_variant is not None:
+        order.remove(_working_variant)
+        order.insert(0, _working_variant)
+
+    problems: list[str] = []
+    for index in order:
+        label, build = _ITEMS_PARAM_VARIANTS[index]
+        try:
+            payload = await _get(session, "get-items", build(app_id))
+        except SihRateLimited:
+            raise
+        except SihError as e:
+            text = str(e)
+            if "отклонил ключ" in text:
+                raise
+            problems.append(f"{label}: {text}")
+            log.info("sih: вариант «%s» не подошёл — %s", label, text)
+            continue
+        if _working_variant != index:
+            log.info("sih: get-items отвечает на вариант «%s», запоминаю", label)
+            _working_variant = index
+        return payload
+
+    raise SihError(
+        "SIH не принял ни одно написание параметров get-items.\n" + "\n".join(problems)
+    )
 
 
 # Кэш каталога: app_id -> (записи, момент загрузки).
@@ -219,7 +299,7 @@ async def fetch_items(
             return cached[0]
 
         try:
-            payload = await _get(session, "get-items", {"appId": app_id})
+            payload = await _fetch_items_payload(session, app_id)
             items, skipped = parse_items(payload)
         except Exception as e:
             if cached:
