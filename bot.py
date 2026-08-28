@@ -4743,6 +4743,74 @@ def _ratio_verdict(ratios: list[float]) -> str:
     )
 
 
+async def _pricecheck_sample(chat_id: int, prices: dict, limit: int) -> list[str]:
+    """
+    Какие предметы сверять.
+
+    Сначала свои списки: по ним бот и работает, и врущая на них оценка — это
+    прямо испорченные уведомления. Если их мало, добираем из каталога, но не
+    подряд: соседние по алфавиту предметы — это десяток вариантов одного
+    оружия, и на них ошибка источника выглядит одинаково. Идём с шагом, чтобы
+    выборка размазалась по каталогу.
+    """
+    def usable(name: str) -> bool:
+        found = prices.get(name)
+        if not found:
+            return False
+        price = found.windows.get(ARB_PRICE_WINDOW)
+        # Копеечные предметы для сверки бесполезны: там процент огромен от
+        # любого шума в пару центов.
+        return bool(price and price >= 1.0)
+
+    chosen: list[str] = []
+    seen: set[str] = set()
+    for name in list(await get_watchlist(chat_id)) + list(await get_float_watchlist(chat_id)):
+        if name not in seen and usable(name):
+            seen.add(name)
+            chosen.append(name)
+            if len(chosen) >= limit:
+                return chosen
+
+    catalog = sorted(n for n in prices if n not in seen and usable(n))
+    if not catalog:
+        return chosen
+    stride = max(1, len(catalog) // max(1, limit - len(chosen)))
+    for i in range(0, len(catalog), stride):
+        chosen.append(catalog[i])
+        if len(chosen) >= limit:
+            break
+    return chosen
+
+
+async def _pricecheck_reference(session, names: set[str]) -> tuple[dict[str, float], str]:
+    """
+    Справочные цены CSFloat для тех же предметов — по возможности.
+
+    Возвращает (цены, почему не вышло). Ошибки НЕ поднимаются наверх
+    намеренно: CSFloat здесь третий участник спора, а не условие проверки.
+    """
+    if not csfloat_client.csfloat_enabled():
+        return {}, "не задан CSFLOAT_API_KEY"
+    try:
+        proxy = csfloat_client.CSFLOAT_POOL.next() or None
+        lots, _ = await csfloat_client.fetch_listings_page(session, proxy=proxy)
+    except (CSFloatError, CSFloatRateLimited) as e:
+        log.info("pricecheck: справка CSFloat недоступна — %s", e)
+        return {}, str(e)
+    except Exception as e:
+        log.info("pricecheck: справка CSFloat не получена — %s", e)
+        return {}, f"{type(e).__name__}: {e}"
+
+    found = {
+        lot.market_hash_name: lot.reference_price
+        for lot in lots
+        if lot.market_hash_name in names and lot.reference_price
+    }
+    if not found:
+        return {}, f"из {len(lots)} лотов ни один не совпал с выборкой"
+    return found, ""
+
+
 async def pricecheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /pricecheck [сколько] — сверить оценки цен с живой ценой Steam.
@@ -4770,55 +4838,40 @@ async def pricecheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     sample = max(3, min(sample, 40))
 
-    if not csfloat_client.csfloat_enabled():
-        await update.message.reply_text("Не задан CSFLOAT_API_KEY — брать справочные цены неоткуда.")
-        return
-
     await update.message.reply_text(
-        f"Сверяю {sample} предметов с живой ценой Steam.\n"
+        f"Сверяю до {sample} предметов с живой ценой Steam.\n"
         f"Пауза между запросами {pricing.PRICE_REQUEST_INTERVAL:g} с, "
         f"это примерно {sample * pricing.PRICE_REQUEST_INTERVAL / 60:.0f}-"
         f"{sample * pricing.PRICE_REQUEST_INTERVAL / 60 + 1:.0f} мин."
     )
 
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
-        # 1. Одна страница CSFloat — оттуда и справочные цены, и имена.
-        try:
-            proxy = csfloat_client.CSFLOAT_POOL.next() or None
-            lots, _ = await csfloat_client.fetch_listings_page(session, proxy=proxy)
-        except (CSFloatError, CSFloatRateLimited) as e:
-            await update.message.reply_text(f"⚠️ CSFloat: {e}")
-            return
-
-        # 2. Прайс-лист — второй спорщик.
+        # Прайс-лист — главный подозреваемый, без него сверять нечего.
         prices = await get_csgotrader_price_details()
         if not prices:
             await update.message.reply_text("⚠️ Прайс-лист csgotrader пуст — сверять не с чем.")
             return
 
-        # Берём только те, где ОБА мнения есть: иначе сравнивать нечего, а
-        # живой запрос всё равно потратится.
-        rows = []
-        seen: set[str] = set()
-        for lot in lots:
-            name = lot.market_hash_name
-            if not name or name in seen or not lot.reference_price:
-                continue
-            found = prices.get(name)
-            listed = found.windows.get(ARB_PRICE_WINDOW) if found else None
-            if not listed:
-                continue
-            seen.add(name)
-            rows.append((name, listed, lot.reference_price, lot.price))
-            if len(rows) >= sample:
-                break
-
-        if not rows:
+        names = await _pricecheck_sample(chat_id, prices, sample)
+        if not names:
             await update.message.reply_text(
-                f"Из {len(lots)} лотов CSFloat ни один не нашёлся в прайс-листе "
-                f"с окном {ARB_PRICE_WINDOW} — сверять нечего."
+                f"В прайс-листе не нашлось предметов с окном {ARB_PRICE_WINDOW} — "
+                "сверять нечего."
             )
             return
+
+        # Справка CSFloat — ЖЕЛАТЕЛЬНАЯ, но не обязательная.
+        #
+        # Сначала было наоборот, и это была ошибка: главное сравнение —
+        # прайс-лист против живого Steam — в CSFloat не нуждается вовсе, а
+        # команда падала из-за мёртвых прокси, к ценам отношения не имеющих.
+        # Диагностика не должна зависеть от самого хрупкого узла системы.
+        reference, csfloat_note = await _pricecheck_reference(session, set(names))
+
+        rows = [
+            (name, prices[name].windows[ARB_PRICE_WINDOW], reference.get(name))
+            for name in names
+        ]
 
         # 3. Живая цена Steam — эталон.
         semaphore = asyncio.Semaphore(pricing.PRICE_CONCURRENCY)
@@ -4842,26 +4895,32 @@ async def pricecheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     csf_ratios: list[float] = []
     unchecked = 0
 
-    for (name, listed, reference, lot_price), live_price in zip(rows, results):
+    for (name, listed, ref), live_price in zip(rows, results):
         if not live_price or not live_price.lowest:
             unchecked += 1
             continue
         real = live_price.lowest
         pl_ratios.append(listed / real)
-        csf_ratios.append(reference / real)
+        csf = ""
+        if ref:
+            csf_ratios.append(ref / real)
+            csf = f"CSF ${ref:.2f} (×{ref / real:.2f}) | "
         lines.append(
             f"<code>{html_module.escape(name[:42])}</code>\n"
             f"  ПЛ ${listed:.2f} (×{listed / real:.2f}) | "
-            f"CSF ${reference:.2f} (×{reference / real:.2f}) | "
-            f"<b>Steam ${real:.2f}</b> | лот ${lot_price:.2f}"
+            f"{csf}<b>Steam ${real:.2f}</b>"
         )
 
     lines.append("")
     lines.append("<b>Прайс-лист csgotrader против живого Steam</b>")
     lines.append(_ratio_verdict(pl_ratios))
-    lines.append("")
-    lines.append("<b>Справка CSFloat против живого Steam</b>")
-    lines.append(_ratio_verdict(csf_ratios))
+    if csf_ratios:
+        lines.append("")
+        lines.append("<b>Справка CSFloat против живого Steam</b>")
+        lines.append(_ratio_verdict(csf_ratios))
+    elif csfloat_note:
+        lines.append("")
+        lines.append(f"<i>Справку CSFloat взять не вышло: {csfloat_note}</i>")
     if unchecked:
         lines.append("")
         lines.append(
