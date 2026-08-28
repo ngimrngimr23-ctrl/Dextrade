@@ -3763,39 +3763,53 @@ async def _collect_market_prices(session):
     Когда оба числа считает одна сторона, такого расхождения не может быть
     по построению.
 
-    csgotrader остаётся запасным путём ровно на один случай — пока не задан
-    SIH_API_KEY. Это не второй источник «для надёжности», а страховка от того,
-    чтобы /markets не отвечал пустотой на боте без ключа.
+    csgotrader — запасной путь, и берётся он всегда, когда SIH не ответил, а
+    не только когда ключа нет.
+
+    Разница принципиальная, и первая версия на ней ошиблась. Условие было «если
+    ключ ЗАДАН — идём в SIH», а на проде ключ оказался задан и при этом
+    нерабочий. Худший из возможных случаев: запасной путь отключён, замены нет,
+    и /markets просто перестал работать — хотя csgotrader всё это время был
+    исправен (проверено /pricecheck: медиана ×1.13 против живого Steam, то есть
+    ровно ширина стакана).
+
+    Правильное условие — «если SIH РАБОТАЕТ». Новый источник, который не
+    отвечает, не должен уносить с собой старый, который отвечает.
     """
     if sih_client.enabled():
-        items = await sih_client.fetch_items(session)
-        steam_prices, by_market, counts = sih_client.split_by_market(items)
-        if not steam_prices:
-            raise MarketsUnavailable(
-                f"SIH отдал {len(items)} предметов, но ни у одного нет цены Steam — "
-                "сравнивать не с чем. Похоже, изменился формат ответа get-items."
+        try:
+            items = await sih_client.fetch_items(session)
+            steam_prices, by_market, counts = sih_client.split_by_market(items)
+            if not steam_prices:
+                raise sih_client.SihError(
+                    f"отдал {len(items)} предметов, но ни у одного нет цены Steam — "
+                    "похоже, изменился формат ответа get-items"
+                )
+            log.info(
+                "markets: источник SIH — %d предметов, с ценой Steam %d, площадок %d",
+                len(items), len(steam_prices), len(by_market),
             )
-        log.info(
-            "markets: источник SIH — %d предметов, с ценой Steam %d, площадок %d",
-            len(items), len(steam_prices), len(by_market),
-        )
-        return "SIH", steam_prices, by_market, counts
+            return "SIH", steam_prices, by_market, counts, ""
+        except (sih_client.SihError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            log.warning("markets: SIH недоступен (%s), беру csgotrader", e)
+            reason = str(e).split("\n", 1)[0]
+            note = (
+                f"⚠️ SIH недоступен ({reason}), цены взяты из csgotrader.\n"
+                "Проверить ключ: /start → Прайс-лист → Проверить ключ SIH"
+            )
+    else:
+        note = ""
 
     steam_prices = await get_csgotrader_prices(session)
     if not steam_prices:
-        raise MarketsUnavailable(
-            "Прайс-лист Steam не скачался — сравнивать не с чем.\n"
-            "Основной источник цен теперь SIH: задай SIH_API_KEY в переменных "
-            "окружения на Render."
-        )
+        raise MarketsUnavailable("Прайс-лист Steam не скачался — сравнивать не с чем.")
     by_market = await market_prices.load_markets(session)
     if not by_market:
         raise MarketsUnavailable(
             "Ни один файл площадок не открылся. Похоже, состав файлов на "
-            "prices.csgotrader.app изменился.\n"
-            "Основной источник цен теперь SIH: задай SIH_API_KEY на Render."
+            "prices.csgotrader.app изменился."
         )
-    return "csgotrader", steam_prices, by_market, {}
+    return "csgotrader", steam_prices, by_market, {}, note
 
 
 async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3842,15 +3856,7 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
         try:
-            source, steam_prices, by_market, counts = await _collect_market_prices(session)
-        except sih_client.SihKeyError as e:
-            # Различие между двумя ключами SIH неочевидное, и без объяснения
-            # «api key is wrong» отправляет проверять правильный ключ вместо
-            # того, чтобы взять другой.
-            await update.message.reply_text(
-                f"⚠️ {e}\n\n{sih_client.key_help()}", parse_mode="HTML"
-            )
-            return
+            source, steam_prices, by_market, counts, note = await _collect_market_prices(session)
         except (sih_client.SihError, MarketsUnavailable) as e:
             await update.message.reply_text(f"⚠️ {e}")
             return
@@ -3863,6 +3869,8 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Попробуй ещё раз через минуту."
             )
             return
+        if note:
+            await update.message.reply_text(note)
 
         available = list(by_market)
         found: list = []
