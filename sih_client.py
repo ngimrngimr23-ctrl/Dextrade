@@ -155,6 +155,38 @@ def _to_float(value) -> float | None:
     return None
 
 
+# Под какими именами может лежать цена Steam.
+#
+# В документации поле называется steam, но живой ответ на 17491 предмет не
+# содержал его ни разу. Гадать по одному имени за деплой дорого, а имена у
+# таких полей разнятся предсказуемо — перебираем известные варианты и, если
+# не нашлось ни одного, показываем настоящие ключи записи.
+_STEAM_FIELDS = (
+    "steam", "steamPrice", "steam_price", "steamprice",
+    "scm", "steam_market", "steamMarket",
+)
+
+# Если цена лежит вложенным объектом — под каким ключом искать внутри.
+_NESTED_PRICE_FIELDS = ("price", "value", "lowest", "lowest_price", "median", "avg")
+
+
+def _steam_price(record: dict) -> float | None:
+    for field in _STEAM_FIELDS:
+        if field not in record:
+            continue
+        value = record[field]
+        if isinstance(value, dict):
+            for sub in _NESTED_PRICE_FIELDS:
+                price = _to_float(value.get(sub))
+                if price is not None:
+                    return price
+            continue
+        price = _to_float(value)
+        if price is not None:
+            return price
+    return None
+
+
 def _to_int(value) -> int:
     if isinstance(value, bool):
         return 0
@@ -168,12 +200,14 @@ def _to_int(value) -> int:
     return 0
 
 
-def parse_items(payload: dict) -> tuple[dict[str, SihItem], int]:
+def parse_items(payload: dict) -> tuple[dict[str, SihItem], int, set[str]]:
     """
-    Разобрать ответ get-items. Возвращает (записи, сколько пропущено).
+    Разобрать ответ get-items. Возвращает (записи, пропущено, поля в ответе).
 
     Пропущенные считаем и возвращаем, а не глотаем: если формат поменяется,
-    это будет видно числом в логе, а не молчаливым «ничего не нашлось».
+    это будет видно числом в логе, а не молчаливым «ничего не нашлось». Поля
+    возвращаем по той же причине — чтобы про пропавшее поле можно было
+    сказать, что пришло вместо него.
     """
     raw = payload.get("items")
     if not isinstance(raw, dict):
@@ -181,10 +215,17 @@ def parse_items(payload: dict) -> tuple[dict[str, SihItem], int]:
 
     items: dict[str, SihItem] = {}
     skipped = 0
+    # Какие поля реально приходят. Нужны не для отладки, а чтобы, если цены
+    # Steam не нашлось, сказать ЧТО пришло вместо неё — иначе на выяснение
+    # имени одного поля уходит по деплою за догадку.
+    seen_fields: set[str] = set()
+
     for name, record in raw.items():
         if not isinstance(record, dict):
             skipped += 1
             continue
+        if len(seen_fields) < 60:
+            seen_fields.update(record.keys())
         price = _to_float(record.get("price"))
         if price is None:
             skipped += 1
@@ -193,12 +234,12 @@ def parse_items(payload: dict) -> tuple[dict[str, SihItem], int]:
         items[name] = SihItem(
             market_hash_name=name,
             price=price,
-            steam=_to_float(record.get("steam")),
+            steam=_steam_price(record),
             count=_to_int(record.get("count")),
             market=str(market) if market else None,
             sell=_to_float(record.get("sell")),
         )
-    return items, skipped
+    return items, skipped, seen_fields
 
 
 async def _error_detail(resp) -> str:
@@ -297,6 +338,10 @@ async def _get(
 # перебрать несколько написаний за один заход дешевле и безопаснее, чем гонять
 # круги. Первый сработавший запоминается на процесс.
 _ITEMS_PARAM_VARIANTS = (
+    # extended просим всегда: в документации он описан как «вернуть
+    # расширенные поля предмета», а цена Steam в обычном ответе не пришла ни
+    # у одного из 17491 предмета. Без неё сравнивать не с чем.
+    ("appId + extended", lambda app_id: {"appId": app_id, "extended": "true"}),
     ("appId числом", lambda app_id: {"appId": app_id}),
     ("appId строкой", lambda app_id: {"appId": str(app_id)}),
     ("app_id строкой", lambda app_id: {"app_id": str(app_id)}),
@@ -417,7 +462,16 @@ async def fetch_items(
 
         try:
             payload = await _fetch_items_payload(session, app_id)
-            items, skipped = parse_items(payload)
+            items, skipped, fields = parse_items(payload)
+            if items and not any(i.steam for i in items.values()):
+                # Каталог пришёл, а сравнивать не с чем. Это не «пусто» и не
+                # «сломалось» — это одно конкретное поле под неизвестным
+                # именем, и назвать пришедшие ключи дешевле, чем гадать.
+                raise SihError(
+                    f"отдал {len(items)} предметов, но ни у одного нет цены Steam.\n"
+                    f"Поля в ответе: {', '.join(sorted(fields)) or 'нет'}\n"
+                    f"Искал под именами: {', '.join(_STEAM_FIELDS)}"
+                )
         except Exception as e:
             if cached:
                 age = (time.time() - cached[1]) / 60
@@ -434,11 +488,12 @@ async def fetch_items(
         _cache[app_id] = (items, time.time())
         log.info(
             "sih: каталог получен — %d предметов, из них с ценой Steam %d, "
-            "не разобрано %d, площадок %d",
+            "не разобрано %d, площадок %d. Поля: %s",
             len(items),
             sum(1 for i in items.values() if i.steam),
             skipped,
             len({i.market for i in items.values() if i.market}),
+            ", ".join(sorted(fields)),
         )
         return items
 
