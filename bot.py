@@ -342,6 +342,15 @@ _arb_running: set[int] = set()
 # если сканирование всех предметов не укладывается в заданный интервал.
 _watchlist_running: set[int] = set()
 
+# То же для /markets и /dips. Раньше замков тут не было и они были не нужны:
+# при max_concurrent_updates=1 два прогона физически не могли пойти
+# одновременно — второй ждал в очереди апдейтов. С concurrent_updates(True)
+# очередь пропала, и без замка «набрал команду, пока идёт автопрогон» дало бы
+# два одновременных прохода по каталогу и двойной расход живых запросов к
+# Steam на одно и то же.
+_markets_running: set[int] = set()
+_dips_running: set[int] = set()
+
 
 async def _get_watch_interval(chat_id: int) -> float:
     saved = await get_watch_gap(chat_id)
@@ -1120,6 +1129,41 @@ async def _resolve_for_watchlist(raw: str) -> tuple[list[str], str | None]:
     return [r["hash_name"] for r in results], None
 
 
+# Сколько имён показывать в списке ответа целиком. Добавляют часто десятками,
+# а иногда одна ссылка разворачивается во все степени износа сразу — полный
+# список тогда занимает несколько экранов и прокручивает наверх итог, ради
+# которого его и читают.
+_ADD_LIST_LIMIT = 15
+
+
+def _add_names_block(title: str, names: list[str]) -> str | None:
+    if not names:
+        return None
+    block = f"{title}:\n" + "\n".join(f"• {n}" for n in names[:_ADD_LIST_LIMIT])
+    if len(names) > _ADD_LIST_LIMIT:
+        block += f"\n…и ещё {len(names) - _ADD_LIST_LIMIT}"
+    return block
+
+
+def _add_tally(added: list, duplicates: list, unresolved: list) -> str:
+    """
+    Итог первой строкой: сколько добавилось, сколько уже было, что не понял.
+
+    Раньше «уже в списке» лежало в общей куче «Пропущено» вместе с
+    нераспознанными названиями, а числа не выводились вовсе. При добавлении
+    полусотни предметов разом ответ был простынёй имён, из которой нельзя было
+    понять главное — сколько реально прибавилось. Три эти причины принципиально
+    разные: добавилось — хорошо, уже было — ничего страшного, не распознал —
+    надо чинить название.
+    """
+    parts = [f"добавлено {len(added)}"]
+    if duplicates:
+        parts.append(f"уже было {len(duplicates)}")
+    if unresolved:
+        parts.append(f"не распознал {len(unresolved)}")
+    return " · ".join(parts)
+
+
 async def watchadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /watchadd <предмет1>, <предмет2>, ... — добавить один или сразу несколько
@@ -1148,19 +1192,19 @@ async def watchadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     current = await get_watchlist(chat_id)
 
-    added, warnings, skipped = [], [], []
+    added, warnings, duplicates, unresolved = [], [], [], []
     for part in parts:
         if global_wear and "(" not in part:
             part = f"{part} ({global_wear})"
         names, warning = await _resolve_for_watchlist(part)
         if not names:
-            skipped.append(warning)
+            unresolved.append(warning)
             continue
         if warning:
             warnings.append(warning)
         for name in names:
             if name in current:
-                skipped.append(f"«{name}»: уже в списке")
+                duplicates.append(name)
                 continue
             current.append(name)
             added.append(name)
@@ -1169,15 +1213,19 @@ async def watchadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.application.job_queue and not context.application.job_queue.get_jobs_by_name(f"{WATCHLIST_JOB_PREFIX}{chat_id}"):
         _schedule_watchlist_job(context.application.job_queue, chat_id, await _get_watch_interval(chat_id))
 
-    lines = []
+    lines = [_add_tally(added, duplicates, unresolved)]
     if global_wear:
         lines.append(f"Степень износа «{global_wear}» применена ко всем предметам списка без своей степени.")
-    if added:
-        lines.append("Добавлено:\n" + "\n".join(f"• {a}" for a in added))
+    for block in (
+        _add_names_block("Добавлено", added),
+        _add_names_block("Уже были в списке", duplicates),
+    ):
+        if block:
+            lines.append(block)
     if warnings:
         lines.append("Уточни, если не то:\n" + "\n".join(f"• {w}" for w in warnings))
-    if skipped:
-        lines.append("Пропущено:\n" + "\n".join(f"• {s}" for s in skipped))
+    if unresolved:
+        lines.append("Не распознал:\n" + "\n".join(f"• {s}" for s in unresolved))
     interval = await _get_watch_interval(chat_id)
     lines.append(f"Всего в списке: {len(current)}. Следующий прогон — через {interval:g} мин после конца текущего/предыдущего.")
     await update.message.reply_text("\n\n".join(lines))
@@ -1403,19 +1451,19 @@ async def floatadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     current = await get_float_watchlist(chat_id)
 
-    added, warnings, skipped = [], [], []
+    added, warnings, duplicates, unresolved = [], [], [], []
     for part in parts:
         if global_wear and "(" not in part:
             part = f"{part} ({global_wear})"
         names, warning = await _resolve_for_watchlist(part)
         if not names:
-            skipped.append(warning)
+            unresolved.append(warning)
             continue
         if warning:
             warnings.append(warning)
         for name in names:
             if name in current:
-                skipped.append(f"«{name}»: уже в списке флоата")
+                duplicates.append(name)
                 continue
             current.append(name)
             added.append(name)
@@ -1424,15 +1472,19 @@ async def floatadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.application.job_queue and not context.application.job_queue.get_jobs_by_name(f"{WATCHLIST_JOB_PREFIX}{chat_id}"):
         _schedule_watchlist_job(context.application.job_queue, chat_id, await _get_watch_interval(chat_id))
 
-    lines = []
+    lines = [_add_tally(added, duplicates, unresolved)]
     if global_wear:
         lines.append(f"Степень износа «{global_wear}» применена ко всем предметам списка без своей степени.")
-    if added:
-        lines.append("Добавлено в охоту за флоатом:\n" + "\n".join(f"• {a}" for a in added))
+    for block in (
+        _add_names_block("Добавлено в охоту за флоатом", added),
+        _add_names_block("Уже были в списке флоата", duplicates),
+    ):
+        if block:
+            lines.append(block)
     if warnings:
         lines.append("Уточни, если не то:\n" + "\n".join(f"• {w}" for w in warnings))
-    if skipped:
-        lines.append("Пропущено:\n" + "\n".join(f"• {s}" for s in skipped))
+    if unresolved:
+        lines.append("Не распознал:\n" + "\n".join(f"• {s}" for s in unresolved))
 
     low, high = await get_float_filter(chat_id)
     if low is None or high is None:
@@ -3950,6 +4002,22 @@ async def _run_dips_scan(send, chat_id: int, saved: dict, *, quiet: bool = False
     """
     Найти просадки и показать. Общая часть команды и автопрогона.
 
+    Обёртка вокруг _dips_scan_body с замком «уже идёт» — см. _run_markets_scan.
+    """
+    if chat_id in _dips_running:
+        log.info("dips: прогон для chat_id=%s уже идёт, пропускаю", chat_id)
+        if not quiet:
+            await send("Прогон /dips уже идёт, дождись его окончания.")
+        return
+    _dips_running.add(chat_id)
+    try:
+        await _dips_scan_body(send, chat_id, saved, quiet=quiet)
+    finally:
+        _dips_running.discard(chat_id)
+
+
+async def _dips_scan_body(send, chat_id: int, saved: dict, *, quiet: bool = False) -> None:
+    """
     Порядок тот же, что в /markets, и по той же причине: сначала бесплатный
     отбор по всему каталогу, потом живая проверка верхушки. Окна отвечают на
     вопрос «куда смотреть», живой запрос — «правда ли это сейчас».
@@ -4542,6 +4610,23 @@ async def _run_markets_scan(send, chat_id: int, saved: dict, *, quiet: bool = Fa
     """
     Собрать и показать находки. Общая часть команды и автопрогона.
 
+    Обёртка вокруг _markets_scan_body с замком «уже идёт»: тело длинное и с
+    несколькими выходами, а замок обязан сниматься при любом из них.
+    """
+    if chat_id in _markets_running:
+        log.info("markets: прогон для chat_id=%s уже идёт, пропускаю", chat_id)
+        if not quiet:
+            await send("Прогон /markets уже идёт, дождись его окончания.")
+        return
+    _markets_running.add(chat_id)
+    try:
+        await _markets_scan_body(send, chat_id, saved, quiet=quiet)
+    finally:
+        _markets_running.discard(chat_id)
+
+
+async def _markets_scan_body(send, chat_id: int, saved: dict, *, quiet: bool = False) -> None:
+    """
     send — куда писать: reply_text для команды, обёртка над send_message для
     джобы. quiet — не сообщать о пустом результате и отсеивать уже присланное;
     у автопрогона иначе получился бы поток «ничего не нашлось» раз в час и
@@ -6779,7 +6864,28 @@ def _build_application(token: str):
     прошёл initialize()/shutdown(), а run_polling() зовёт initialize() сам, и
     дважды инициализировать один и тот же Application нельзя.
     """
-    app = Application.builder().token(token).post_init(_on_startup).build()
+    # concurrent_updates: без него python-telegram-bot берёт в работу ровно
+    # ОДИН апдейт за раз (max_concurrent_updates=1 — значение по умолчанию), и
+    # пока /scanall идёт свои несколько минут, бот не отвечает вообще ни на
+    # что: ни /help, ни кнопки меню, которым Steam даже не нужен. Команды при
+    # этом не терялись, а копились и вываливались все разом после скана —
+    # снаружи это выглядело как зависание.
+    #
+    # Общую очередь к Steam это не отменяет и не должно: цены ходят одной
+    # полосой на процесс (pricing.PRICE_REQUEST_INTERVAL), иначе прилетает 429.
+    # Команда, которой нужна живая цена, по-прежнему ждёт своей очереди — но
+    # теперь ждёт только она, а не весь бот.
+    #
+    # Плата за это — прогоны могут пойти параллельно, поэтому у каждого стоит
+    # замок «уже идёт» (_watchlist_running, _arb_running, _dips_running,
+    # _markets_running).
+    app = (
+        Application.builder()
+        .token(token)
+        .concurrent_updates(True)
+        .post_init(_on_startup)
+        .build()
+    )
     # Из одного реестра — и обработчики, и меню Telegram, и /help. Раньше это
     # были три списка, и справочник от них отставал на треть команд.
     for cmd in COMMANDS:
