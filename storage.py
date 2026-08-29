@@ -321,16 +321,58 @@ async def get_float_filter(chat_id: int) -> tuple[Optional[float], Optional[floa
     (низкий_порог, высокий_порог) для охоты за редким флоатом — лот интересен,
     если флоат <= низкий_порог (топ для FN) ИЛИ >= высокий_порог (топ для BS).
     Оба None, если фильтр не задан (/setfloatfilter ещё не вызывали или выключен).
+
+    Это ВНУТРЕННИЕ границы диапазонов. Внешние (нижняя у FN, верхняя у BS)
+    лежат отдельно — см. get_float_ranges; здесь они не нужны, потому что
+    большинству мест хватает ответа «фильтр вообще задан или нет».
     """
     settings = await _get_chat_settings(chat_id)
     return settings.get("float_low_max"), settings.get("float_high_min")
 
 
-async def set_float_filter(chat_id: int, low_max: Optional[float], high_min: Optional[float]) -> None:
+async def get_float_ranges(
+    chat_id: int,
+) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """
+    Полные диапазоны охоты: (fn_от, fn_до, bs_от, bs_до).
+
+    fn_до и bs_от — те же значения, что отдаёт get_float_filter; fn_от и bs_до
+    появились позже и потому хранятся отдельными ключами, а не переписыванием
+    формата. У кого их нет, тот получает None — это читается как «граница
+    открыта», то есть ровно прежнее поведение: FN от нуля, BS до единицы.
+    Молчаливой миграции старых настроек не требуется.
+    """
+    s = await _get_chat_settings(chat_id)
+    return (
+        s.get("float_low_min"), s.get("float_low_max"),
+        s.get("float_high_min"), s.get("float_high_max"),
+    )
+
+
+async def set_float_ranges(
+    chat_id: int,
+    fn_from: Optional[float], fn_to: Optional[float],
+    bs_from: Optional[float], bs_to: Optional[float],
+) -> None:
     settings = await _get_chat_settings(chat_id)
-    settings["float_low_max"] = low_max
-    settings["float_high_min"] = high_min
+    settings["float_low_min"] = fn_from
+    settings["float_low_max"] = fn_to
+    settings["float_high_min"] = bs_from
+    settings["float_high_max"] = bs_to
     await _save_chat_settings(chat_id, settings)
+
+
+async def set_float_filter(chat_id: int, low_max: Optional[float], high_min: Optional[float]) -> None:
+    """
+    Задать только внутренние границы, внешние — открыть.
+
+    Две цифры означают «FN от нуля до low_max, BS от high_min до единицы»,
+    поэтому ранее заданные внешние границы здесь именно сбрасываются, а не
+    сохраняются: иначе после /setfloatfilter 0.01 0.99 продолжал бы молча
+    действовать чей-то старый нижний порог FN, и отбор шёл бы не по тому, что
+    человек только что написал.
+    """
+    await set_float_ranges(chat_id, None, low_max, high_min, None)
 
 
 async def get_float_markup(chat_id: int) -> Optional[float]:

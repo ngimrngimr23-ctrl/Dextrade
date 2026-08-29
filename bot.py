@@ -114,6 +114,8 @@ from storage import (
     set_price_filter,
     get_float_filter,
     set_float_filter,
+    get_float_ranges,
+    set_float_ranges,
     get_float_markup,
     set_float_markup,
     get_watchlist,
@@ -410,6 +412,10 @@ class ScanSettings(NamedTuple):
     float_low: float | None
     float_high: float | None
     float_markup: float | None
+    # Внешние границы диапазонов: нижняя у FN, верхняя у BS. None — граница
+    # открыта, то есть прежнее поведение (от нуля / до единицы).
+    float_low_min: float | None = None
+    float_high_max: float | None = None
 
     @classmethod
     def from_raw(cls, raw: dict) -> "ScanSettings":
@@ -423,6 +429,8 @@ class ScanSettings(NamedTuple):
             float_low=raw.get("float_low_max"),
             float_high=raw.get("float_high_min"),
             float_markup=raw.get("float_markup_pct"),
+            float_low_min=raw.get("float_low_min"),
+            float_high_max=raw.get("float_high_max"),
         )
 
 
@@ -701,7 +709,10 @@ async def _compute_offers(
         top_floats = _decode_floats(listings, limit=FLOAT_CHECK_TOP_N)
         if top_floats:
             float_offers = find_float_offers(
-                listings, top_floats, float_low, float_high, max_markup_pct=float_markup
+                listings, top_floats, float_low, float_high,
+                max_markup_pct=float_markup,
+                float_low_min=settings.float_low_min if settings.float_low_min is not None else 0.0,
+                float_high_max=settings.float_high_max if settings.float_high_max is not None else 1.0,
             )
 
     offers = []
@@ -944,63 +955,131 @@ async def setpricefilter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+_FLOAT_FILTER_USAGE = (
+    "Формат:\n"
+    "/setfloatfilter <FN до> <BS от> — две границы, диапазоны открыты по краям\n"
+    "/setfloatfilter <FN от> <FN до> <BS от> <BS до> — все четыре\n"
+    "Примеры:\n"
+    "/setfloatfilter 0.01 0.99 — всё, что ниже 0.01 или выше 0.99\n"
+    "/setfloatfilter 0.003 0.02 0.9 0.98 — то же, но без совсем крайних: "
+    "флоаты вроде 0.0001 и 0.999 давно известны, у них своя цена, и находкой "
+    "они не будут\n"
+    "/setfloatfilter off — убрать фильтр"
+)
+
+
+def _float_condition(fn_from, fn_to, bs_from, bs_to) -> str:
+    """
+    Условие отбора одной строкой, в том виде, в котором оно реально работает.
+
+    Открытую границу пишем неравенством (≤0.02), закрытую — диапазоном
+    (0.003–0.02). Разница видна сразу, а это ровно то, что человек хочет
+    проверить, когда смотрит на настройку.
+    """
+    if fn_to is None or bs_from is None:
+        return "не задано"
+    fn = f"{fn_from:g}–{fn_to:g}" if fn_from is not None else f"≤{fn_to:g}"
+    bs = f"{bs_from:g}–{bs_to:g}" if bs_to is not None else f"≥{bs_from:g}"
+    return f"FN {fn} или BS {bs}"
+
+
 async def setfloatfilter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /setfloatfilter                    — показать текущий фильтр флоата
-    /setfloatfilter <низкий> <высокий> — искать лоты с флоатом ≤низкий (топ для FN) или ≥высокий (топ для BS)
-    /setfloatfilter off                — убрать фильтр
-    Не связано со стикерами — отдельная находка, попадает в ту же подборку с пометкой 🔍.
+    /setfloatfilter                            — показать текущий фильтр флоата
+    /setfloatfilter <FN до> <BS от>            — диапазоны открыты по краям
+    /setfloatfilter <FN от> <FN до> <BS от> <BS до> — все четыре границы
+    /setfloatfilter off                        — убрать фильтр
+
+    Два диапазона, а не два порога: у Factory New своя зона редкости у нуля, у
+    Battle-Scarred своя у единицы, и обе имеет смысл ограничивать с двух
+    сторон. Не связано со стикерами — отдельная находка, попадает в ту же
+    подборку с пометкой 🔍.
+
+    Возвращает True, если границы приняты и сохранены. Нужно вызывающему коду
+    (/float 0.01 0.99 15): наценку ставить можно только следом за принятыми
+    границами, а повторять здешние проверки на стороне вызова значит завести
+    второй список условий, который рано или поздно разъедется с этим.
     """
     chat_id = update.effective_chat.id
     args = context.args
 
     if not args:
-        low, high = await get_float_filter(chat_id)
-        if low is None or high is None:
+        fn_from, fn_to, bs_from, bs_to = await get_float_ranges(chat_id)
+        if fn_to is None or bs_from is None:
             await update.message.reply_text(
-                "Фильтр флоата не задан — флоат не проверяется вообще (лишних запросов не тратим).\n\n"
-                "Формат: /setfloatfilter <низкий> <высокий>\nПример: /setfloatfilter 0.01 0.99 "
-                "(поймает почти идеальный Factory New и предельно убитый Battle-Scarred)\n"
-                f"Проверяются все лоты на предмет (до {FLOAT_CHECK_TOP_N}, сколько Steam вообще отдаёт "
-                "за раз) — декодирование локальное, без сетевых запросов.\n"
-                "/setfloatfilter off — убрать фильтр"
+                "Фильтр флоата не задан — флоат не проверяется вообще (лишних "
+                "запросов не тратим).\n\n" + _FLOAT_FILTER_USAGE + "\n\n"
+                f"Проверяются все лоты на предмет (до {FLOAT_CHECK_TOP_N}, сколько Steam "
+                "вообще отдаёт за раз) — декодирование локальное, без сетевых запросов."
             )
         else:
             await update.message.reply_text(
-                f"Текущий фильтр флоата: ≤{low:g} (топ для FN) или ≥{high:g} (топ для BS), "
-                f"проверяются все лоты на предмет."
+                f"Текущий фильтр флоата: {_float_condition(fn_from, fn_to, bs_from, bs_to)}. "
+                f"Проверяются все лоты на предмет."
             )
-        return
+        return False
 
     if args[0].lower() == "off":
         await set_float_filter(chat_id, None, None)
         await update.message.reply_text("Фильтр флоата убран.")
-        return
+        return True
 
-    if len(args) < 2:
+    if len(args) not in (2, 4):
         await update.message.reply_text(
-            "Нужны оба значения. Формат: /setfloatfilter <низкий> <высокий>, или /setfloatfilter off"
+            "Нужно две границы или четыре.\n\n" + _FLOAT_FILTER_USAGE
         )
-        return
+        return False
 
     try:
-        low = float(args[0])
-        high = float(args[1])
+        values = [float(a.replace(",", ".")) for a in args]
     except ValueError:
-        await update.message.reply_text("Оба значения должны быть числами от 0 до 1. Пример: /setfloatfilter 0.01 0.99")
-        return
+        await update.message.reply_text(
+            "Все значения должны быть числами от 0 до 1.\n\n" + _FLOAT_FILTER_USAGE
+        )
+        return False
 
-    if not (0.0 <= low <= 1.0 and 0.0 <= high <= 1.0):
+    if any(not (0.0 <= v <= 1.0) for v in values):
         await update.message.reply_text("Флоат — число от 0 до 1.")
-        return
-    if low >= high:
-        await update.message.reply_text("Низкий порог должен быть меньше высокого.")
-        return
+        return False
 
-    await set_float_filter(chat_id, low, high)
+    if len(values) == 2:
+        fn_from, (fn_to, bs_from), bs_to = None, values, None
+    else:
+        fn_from, fn_to, bs_from, bs_to = values
+
+    if fn_from is not None and fn_from >= fn_to:
+        await update.message.reply_text(
+            f"Нижняя граница FN ({fn_from:g}) должна быть меньше верхней ({fn_to:g})."
+        )
+        return False
+    if bs_to is not None and bs_from >= bs_to:
+        await update.message.reply_text(
+            f"Нижняя граница BS ({bs_from:g}) должна быть меньше верхней ({bs_to:g})."
+        )
+        return False
+    if fn_to >= bs_from:
+        # Иначе диапазоны сливаются в один сплошной, и «редким» становится
+        # вообще любой флоат — фильтр перестаёт что-либо отсекать.
+        #
+        # Формулировка зависит от формы ввода: на двух числах человек думает
+        # не диапазонами, а «низкий и высокий», и говорить ему про пересечение
+        # диапазонов, которых он не задавал, значит объяснять не то.
+        await update.message.reply_text(
+            f"Первое число ({fn_to:g}, порог FN) должно быть меньше второго "
+            f"({bs_from:g}, порог BS)."
+            if len(values) == 2 else
+            f"Диапазоны пересекаются: FN заканчивается на {fn_to:g}, а BS уже "
+            f"начинается с {bs_from:g}. Верхняя граница FN должна быть меньше "
+            f"нижней границы BS."
+        )
+        return False
+
+    await set_float_ranges(chat_id, fn_from, fn_to, bs_from, bs_to)
     await update.message.reply_text(
-        f"Ок, теперь ищу лоты с флоатом ≤{low:g} или ≥{high:g} среди всех лотов на предмет."
+        f"Ок, теперь ищу лоты: {_float_condition(fn_from, fn_to, bs_from, bs_to)} "
+        f"— среди всех лотов на предмет."
     )
+    return True
 
 
 async def setfloatmarkup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1538,7 +1617,7 @@ async def floatclear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Список флоата очищен — удалено {len(current)} предмет(ов).")
 
 
-def _float_settings_block(low, high, markup) -> str:
+def _float_settings_block(fn_from, fn_to, bs_from, bs_to, markup) -> str:
     """
     Памятка по настройке флоата — то, что показывает голый /float.
 
@@ -1552,19 +1631,30 @@ def _float_settings_block(low, high, markup) -> str:
     Текущие значения подставляем в примеры: команда с уже своими числами и
     понятнее описания, и безопаснее — видно, что именно изменится.
     """
-    lo = f"{low:g}" if low is not None else "0.01"
-    hi = f"{high:g}" if high is not None else "0.99"
     mk = f"{markup:g}" if markup is not None else "15"
-
-    not_set = " (сейчас не задан — охота не идёт)" if low is None or high is None else ""
     markup_note = "" if markup is not None else " (сейчас без ограничения — подходит любая цена)"
+
+    if fn_to is None or bs_from is None:
+        # Ничего не задано — показываем пример, а не пустые места.
+        short = "0.01 0.99"
+        full = "0.003 0.02 0.9 0.98"
+        not_set = " (сейчас не задан — охота не идёт)"
+    else:
+        short = f"{fn_to:g} {bs_from:g}"
+        full = (
+            f"{fn_from:g} {fn_to:g} {bs_from:g} {bs_to:g}"
+            if fn_from is not None and bs_to is not None
+            else "0.003 0.02 0.9 0.98"
+        )
+        not_set = ""
 
     return (
         "<b>Настройка</b>\n"
-        f"/setfloatfilter {lo} {hi} — какой флоат считать редким{not_set}\n"
+        f"/setfloatfilter {short} — FN до и BS от, края открыты{not_set}\n"
+        f"/setfloatfilter {full} — все четыре границы: FN от, FN до, BS от, BS до\n"
         f"/setfloatmarkup {mk} — насколько дороже самого дешёвого лота находка "
         f"ещё интересна{markup_note}\n"
-        f"/float {lo} {hi} {mk} — то же самое одной строкой\n"
+        f"/float {short} {mk} — границы и наценка одной строкой\n"
         "/setfloatfilter off — выключить охоту совсем\n\n"
         "<b>Список</b>\n"
         "/float &lt;предмет&gt; — добавить · /float -2 — убрать второй · /float очистить\n\n"
@@ -1577,9 +1667,9 @@ async def floatlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/floatlist — список охоты за флоатом, условие отбора и как его менять."""
     chat_id = update.effective_chat.id
     items = await get_float_watchlist(chat_id)
-    low, high = await get_float_filter(chat_id)
+    fn_from, fn_to, bs_from, bs_to = await get_float_ranges(chat_id)
     markup = await get_float_markup(chat_id)
-    settings = _float_settings_block(low, high, markup)
+    settings = _float_settings_block(fn_from, fn_to, bs_from, bs_to, markup)
 
     if not items:
         await update.message.reply_text(
@@ -1589,10 +1679,10 @@ async def floatlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if low is None or high is None:
+    if fn_to is None or bs_from is None:
         threshold = "⚠️ порог не задан — охота не идёт"
     else:
-        threshold = f"флоат ≤{low:g} или ≥{high:g}"
+        threshold = _float_condition(fn_from, fn_to, bs_from, bs_to)
         if markup is not None:
             threshold += f", наценка ≤{markup:g}%"
 
@@ -1614,9 +1704,18 @@ _FLOAT_ACTIONS = {
 }
 
 
-def _parse_float_settings(args: list[str]) -> tuple[float, float, float | None] | None:
+def _parse_float_settings(args: list[str]) -> tuple[list[float], float | None] | None:
     """
-    Разобрать «/float 0.01 0.99 15» — пороги флоата и, необязательно, наценку.
+    Разобрать числовую форму /float. Возвращает (границы, наценка).
+
+        /float 0.01 0.99                    — две границы
+        /float 0.01 0.99 15                 — две границы и наценка
+        /float 0.003 0.02 0.9 0.98          — четыре границы
+        /float 0.003 0.02 0.9 0.98 15       — четыре границы и наценка
+
+    Границ бывает две или четыре, наценка — необязательный хвост, поэтому
+    длины 2 и 4 читаются как «только границы», а 3 и 5 — как «границы плюс
+    наценка». Двусмысленности нет: наценка всегда последняя и всегда одна.
 
     Возвращает None, если это не набор чисел: тогда аргументы уходят дальше как
     название предмета. Ошибочно принять предмет за настройку нельзя — названия
@@ -1625,15 +1724,15 @@ def _parse_float_settings(args: list[str]) -> tuple[float, float, float | None] 
     Одно число не принимаем намеренно: «/float 0.01» одинаково похоже и на
     начало ввода порогов, и на опечатку, а угадывать тут нечего.
     """
-    if len(args) not in (2, 3):
+    if len(args) not in (2, 3, 4, 5):
         return None
     try:
         values = [float(a.replace("%", "").replace(",", ".")) for a in args]
     except ValueError:
         return None
-    low, high = values[0], values[1]
-    markup = values[2] if len(values) == 3 else None
-    return low, high, markup
+    if len(values) in (2, 4):
+        return values, None
+    return values[:-1], values[-1]
 
 
 async def float_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1642,7 +1741,8 @@ async def float_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /float <предмет1>, <...>      — добавить предметы
     /float -2                     — убрать второй (можно «/float убрать 2»)
     /float очистить               — очистить список
-    /float 0.01 0.99 15           — пороги флоата и наценка одной строкой
+    /float 0.01 0.99 15           — границы флоата и наценка одной строкой
+    /float 0.003 0.02 0.9 0.98 15 — то же с четырьмя границами
                                     (то же, что /setfloatfilter + /setfloatmarkup)
     /float чек <предмет> [флоат]  — платят ли за низкий флоат на этом скине
 
@@ -1677,13 +1777,12 @@ async def float_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # назовёшь, так что перепутать нечего.
     settings = _parse_float_settings(args)
     if settings is not None:
-        low, high, markup = settings
-        await setfloatfilter(update, _SubCtx(context, [str(low), str(high)]))
-        # Наценку ставим только если пороги приняты. Иначе на «/float 0.9 0.1 15»
+        bounds, markup = settings
+        # Наценку ставим, только если границы приняты. Иначе на «/float 0.9 0.1 15»
         # пришли бы подряд ругань на перевёрнутые пороги и бодрое «наценка
         # сохранена» — человеку решать, что из этого правда.
-        ok = 0.0 <= low <= 1.0 and 0.0 <= high <= 1.0 and low < high
-        if markup is not None and ok:
+        accepted = await setfloatfilter(update, _SubCtx(context, [str(v) for v in bounds]))
+        if markup is not None and accepted:
             await setfloatmarkup(update, _SubCtx(context, [str(markup)]))
         return
 
@@ -5362,7 +5461,7 @@ async def _status_lines(chat_id: int, jq) -> list[str]:
     def_min, def_max = await _get_defaults(chat_id)
     streak = await get_streak_markup(chat_id)
     p_lo, p_hi = await get_price_filter(chat_id)
-    f_lo, f_hi = await get_float_filter(chat_id)
+    fn_from, f_lo, f_hi, bs_to = await get_float_ranges(chat_id)
     f_markup = await get_float_markup(chat_id)
 
     lines = ["📊 <b>Состояние</b>", ""]
@@ -5444,7 +5543,7 @@ async def _status_lines(chat_id: int, jq) -> list[str]:
         lines.append("  Флоат: ⚠️ порог не задан — охота за флоатом не идёт (/setfloatfilter 0.01 0.99)")
     else:
         extra = f", наценка ≤{f_markup:g}%" if f_markup is not None else ""
-        lines.append(f"  Флоат: ≤{f_lo:g} или ≥{f_hi:g}{extra}")
+        lines.append(f"  Флоат: {_float_condition(fn_from, f_lo, f_hi, bs_to)}{extra}")
 
     # --- Просадки ----------------------------------------------------------
     # Историю копит один общий процесс, а не чат, и растёт она неделями. Без
@@ -5541,7 +5640,7 @@ async def _settings_snapshot(chat_id: int) -> dict[str, str]:
     streak = await get_streak_markup(chat_id)
     ratio = await get_sticker_ratio(chat_id)
     p_lo, p_hi = await get_price_filter(chat_id)
-    f_lo, f_hi = await get_float_filter(chat_id)
+    fn_from, f_lo, f_hi, bs_to = await get_float_ranges(chat_id)
     f_markup = await get_float_markup(chat_id)
     arb = await get_arb_settings(chat_id)
     mk = await get_market_settings(chat_id)
@@ -5565,7 +5664,7 @@ async def _settings_snapshot(chat_id: int) -> dict[str, str]:
         "fl_range": (
             "выключено"
             if f_lo is None or f_hi is None
-            else f"≤{f_lo:g} или ≥{f_hi:g}"
+            else _float_condition(fn_from, f_lo, f_hi, bs_to)
         ),
         "fl_markup": _fmt_pct(f_markup),
         "ar_disc": _fmt_pct(arb["min_discount"]),
@@ -5611,18 +5710,36 @@ def _parse_setting(setting: menu.Setting, raw: str):
     parts = text.split()
 
     if setting.kind in ("pair_money", "pair_float"):
-        if len(parts) != 2:
-            raise ValueError(f"Нужно два числа через пробел. Пример: {setting.example}")
+        # Флоат принимает и четыре числа: FN от, FN до, BS от, BS до. Держать
+        # для этого отдельный вид настройки незачем — форма та же, просто
+        # границ вдвое больше.
+        allowed = (2, 4) if setting.kind == "pair_float" else (2,)
+        if len(parts) not in allowed:
+            need = "два или четыре числа" if len(allowed) > 1 else "два числа"
+            raise ValueError(f"Нужно {need} через пробел. Пример: {setting.example}")
         try:
-            lo, hi = float(parts[0]), float(parts[1])
+            values = [float(x.replace(",", ".")) for x in parts]
         except ValueError:
-            raise ValueError(f"Оба значения должны быть числами. Пример: {setting.example}")
+            raise ValueError(f"Все значения должны быть числами. Пример: {setting.example}")
         if setting.kind == "pair_float":
-            if not (0.0 <= lo <= 1.0 and 0.0 <= hi <= 1.0):
+            if any(not (0.0 <= v <= 1.0) for v in values):
                 raise ValueError("Флоат — число от 0 до 1.")
-            if lo >= hi:
-                raise ValueError("Первое число (низкий флоат) должно быть меньше второго.")
-        elif lo > hi:
+            if len(values) == 2:
+                fn_from, (fn_to, bs_from), bs_to = None, values, None
+            else:
+                fn_from, fn_to, bs_from, bs_to = values
+                if fn_from >= fn_to:
+                    raise ValueError("У FN нижняя граница должна быть меньше верхней.")
+                if bs_from >= bs_to:
+                    raise ValueError("У BS нижняя граница должна быть меньше верхней.")
+            if fn_to >= bs_from:
+                raise ValueError(
+                    "Верхняя граница FN должна быть меньше нижней границы BS, "
+                    "иначе диапазоны сливаются в один и фильтр ничего не отсекает."
+                )
+            return (fn_from, fn_to, bs_from, bs_to)
+        lo, hi = values
+        if lo > hi:
             raise ValueError("Минимум не может быть больше максимума.")
         return (lo, hi)
 
@@ -5696,12 +5813,12 @@ async def _apply_setting(chat_id: int, key: str, value, context) -> str:
         )
 
     if key == "fl_range":
-        lo, hi = (None, None) if value is None else value
-        await set_float_filter(chat_id, lo, hi)
+        bounds = (None, None, None, None) if value is None else value
+        await set_float_ranges(chat_id, *bounds)
         return (
             "✅ Охота за флоатом выключена."
             if value is None
-            else f"✅ Ищу флоат ≤{lo:g} или ≥{hi:g}."
+            else f"✅ Ищу флоат: {_float_condition(*bounds)}."
         )
 
     if key == "fl_markup":
@@ -6447,10 +6564,12 @@ COMMANDS: tuple[Command, ...] = (
         "по его настройке\n"
         "/float <предмет1>, <предмет2> — добавить\n"
         "/float -2 — убрать второй, /float очистить — очистить\n"
-        "/setfloatfilter 0.01 0.99 — какой флоат считать редким "
+        "/setfloatfilter 0.01 0.99 — FN до и BS от, края открыты "
         "(/setfloatfilter off — выключить охоту)\n"
+        "/setfloatfilter 0.003 0.02 0.9 0.98 — все четыре границы: FN от, FN до, "
+        "BS от, BS до\n"
         "/setfloatmarkup 15 — насколько дороже дешёвого лота находка ещё интересна\n"
-        "/float 0.01 0.99 15 — оба порога одной строкой\n"
+        "/float 0.01 0.99 15 — границы и наценка одной строкой\n"
         "/float чек <предмет> [флоат] — платят ли за низкий флоат именно на "
         "этом скине\n"
         "Список отдельный от /watch: флоат имеет смысл искать на конкретных "

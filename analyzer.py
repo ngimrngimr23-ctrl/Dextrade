@@ -159,15 +159,24 @@ def find_float_offers(
     float_low_max: float,
     float_high_min: float,
     max_markup_pct: float | None = None,
+    float_low_min: float = 0.0,
+    float_high_max: float = 1.0,
 ) -> list[Offer]:
     """
     Отдельная, не связанная со стикерами подборка — лот интересен, если его
-    флоат близко к 0 (топ для Factory New) ИЛИ близко к 1 (топ для
-    Battle-Scarred): float_low_max — верхняя граница "низкого" флоата,
-    float_high_min — нижняя граница "высокого". listing_floats — уже
-    раскодированные флоаты по inspect_link (декодируются локально в
-    cs_inspect.py, сюда приходят готовыми — этот модуль сети не касается).
-    Лоты без стикеров сюда тоже попадают — критерий чисто по флоату.
+    флоат попадает в диапазон FN [float_low_min, float_low_max] ИЛИ в диапазон
+    BS [float_high_min, float_high_max].
+
+    Внешние границы (float_low_min, float_high_max) по умолчанию открыты — 0 и
+    1, то есть прежнее поведение «просто близко к нулю или к единице». Задавать
+    их имеет смысл, когда самые крайние значения уже не находка: флоат 0.0001
+    известен всем, у него своя цена и своя витрина, и тратить на него проверки
+    незачем. Диапазон отсекает такие лоты снизу, оставляя ту зону, где редкость
+    ещё есть, а наценки за неё ещё нет.
+
+    listing_floats — уже раскодированные флоаты по inspect_link (декодируются
+    локально в cs_inspect.py, сюда приходят готовыми — этот модуль сети не
+    касается). Лоты без стикеров сюда тоже попадают — критерий чисто по флоату.
 
     max_markup_pct: насколько цена лота может быть выше самого дешёвого лота
     этого предмета (floor_price), чтобы находка всё ещё считалась "недооценённой"
@@ -183,7 +192,9 @@ def find_float_offers(
         float_value = listing_floats.get(listing.inspect_link)
         if float_value is None:
             continue
-        if not (float_value <= float_low_max or float_value >= float_high_min):
+        in_fn = float_low_min <= float_value <= float_low_max
+        in_bs = float_high_min <= float_value <= float_high_max
+        if not (in_fn or in_bs):
             continue
 
         overpay = listing.price - floor_price
