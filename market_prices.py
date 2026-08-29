@@ -218,6 +218,7 @@ class MarketOffer:
     __slots__ = (
         "market", "market_hash_name", "market_price", "steam_price", "discount_pct",
         "steam_volume", "verified", "estimated_price", "listing_count",
+        "venue_hint",
     )
 
     def __init__(self, market: str, name: str, market_price: float, steam_price: float):
@@ -235,6 +236,12 @@ class MarketOffer:
         # единственном экземпляре и та же скидка на трёх десятках лотов — разные
         # вещи. csgotrader этого не отдавал вовсе, SIH отдаёт полем count.
         self.listing_count: int | None = None
+        # Где это, скорее всего, лежит: (площадка, её цена).
+        #
+        # Нужно, когда цена пришла от источника, который площадку не называет.
+        # «Дешевле на 48%» без ответа на вопрос «дешевле ГДЕ» — не находка, а
+        # ребус: пойти и купить по ней нельзя.
+        self.venue_hint: tuple[str, float] | None = None
 
     def apply_live_steam(self, lowest: float, volume: int | None) -> None:
         """Заменить оценку настоящей ценой из Steam и пересчитать выгоду."""

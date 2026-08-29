@@ -3751,6 +3751,40 @@ class MarketsUnavailable(Exception):
     """Цены площадок не собрались. Текст уходит пользователю как есть."""
 
 
+class PriceSources(NamedTuple):
+    """
+    Что собрали для сравнения. Именованной структурой, а не кортежем из шести
+    штук: у половины полей тип dict, и перепутать их местами при распаковке
+    было бы нечем поймать.
+    """
+
+    source: str                              # чем подписать результат
+    steam: dict[str, float]                  # цена Steam по предмету
+    by_market: dict[str, dict[str, float]]   # площадка -> {предмет: цена}
+    counts: dict[str, int]                   # сколько лотов, если известно
+    venues: dict[str, tuple[str, float]]     # предмет -> (где купить, почём)
+    note: str                                # что сказать пользователю про источник
+
+
+def _cheapest_named_venue(
+    by_market: dict[str, dict[str, float]],
+) -> dict[str, tuple[str, float]]:
+    """
+    Самая дешёвая ИМЕНОВАННАЯ площадка по каждому предмету.
+
+    Нужно, когда основной источник цену знает, а площадку не называет. «Дешевле
+    на 48%» без ответа на вопрос «дешевле где» — не находка, а ребус: пойти и
+    купить по ней нельзя.
+    """
+    best: dict[str, tuple[str, float]] = {}
+    for market, prices in by_market.items():
+        for name, price in prices.items():
+            current = best.get(name)
+            if current is None or price < current[1]:
+                best[name] = (market, price)
+    return best
+
+
 async def _collect_market_prices(session):
     """
     Цены площадок и Steam для сравнения: (источник, цены Steam, по площадкам, лотов).
@@ -3786,7 +3820,10 @@ async def _collect_market_prices(session):
                     "markets: источник SIH — %d предметов, с ценой Steam %d, площадок %d",
                     len(items), len(steam_prices), len(by_market),
                 )
-                return "SIH", steam_prices, by_market, counts, ""
+                return PriceSources(
+                    "SIH", steam_prices, by_market, counts,
+                    _cheapest_named_venue(by_market), "",
+                )
 
             # Цены Steam в get-items нет — но каталог площадок пришёл, и он
             # ценнее того, что было: 28 площадок против восьми, плюс число
@@ -3804,20 +3841,25 @@ async def _collect_market_prices(session):
                     "беру её из прайс-листа",
                     len(items), len(by_market),
                 )
+                # Подсказка «где купить». SIH площадку не называет, и без неё
+                # находка бесполезна: цену видно, а идти некуда. Берём
+                # ближайшего кандидата из именованных площадок csgotrader —
+                # они всё равно уже скачаны.
+                named = await market_prices.load_markets(session)
+                venues = _cheapest_named_venue(named)
                 with_stock = sum(1 for c in counts.values() if c)
                 # Поля показываем, только если знаем их: на попадании в кэш
                 # last_fields не обновляется, и пустые скобки в сообщении
                 # выглядели бы как «полей нет вовсе».
                 fields = ", ".join(sorted(sih_client.last_fields))
                 shape = f" (поля: {fields})" if fields else ""
-                return (
-                    "SIH + прайс-лист",
-                    fallback,
-                    by_market,
-                    counts,
-                    f"ℹ️ SIH отдал {len(items)} предметов, из них с лотами в "
+                return PriceSources(
+                    "SIH + прайс-лист", fallback, by_market, counts, venues,
+                    f"\u2139\ufe0f SIH отдал {len(items)} предметов, из них с лотами в "
                     f"наличии {with_stock}. Цену Steam он не отдаёт{shape}, "
-                    f"поэтому она берётся из прайс-листа.",
+                    f"поэтому она берётся из прайс-листа.\n"
+                    f"Площадку SIH тоже не называет — «где купить» ниже это "
+                    f"подсказка по данным csgotrader, проверяй на месте.",
                 )
             raise sih_client.SihError(
                 f"отдал {len(items)} предметов без цены Steam, а прайс-лист не скачался"
@@ -3844,7 +3886,10 @@ async def _collect_market_prices(session):
             "Ни один файл площадок не открылся. Похоже, состав файлов на "
             "prices.csgotrader.app изменился."
         )
-    return "csgotrader", steam_prices, by_market, {}, note
+    return PriceSources(
+        "csgotrader", steam_prices, by_market, {},
+        _cheapest_named_venue(by_market), note,
+    )
 
 
 async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3891,7 +3936,7 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
         try:
-            source, steam_prices, by_market, counts, note = await _collect_market_prices(session)
+            sources = await _collect_market_prices(session)
         except (sih_client.SihError, MarketsUnavailable) as e:
             await update.message.reply_text(f"⚠️ {e}")
             return
@@ -3904,15 +3949,15 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Попробуй ещё раз через минуту."
             )
             return
-        if note:
-            await update.message.reply_text(note)
+        if sources.note:
+            await update.message.reply_text(sources.note)
 
-        available = list(by_market)
+        available = list(sources.by_market)
         found: list = []
-        for market, prices in by_market.items():
+        for market, prices in sources.by_market.items():
             found.extend(
                 market_prices.compare(
-                    steam_prices, prices, market,
+                    sources.steam, prices, market,
                     min_discount_pct=threshold,
                     max_discount_pct=max_discount,
                     min_price=min_item_price,
@@ -3921,12 +3966,16 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             )
         for offer in found:
-            offer.listing_count = counts.get(offer.market_hash_name)
+            offer.listing_count = sources.counts.get(offer.market_hash_name)
+            # Подсказку вешаем только там, где источник площадку не назвал —
+            # иначе она дублировала бы уже известное имя.
+            if offer.market not in sources.by_market or len(sources.by_market) == 1:
+                offer.venue_hint = sources.venues.get(offer.market_hash_name)
 
     # Сколько лотов на площадке — это ликвидность на стороне ПОКУПКИ, и её
     # стоит показать до того, как человек пойдёт покупать: скидка на
     # единственном экземпляре живёт минуты.
-    if counts:
+    if sources.counts:
         no_stock = sum(1 for o in found if o.listing_count == 0)
         if no_stock:
             found = [o for o in found if o.listing_count != 0]
@@ -3986,24 +4035,45 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     found.sort(key=lambda o: o.discount_pct, reverse=True)
     lines = [
         f"🏪 Дешевле Steam — найдено {len(found)}\n"
-        f"<i>Источник: {source}, кэш обновляется раз в час. Это лучшее предложение "
-        f"по предмету, а не конкретный лот: проверяй на площадке перед покупкой. "
-        f"«Чистыми» — за вычетом комиссии Steam ~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%.</i>"
+        f"<i>Источник: {sources.source}, кэш обновляется раз в час. Это лучшее "
+        f"предложение по предмету, а не конкретный лот: проверяй на площадке перед "
+        f"покупкой. «Чистыми» — за вычетом комиссии Steam "
+        f"~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%.</i>"
     ]
     for o in found[:15]:
         net = o.net_after_fee(STEAM_FEE_MULTIPLIER)
         # Число лотов знает только SIH. Пишем строку, лишь когда оно есть, —
         # «лотов: ?» рядом с реальными числами читается как сбой, а не как
         # «этот источник такого не отдаёт».
-        stock = f" | лотов: {o.listing_count}" if o.listing_count else ""
+        stock = ""
+        if o.listing_count:
+            stock = f" | лотов: {o.listing_count}"
+            # Единственный экземпляр с большой скидкой — классический выброс:
+            # либо ошибка в цене, либо протухшая запись. Сорок девять штук по
+            # той же цене случайностью быть не могут, один — запросто.
+            if o.listing_count == 1:
+                stock += " ⚠️"
+        where = ""
+        if o.venue_hint:
+            venue, venue_price = o.venue_hint
+            where = (
+                f"\n  где искать: {html_module.escape(venue)} ${venue_price:.2f} "
+                f"<i>(подсказка, не проверено)</i>"
+            )
         lines.append(
             f"<code>{html_module.escape(o.market_hash_name)}</code>\n"
             f"  {html_module.escape(o.market)} ${o.market_price:.2f} | "
             f"Steam ${o.steam_price:.2f} | дешевле на {o.discount_pct:.1f}%\n"
             f"  чистыми при перепродаже: {'+' if net >= 0 else '-'}${abs(net):.2f}"
             f" | продаж в Steam за сутки: {o.steam_volume if o.steam_volume is not None else '?'}"
-            f"{stock}\n"
+            f"{stock}{where}\n"
             f'  <a href="{o.steam_url}">Проверить в Steam</a>'
+        )
+    if any(o.listing_count == 1 for o in found[:15]):
+        lines.append(
+            "<i>⚠️ — лот в единственном экземпляре. Большая скидка на одном "
+            "экземпляре чаще означает ошибку в цене или протухшую запись, "
+            "чем настоящую находку.</i>"
         )
 
     for chunk in _chunk_lines(lines, sep="\n\n"):
