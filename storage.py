@@ -580,12 +580,22 @@ async def get_market_settings(chat_id: int) -> dict:
         "min_price": s.get("mk_min_price"),
         "min_profit": s.get("mk_min_profit"),
         "min_volume": s.get("mk_min_volume"),
+        # Сколько экземпляров предмета выставлено на площадке. Ограничение
+        # СВЕРХУ: сотни лотов означают ходовой товар, где разрыв цен обычно
+        # либо дефект данных, либо исчезнет раньше, чем до него дойдут руки.
+        "max_count": s.get("mk_max_count"),
+        # Пауза между автоматическими прогонами /markets в минутах.
+        # None — автопрогона нет, команда работает только вручную.
+        "interval": s.get("mk_interval"),
     }
 
 
 async def set_market_setting(chat_id: int, key: str, value) -> None:
-    """key — одно из: min_discount, max_discount, min_price, min_profit, min_volume."""
-    allowed = {"min_discount", "max_discount", "min_price", "min_profit", "min_volume"}
+    """key — одно из: min_discount, max_discount, min_price, min_profit, min_volume, max_count, interval."""
+    allowed = {
+        "min_discount", "max_discount", "min_price", "min_profit", "min_volume",
+        "max_count", "interval",
+    }
     if key not in allowed:
         raise ValueError(f"неизвестная настройка площадок: {key}")
     settings = await _get_chat_settings(chat_id)

@@ -3892,65 +3892,151 @@ async def _collect_market_prices(session):
     )
 
 
-async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+MARKETS_JOB_PREFIX = "markets_scan_"
+
+
+async def _apply_markets_args(chat_id: int, args) -> dict:
     """
-    /markets [%] — сравнить Steam с площадками (источник — SIH).
+    Разобрать «/markets 30 50 60» и сохранить. Возвращает настройки целиком.
 
-    Отдельный от CSFloat канал арбитража, и главное его свойство — охват. Весь
-    каталог приходит одним запросом, поэтому сравнивается он целиком, а не
-    выборка лотов, и вопрос «почему только тысяча предметов» тут не возникает.
+    Позиционные аргументы, а не именованные, потому что порядок тут
+    естественный: сначала «насколько дешевле», потом «насколько редкий», потом
+    «как часто смотреть». Пропустить средний можно прочерком: /markets 30 - 60.
 
-    Цена — лучшее предложение по предмету, а не конкретный лот: ни флоата, ни
-    наклеек, ни прямой ссылки на лот. Зато есть count (сколько лотов) и market
-    (на какой площадке) — этого раньше не было вовсе.
+    Значения СОХРАНЯЮТСЯ, а не действуют на один раз. Раньше первый аргумент
+    был разовой заменой порога, но с появлением интервала это стало
+    непоследовательно: расписание разовым быть не может, а держать два разных
+    правила в одной команде — верный способ запутаться в собственной команде.
     """
-    chat_id = update.effective_chat.id
-    saved = await get_market_settings(chat_id)
+    def number(raw: str, what: str) -> float | None:
+        if raw in ("-", "*", "_"):
+            return None
+        try:
+            return float(raw.replace("%", "").replace(",", "."))
+        except ValueError:
+            raise ValueError(
+                f"{raw!r} — не число ({what}).\n"
+                "Формат: /markets <спред%> [макс лотов] [минут между прогонами]\n"
+                "Пример: /markets 30 50 60. Пропустить значение — прочерком: /markets 30 - 60"
+            )
 
+    discount = number(args[0], "спред в процентах")
+    if discount is not None:
+        if discount <= 0:
+            raise ValueError("Спред должен быть больше нуля.")
+        await set_market_setting(chat_id, "min_discount", discount)
+
+    if len(args) >= 2:
+        max_count = number(args[1], "максимум лотов")
+        if max_count is not None:
+            if max_count < 1:
+                # Ноль лотов не пропустит ничего: get-items отдаёт только то,
+                # что продаётся, там у всех минимум один.
+                raise ValueError("Максимум лотов должен быть от 1. Убрать фильтр: /markets 30 -")
+            await set_market_setting(chat_id, "max_count", max_count)
+        else:
+            await set_market_setting(chat_id, "max_count", None)
+
+    if len(args) >= 3:
+        minutes = number(args[2], "минуты между прогонами")
+        if minutes is not None and minutes <= 0:
+            minutes = None  # 0 — понятный способ сказать «выключить»
+        if minutes is not None and minutes < 10:
+            raise ValueError(
+                "Меньше 10 минут смысла нет: каталог у источника обновляется "
+                "примерно раз в час, и чаще придут те же самые числа."
+            )
+        await set_market_setting(chat_id, "interval", minutes)
+
+    return await get_market_settings(chat_id)
+
+
+def _reschedule_markets_job(job_queue, chat_id: int, interval_minutes) -> None:
+    """Пересоздать джобу автопрогона под новый интервал (None — выключить)."""
+    if job_queue is None:
+        return
+    for job in job_queue.get_jobs_by_name(f"{MARKETS_JOB_PREFIX}{chat_id}"):
+        job.schedule_removal()
+    if not interval_minutes:
+        return
+    job_queue.run_once(
+        markets_scan_job,
+        when=interval_minutes * 60,
+        data={"chat_id": chat_id},
+        name=f"{MARKETS_JOB_PREFIX}{chat_id}",
+    )
+
+
+async def markets_scan_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Автопрогон /markets. Присылает только НОВЫЕ находки.
+
+    Без отсева повторов регулярный прогон превращается в спам: каталог
+    обновляется примерно раз в час, и те же двадцать предметов приходили бы
+    снова и снова. Ключ дедупликации тот же, что у вотчлиста.
+    """
+    chat_id = context.job.data["chat_id"]
+    settings = await get_market_settings(chat_id)
+
+    async def send(text, **kwargs):
+        return await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+
+    try:
+        if settings["interval"]:
+            await _run_markets_scan(send, chat_id, settings, quiet=True)
+    except Exception:
+        log.exception("markets: непредвиденная ошибка автопрогона chat_id=%s", chat_id)
+    finally:
+        fresh = await get_market_settings(chat_id)
+        _reschedule_markets_job(context.job_queue, chat_id, fresh["interval"])
+
+
+def _markets_offer_key(offer) -> str:
+    """
+    Ключ находки для отсева повторов.
+
+    Цену округляем до цента и включаем в ключ: тот же предмет, подешевевший
+    ещё на доллар, — это новая новость, а не повтор старой.
+    """
+    return f"mk:{offer.market}:{offer.market_hash_name}:{offer.market_price:.2f}"
+
+
+async def _run_markets_scan(send, chat_id: int, saved: dict, *, quiet: bool = False) -> None:
+    """
+    Собрать и показать находки. Общая часть команды и автопрогона.
+
+    send — куда писать: reply_text для команды, обёртка над send_message для
+    джобы. quiet — не сообщать о пустом результате и отсеивать уже присланное;
+    у автопрогона иначе получился бы поток «ничего не нашлось» раз в час и
+    один и тот же список находок по кругу.
+    """
     def setting(key, default):
         return saved[key] if saved[key] is not None else default
 
-    # Аргумент команды перебивает сохранённый порог на один раз — удобно
-    # быстро пощупать другое значение, не меняя настройку.
-    try:
-        threshold = (
-            float(context.args[0].replace("%", "").replace(",", "."))
-            if context.args
-            else setting("min_discount", MARKETS_DEFAULT_DISCOUNT)
-        )
-    except ValueError:
-        await update.message.reply_text("Порог не разобрал. Пример: /markets 25")
-        return
-
+    threshold = setting("min_discount", MARKETS_DEFAULT_DISCOUNT)
     min_volume = int(setting("min_volume", MARKETS_MIN_VOLUME))
     max_discount = setting("max_discount", market_prices.MAX_SANE_DISCOUNT_PCT)
     min_profit = setting("min_profit", market_prices.MIN_NET_PROFIT)
     min_item_price = setting("min_price", market_prices.MIN_MARKET_PRICE)
-
-    await update.message.reply_text(
-        f"Сравниваю Steam с площадками ({'SIH' if sih_client.enabled() else 'csgotrader'}).\n"
-        f"Спред от {threshold:g}% до {max_discount:g}%, прибыль от ${min_profit:g}, "
-        f"продаж в Steam от {min_volume} за сутки.\n"
-        f"Пороги: /start → Пороги → Площадки"
-    )
+    max_count = saved.get("max_count")
 
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
         try:
             sources = await _collect_market_prices(session)
         except (sih_client.SihError, MarketsUnavailable) as e:
-            await update.message.reply_text(f"⚠️ {e}")
+            await send(f"⚠️ {e}")
             return
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             # Сетевую ошибку ловим отдельно от отказа источника: молча упасть
             # в обработчик PTB значит оставить человека вообще без ответа.
             log.warning("markets: источник цен недоступен: %s", e)
-            await update.message.reply_text(
+            await send(
                 f"⚠️ Не достучался до источника цен ({type(e).__name__}). "
                 "Попробуй ещё раз через минуту."
             )
             return
         if sources.note:
-            await update.message.reply_text(sources.note)
+            await send(sources.note)
 
         available = list(sources.by_market)
         found: list = []
@@ -3981,16 +4067,34 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
             found = [o for o in found if o.listing_count != 0]
             log.info("markets: отброшено %d находок без лотов в наличии", no_stock)
 
+        # Потолок по числу лотов. Сотни экземпляров означают ходовой товар, где
+        # разрыв цен обычно либо дефект данных, либо исчезнет раньше, чем до
+        # него дойдут руки. Фильтр НЕ трогает находки с неизвестным
+        # количеством: «не знаем» и «слишком много» — разные вещи, и путать их
+        # значит молча выбросить всё, что пришло не от SIH.
+        if max_count:
+            too_many = [
+                o for o in found
+                if o.listing_count is not None and o.listing_count > max_count
+            ]
+            if too_many:
+                found = [o for o in found if o not in too_many]
+                log.info(
+                    "markets: отброшено %d находок с лотами свыше %g",
+                    len(too_many), max_count,
+                )
+
     if not found:
         # Площадок у SIH под три десятка — перечислять все значит утопить
         # смысл сообщения в списке названий.
         shown = ", ".join(sorted(available)[:8])
         if len(available) > 8:
             shown += f" и ещё {len(available) - 8}"
-        await update.message.reply_text(
-            f"Проверил площадки ({shown}) — дешевле Steam на {threshold:g}% "
-            "ничего нет. Попробуй порог ниже."
-        )
+        if not quiet:
+            await send(
+                f"Проверил площадки ({shown}) — дешевле Steam на {threshold:g}% "
+                "ничего нет. Попробуй порог ниже."
+            )
         return
 
     found.sort(key=lambda o: o.discount_pct, reverse=True)
@@ -4004,6 +4108,12 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
         found[:MARKETS_VERIFY_LIMIT], threshold, min_volume
     )
     if not found:
+        if quiet:
+            log.info(
+                "markets: автопрогон — из %d кандидатов не подтвердился никто "
+                "(отбраковано %d, не проверено %d)", before, rejected, unavailable,
+            )
+            return
         if unavailable and not rejected:
             # Ничего не проверено — значит и сказать про находки нечего.
             # Заявлять "это были расхождения в прайс-листах" тут нельзя: мы их
@@ -4018,20 +4128,29 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 reason = "Steam ограничил доступ"
                 advice = "Попробуй через несколько минут — адреса освободятся."
-            await update.message.reply_text(
+            await send(
                 f"Кандидатов {before}, но проверить цены у Steam не удалось "
                 f"({unavailable} из {min(before, MARKETS_VERIFY_LIMIT)} запросов не прошли — "
                 f"{reason}). Это НЕ значит, что находок нет: их просто "
                 f"не с чем было сверить.\n\n{advice}"
             )
         else:
-            await update.message.reply_text(
+            await send(
                 f"Кандидатов было {before}. Проверено у Steam: {rejected} отбраковано"
                 + (f", {unavailable} не удалось проверить" if unavailable else "")
                 + ".\nНи одна находка не подтвердилась живой ценой — значит это были "
                 "расхождения в прайс-листах, а не выгода."
             )
         return
+    if quiet:
+        keys = [_markets_offer_key(o) for o in found]
+        fresh = await filter_new_offers(chat_id, keys)
+        found = [o for o, is_new in zip(found, fresh) if is_new]
+        if not found:
+            log.info("markets: все находки уже присылались, молчу")
+            return
+        await mark_offers_sent(chat_id, [_markets_offer_key(o) for o in found])
+
     found.sort(key=lambda o: o.discount_pct, reverse=True)
     lines = [
         f"🏪 Дешевле Steam — найдено {len(found)}\n"
@@ -4077,7 +4196,63 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     for chunk in _chunk_lines(lines, sep="\n\n"):
-        await update.message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
+        await send(chunk, parse_mode="HTML", disable_web_page_preview=True)
+
+
+async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /markets [спред%] [макс лотов] [минут] — сравнить Steam с площадками.
+
+    Отдельный от CSFloat канал арбитража, и главное его свойство — охват. Весь
+    каталог приходит одним запросом, поэтому сравнивается он целиком, а не
+    выборка лотов, и вопрос «почему только тысяча предметов» тут не возникает.
+
+    Цена — лучшее предложение по предмету, а не конкретный лот: ни флоата, ни
+    наклеек, ни прямой ссылки на лот. Зато есть count — сколько экземпляров
+    выставлено, и это единственный доступный признак «находка живая или
+    протухшая».
+
+    Аргументы позиционные и сохраняются: /markets 30 50 60 — спред от 30%,
+    не больше 50 лотов, автопрогон раз в час. Пропустить средний — прочерком.
+    """
+    chat_id = update.effective_chat.id
+
+    if context.args:
+        try:
+            saved = await _apply_markets_args(chat_id, context.args)
+        except ValueError as e:
+            await update.message.reply_text(str(e))
+            return
+        _reschedule_markets_job(context.application.job_queue, chat_id, saved["interval"])
+    else:
+        saved = await get_market_settings(chat_id)
+
+    def setting(key, default):
+        return saved[key] if saved[key] is not None else default
+
+    threshold = setting("min_discount", MARKETS_DEFAULT_DISCOUNT)
+    max_discount = setting("max_discount", market_prices.MAX_SANE_DISCOUNT_PCT)
+    min_profit = setting("min_profit", market_prices.MIN_NET_PROFIT)
+    min_volume = int(setting("min_volume", MARKETS_MIN_VOLUME))
+
+    limits = [
+        f"спред от {threshold:g}% до {max_discount:g}%",
+        f"прибыль от ${min_profit:g}",
+        f"продаж в Steam от {min_volume} за сутки",
+    ]
+    if saved["max_count"]:
+        limits.append(f"не больше {saved['max_count']:g} лотов на площадке")
+    limits.append(
+        f"автопрогон раз в {saved['interval']:g} мин"
+        if saved["interval"] else "автопрогон выключен"
+    )
+    await update.message.reply_text(
+        f"Сравниваю Steam с площадками ({'SIH' if sih_client.enabled() else 'csgotrader'}).\n"
+        + ",\n".join(limits)
+        + ".\n\nФормат: /markets <спред%> [макс лотов] [минут между прогонами]"
+    )
+
+    await _run_markets_scan(update.message.reply_text, chat_id, saved)
 
 
 async def arbreset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4621,6 +4796,13 @@ async def _settings_snapshot(chat_id: int) -> dict[str, str]:
         "mk_vol": mk_value("min_volume", MARKETS_MIN_VOLUME, lambda v: f"от {v:g} продаж"),
         "mk_profit": mk_value("min_profit", market_prices.MIN_NET_PROFIT, _fmt_money),
         "mk_price": mk_value("min_price", market_prices.MIN_MARKET_PRICE, _fmt_money),
+        "mk_count": (
+            "выключено" if mk["max_count"] is None
+            else f"не больше {mk['max_count']:g}"
+        ),
+        "mk_interval": (
+            "выключен" if not mk["interval"] else f"раз в {mk['interval']:g} мин"
+        ),
         "wt_int": f"{watch_interval:g} мин",
     }
 
@@ -4789,6 +4971,24 @@ async def _apply_setting(chat_id: int, key: str, value, context) -> str:
             "✅ Отбор по наклейкам в арбитраже выключен."
             if value is None
             else f"✅ Арбитраж: плюс лоты с доплатой за наклейки ≤{value:g}%."
+        )
+
+    if key == "mk_count":
+        await set_market_setting(chat_id, "max_count", value)
+        return (
+            "✅ Фильтр по числу лотов снят."
+            if value is None
+            else f"✅ Площадки: только находки, где выставлено не больше {value} лотов."
+        )
+
+    if key == "mk_interval":
+        await set_market_setting(chat_id, "interval", value)
+        _reschedule_markets_job(jq, chat_id, value)
+        return (
+            "✅ Автопрогон площадок выключен."
+            if value is None
+            else f"✅ Площадки проверяются сами раз в {value:g} мин. "
+                 "Присылаю только новые находки."
         )
 
     if key.startswith("mk_"):
@@ -5487,8 +5687,12 @@ COMMANDS: tuple[Command, ...] = (
     Command(
         "markets", markets, "Площадки",
         "Сравнить Steam с другими площадками",
-        "/markets [мин%] — сравнить цены Steam со сторонними площадками по "
-        "всему каталогу. Пороги — /start → Пороги → Площадки.",
+        "/markets — сравнить цены Steam со сторонними площадками по всему каталогу\n"
+        "/markets <спред%> [макс лотов] [минут] — задать пороги и автопрогон, "
+        "например /markets 30 50 60: дешевле Steam от 30%, не больше 50 лотов "
+        "на площадке, проверять раз в час\n"
+        "Пропустить значение — прочерком: /markets 30 - 60. Выключить "
+        "автопрогон — нулём. Остальные пороги: /start → Пороги → Площадки.",
     ),
     # --- Инвентарь ---------------------------------------------------------
     Command(
@@ -5629,6 +5833,20 @@ async def _on_startup(app: Application):
             continue
         _schedule_arb_job(app.job_queue, chat_id, _arb_interval(settings))
         arb_restored += 1
+
+    # Автопрогон /markets — так же по настройкам. Без восстановления
+    # расписание жило бы только в памяти процесса, а Render передеплоивает
+    # часто: пользователь включил автопрогон, а он молча умер на первом же
+    # деплое.
+    markets_restored = 0
+    for chat_id in await all_chat_ids_with_settings():
+        interval = (await get_market_settings(chat_id))["interval"]
+        if not interval:
+            continue
+        _reschedule_markets_job(app.job_queue, chat_id, interval)
+        markets_restored += 1
+    if markets_restored:
+        log.info("markets: восстановлен автопрогон для %d чат(ов)", markets_restored)
     if arb_restored:
         log.info("arb: восстановлены джобы арбитража для %d чат(ов)", arb_restored)
 
