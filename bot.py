@@ -130,6 +130,8 @@ from storage import (
     SENT_OFFER_TTL_SECONDS,
     get_market_settings,
     set_market_setting,
+    get_dips_settings,
+    set_dips_setting,
     get_steam_prices_batch,
     set_steam_price,
     get_extra_proxies,
@@ -149,6 +151,7 @@ import csfloat_client
 import market_prices
 import menu
 import pricing
+import dips
 import proxy_pool
 import sih_client
 from csfloat_client import CSFloatError, CSFloatRateLimited
@@ -3785,6 +3788,237 @@ async def _verify_markets_against_steam(offers, min_discount_pct: float, min_vol
     return verified, rejected, unavailable
 
 
+DIPS_JOB_PREFIX = "dips_scan_"
+
+# Порог просадки по умолчанию. Ниже 20% смысла нет: комиссия Steam ~13%, и
+# чтобы купить-подождать-продать хотя бы в ноль, цена должна вернуться
+# примерно на 15%. Просадка в 10% — это не находка, а работа за комиссию.
+DIPS_DEFAULT_DROP = float(os.environ.get("DIPS_DEFAULT_DROP", "25"))
+
+# Сколько просадок проверять живой ценой. Тот же бюджет и та же причина, что
+# у /markets: живых запросов к Steam мало, тратить их надо на верхушку.
+DIPS_VERIFY_LIMIT = int(os.environ.get("DIPS_VERIFY_LIMIT", "25"))
+
+
+async def _apply_dips_args(chat_id: int, args) -> dict:
+    """
+    Разобрать «/dips 30 60» и сохранить: порог просадки и интервал автопрогона.
+
+    Тот же порядок и та же логика, что у /markets: значения сохраняются,
+    прочерк пропускает параметр, ноль выключает автопрогон.
+    """
+    def number(raw: str, what: str) -> float | None:
+        if raw in ("-", "*", "_"):
+            return None
+        try:
+            return float(raw.replace("%", "").replace(",", "."))
+        except ValueError:
+            raise ValueError(
+                f"{raw!r} — не число ({what}).\n"
+                "Формат: /dips <просадка%> [минут между прогонами]\n"
+                "Пример: /dips 30 60. Пропустить значение — прочерком: /dips - 60"
+            )
+
+    drop = number(args[0], "просадка в процентах")
+    if drop is not None:
+        if drop <= 0:
+            raise ValueError("Просадка должна быть больше нуля.")
+        await set_dips_setting(chat_id, "min_drop", drop)
+
+    if len(args) >= 2:
+        minutes = number(args[1], "минуты между прогонами")
+        if minutes is not None and minutes <= 0:
+            minutes = None
+        if minutes is not None and minutes < 1:
+            raise ValueError("Интервал считается в минутах, меньше одной не бывает.")
+        await set_dips_setting(chat_id, "interval", minutes)
+
+    return await get_dips_settings(chat_id)
+
+
+def _reschedule_dips_job(job_queue, chat_id: int, interval_minutes) -> None:
+    if job_queue is None:
+        return
+    for job in job_queue.get_jobs_by_name(f"{DIPS_JOB_PREFIX}{chat_id}"):
+        job.schedule_removal()
+    if not interval_minutes:
+        return
+    job_queue.run_once(
+        dips_scan_job,
+        when=interval_minutes * 60,
+        data={"chat_id": chat_id},
+        name=f"{DIPS_JOB_PREFIX}{chat_id}",
+    )
+
+
+async def dips_scan_job(context: ContextTypes.DEFAULT_TYPE):
+    """Автопрогон просадок. Как и у /markets, шлёт только новое."""
+    chat_id = context.job.data["chat_id"]
+    settings = await get_dips_settings(chat_id)
+
+    async def send(text, **kwargs):
+        return await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+
+    try:
+        if settings["interval"]:
+            await _run_dips_scan(send, chat_id, settings, quiet=True)
+    except Exception:
+        log.exception("dips: непредвиденная ошибка автопрогона chat_id=%s", chat_id)
+    finally:
+        fresh = await get_dips_settings(chat_id)
+        _reschedule_dips_job(context.job_queue, chat_id, fresh["interval"])
+
+
+def _dip_key(dip) -> str:
+    """Ключ для отсева повторов. Цена в ключе: подешевел ещё — это новость."""
+    return f"dip:{dip.market_hash_name}:{dip.today:.2f}"
+
+
+async def _run_dips_scan(send, chat_id: int, saved: dict, *, quiet: bool = False) -> None:
+    """
+    Найти просадки и показать. Общая часть команды и автопрогона.
+
+    Порядок тот же, что в /markets, и по той же причине: сначала бесплатный
+    отбор по всему каталогу, потом живая проверка верхушки. Окна отвечают на
+    вопрос «куда смотреть», живой запрос — «правда ли это сейчас».
+    """
+    min_drop = saved["min_drop"] if saved["min_drop"] is not None else DIPS_DEFAULT_DROP
+
+    details = await get_csgotrader_price_details()
+    if not details:
+        if not quiet:
+            await send("⚠️ Прайс-лист не скачался — искать просадки не в чем.")
+        return
+
+    found, dropped = dips.find_dips(details, min_drop_pct=min_drop)
+    if not found:
+        if not quiet:
+            reasons = ", ".join(f"{k}: {v}" for k, v in dropped.items() if v)
+            await send(
+                f"Просмотрел {len(details)} предметов — просадок от {min_drop:g}% нет.\n"
+                f"Отсев: {reasons}"
+            )
+        return
+
+    # Живая проверка верхушки. Просадка по суточному окну — это средняя за
+    # день, а не цена сейчас: обвал трёхчасовой давности она показывает
+    # разбавленным. Живой запрос отвечает, есть ли просадка ПРЯМО СЕЙЧАС.
+    top = found[:DIPS_VERIFY_LIMIT]
+    live_prices = await _live_prices_for(chat_id, [d.market_hash_name for d in top])
+
+    lines = [
+        f"📉 Просадки от месячной нормы — найдено {len(found)}\n"
+        f"<i>Цена сегодня против средней за 30 дней. Это НЕ арбитраж: разрыв "
+        f"во времени, а не между площадками — чтобы заработать, цена должна "
+        f"вернуться, и она может не вернуться. «Вернётся» — прибыль при "
+        f"возврате к норме за вычетом комиссии "
+        f"~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%.</i>"
+    ]
+    shown = []
+    for dip in top[:15]:
+        live = live_prices.get(dip.market_hash_name)
+        gain = dip.recovery_gain_pct(STEAM_FEE_MULTIPLIER)
+        if live:
+            # Живая цена есть — пересчитываем просадку по ней, это честнее.
+            actual_drop = (dip.month - live) / dip.month * 100
+            now = f"<b>сейчас ${live:.2f}</b> (просадка {actual_drop:.0f}%)"
+        else:
+            now = f"сутки ${dip.today:.2f} <i>(оценка)</i>"
+        shown.append(dip)
+        lines.append(
+            f"<code>{html_module.escape(dip.market_hash_name)}</code>\n"
+            f"  {now} | неделя ${dip.week:.2f} | месяц ${dip.month:.2f}\n"
+            f"  просадка от нормы {dip.drop_pct:.0f}%, при возврате "
+            f"{'+' if gain >= 0 else ''}{gain:.0f}% чистыми\n"
+            f'  <a href="{dip.steam_url}">Открыть в Steam</a>'
+        )
+
+    if quiet:
+        keys = [_dip_key(d) for d in shown]
+        fresh = await filter_new_offers(chat_id, keys)
+        if not any(fresh):
+            log.info("dips: все просадки уже присылались, молчу")
+            return
+        await mark_offers_sent(chat_id, [k for k, is_new in zip(keys, fresh) if is_new])
+
+    if len(found) > 15:
+        lines.append(f"<i>…и ещё {len(found) - 15}. Подними порог, чтобы список был короче.</i>")
+
+    for chunk in _chunk_lines(lines, sep="\n\n"):
+        await send(chunk, parse_mode="HTML", disable_web_page_preview=True)
+
+
+async def _live_prices_for(chat_id: int, names: list[str]) -> dict[str, float]:
+    """
+    Живая цена Steam по списку имён — сколько получится в рамках бюджета.
+
+    Молча возвращает то, что удалось: при забаненном priceoverview это пустой
+    словарь, и находки уйдут с пометкой «оценка». Отказываться от них целиком
+    нельзя — кандидаты найдены, просто подтвердить их нечем.
+    """
+    if not names:
+        return {}
+    cached = await get_steam_prices_batch(names)
+    out = {n: e["price"] for n, e in cached.items() if e.get("price")}
+
+    misses = [n for n in names if n not in cached][:STEAM_LIVE_BUDGET]
+    if not misses:
+        return out
+
+    semaphore = asyncio.Semaphore(pricing.PRICE_CONCURRENCY)
+
+    async def one(session, name):
+        async with semaphore:
+            try:
+                live = await get_steam_market_price_retrying(session, name)
+            except Exception:
+                return name, None
+            if live and live.lowest:
+                await set_steam_price(name, live.lowest, live.volume)
+                return name, live.lowest
+            return name, None
+
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+        for name, price in await asyncio.gather(*(one(session, n) for n in misses)):
+            if price:
+                out[name] = price
+    return out
+
+
+async def dips_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /dips [просадка%] [минут] — предметы дешевле своей месячной нормы.
+
+    Единственная часть бота, которой не нужны ни прокси, ни лимиты Steam:
+    отбор идёт по уже скачанному прайс-листу, локально, по всем 32 тысячам
+    предметов разом. Живой запрос тратится только на верхушку.
+    """
+    chat_id = update.effective_chat.id
+
+    if context.args:
+        try:
+            saved = await _apply_dips_args(chat_id, context.args)
+        except ValueError as e:
+            await update.message.reply_text(str(e))
+            return
+        _reschedule_dips_job(context.application.job_queue, chat_id, saved["interval"])
+    else:
+        saved = await get_dips_settings(chat_id)
+
+    min_drop = saved["min_drop"] if saved["min_drop"] is not None else DIPS_DEFAULT_DROP
+    schedule = (
+        f"автопрогон раз в {saved['interval']:g} мин"
+        if saved["interval"] else "автопрогон выключен"
+    )
+    await update.message.reply_text(
+        f"Ищу предметы дешевле месячной нормы от {min_drop:g}%, {schedule}.\n"
+        f"Свежие просадки: неделя должна держаться у месяца, иначе это не "
+        f"просадка, а падение.\n\n"
+        f"Формат: /dips <просадка%> [минут между прогонами]"
+    )
+    await _run_dips_scan(update.message.reply_text, chat_id, saved)
+
+
 class MarketsUnavailable(Exception):
     """Цены площадок не собрались. Текст уходит пользователю как есть."""
 
@@ -5886,6 +6120,17 @@ COMMANDS: tuple[Command, ...] = (
         "почистить — /start → Прокси.",
     ),
     Command(
+        "dips", dips_cmd, "Площадки",
+        "Просадки: дешевле месячной нормы",
+        "/dips — предметы, торгующиеся дешевле своей средней за 30 дней\n"
+        "/dips <просадка%> [минут] — задать порог и автопрогон, например "
+        "/dips 30 60\n"
+        "Отбор идёт по всему каталогу локально, без запросов к Steam, поэтому "
+        "работает даже когда всё остальное упирается в лимиты. Это НЕ арбитраж: "
+        "разрыв во времени, а не между площадками — цена должна вернуться, и "
+        "она может не вернуться.",
+    ),
+    Command(
         "pricecheck", pricecheck, "Служебное", None,
         "/pricecheck [сколько] — сверить оценки цен с живой ценой Steam "
         "(по умолчанию 20 предметов, около двух минут). Отвечает на вопрос, "
@@ -6020,6 +6265,16 @@ async def _on_startup(app: Application):
         markets_restored += 1
     if markets_restored:
         log.info("markets: восстановлен автопрогон для %d чат(ов)", markets_restored)
+
+    dips_restored = 0
+    for chat_id in await all_chat_ids_with_settings():
+        interval = (await get_dips_settings(chat_id))["interval"]
+        if not interval:
+            continue
+        _reschedule_dips_job(app.job_queue, chat_id, interval)
+        dips_restored += 1
+    if dips_restored:
+        log.info("dips: восстановлен автопрогон для %d чат(ов)", dips_restored)
     if arb_restored:
         log.info("arb: восстановлены джобы арбитража для %d чат(ов)", arb_restored)
 

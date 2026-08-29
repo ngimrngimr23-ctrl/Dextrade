@@ -624,6 +624,28 @@ async def set_market_setting(chat_id: int, key: str, value) -> None:
     await _save_chat_settings(chat_id, settings)
 
 
+async def get_dips_settings(chat_id: int) -> dict:
+    """
+    Настройки поиска просадок: {'min_drop': %, 'interval': мин}.
+    None в любом поле — не задано, действует значение по умолчанию из кода.
+    """
+    s = await _get_chat_settings(chat_id)
+    return {
+        "min_drop": s.get("dip_min_drop"),
+        "interval": s.get("dip_interval"),
+    }
+
+
+async def set_dips_setting(chat_id: int, key: str, value) -> None:
+    """key — одно из: min_drop, interval."""
+    allowed = {"min_drop", "interval"}
+    if key not in allowed:
+        raise ValueError(f"неизвестная настройка просадок: {key}")
+    settings = await _get_chat_settings(chat_id)
+    settings[f"dip_{key}"] = value
+    await _save_chat_settings(chat_id, settings)
+
+
 async def all_chat_ids_with_settings() -> list[int]:
     """
     Чаты, у которых вообще есть сохранённые настройки — нужно, чтобы понять,
