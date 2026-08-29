@@ -3726,13 +3726,21 @@ async def _verify_markets_against_steam(offers, min_discount_pct: float, min_vol
             return offer, live
 
     verified = []
+    unchecked = []    # проверить не вышло — но выбрасывать их нельзя
     unavailable = 0   # не смогли проверить: Steam не ответил
     rejected = 0      # проверили и отбраковали — это разные вещи
 
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
         for offer, live in await asyncio.gather(*(check(o, session) for o in offers)):
             if live is None or not live.lowest:
+                # Раньше такая находка молча исчезала, и при забаненном
+                # priceoverview выдача пустела целиком — при том что кандидат
+                # был найден, просто подтвердить его не удалось. «Не проверено»
+                # и «проверено и не подошло» — разные вещи, и вторая не должна
+                # поглощать первую. Отдаём с пометкой «оценка», решать
+                # пользователю.
                 unavailable += 1
+                unchecked.append(offer)
                 continue
 
             was = offer.steam_price
@@ -3763,9 +3771,13 @@ async def _verify_markets_against_steam(offers, min_discount_pct: float, min_vol
             verified.append(offer)
 
     log.info(
-        "markets: подтвердилось %d, отбраковано %d, НЕ УДАЛОСЬ проверить %d из %d",
+        "markets: подтвердилось %d, отбраковано %d, НЕ УДАЛОСЬ проверить %d из %d "
+        "(непроверенные отдаются с пометкой «оценка»)",
         len(verified), rejected, unavailable, len(offers),
     )
+    # Подтверждённые впереди: их цена настоящая, а у непроверенных — оценка из
+    # прайс-листа, которая на редких позициях врёт сильнее всего.
+    verified.extend(unchecked)
     # Возвращаем и то, что не удалось проверить: смешивать «проверили и не
     # подошло» с «не смогли проверить» нельзя. На проде из-за этого бот заявил
     # «ни один не подтвердился, значит это расхождения в прайс-листах» при том,
@@ -4150,7 +4162,14 @@ async def _run_markets_scan(send, chat_id: int, saved: dict, *, quiet: bool = Fa
             )
             return
         if sources.note:
-            await send(sources.note)
+            # В автопрогоне это сообщение не нужно: оно описывает УСТРОЙСТВО
+            # источника, а не находки, и от прогона к прогону не меняется.
+            # Раз в минуту оно превращается в спам, за которым теряются
+            # настоящие уведомления.
+            if quiet:
+                log.info("markets: %s", sources.note.replace("\n", " "))
+            else:
+                await send(sources.note)
 
         available = list(sources.by_market)
         found: list = []
@@ -4265,7 +4284,16 @@ async def _run_markets_scan(send, chat_id: int, saved: dict, *, quiet: bool = Fa
             return
         await mark_offers_sent(chat_id, [_markets_offer_key(o) for o in found])
 
-    found.sort(key=lambda o: o.discount_pct, reverse=True)
+    # Порядок: сначала подтверждённые живым Steam, потом из кэша, потом
+    # непроверенные. Внутри каждой группы — по величине скидки.
+    #
+    # Просто по скидке сортировать нельзя: у непроверенных цена Steam взята из
+    # прайс-листа, и на редких позициях она завышена сильнее всего. Такие
+    # находки заняли бы верх списка именно потому, что им меньше всего можно
+    # верить.
+    _ORDER = {"live": 0, "cache": 1, "estimate": 2}
+    found.sort(key=lambda o: (_ORDER.get(o.price_source, 3), -o.discount_pct))
+
     live_count = sum(1 for o in found if o.price_source == "live")
     cache_count = sum(1 for o in found if o.price_source == "cache")
     # Состояние проверки — в шапку, а не между строк.
