@@ -3785,7 +3785,7 @@ def _cheapest_named_venue(
     return best
 
 
-async def _collect_market_prices(session):
+async def _collect_market_prices(session, max_age: float | None = None):
     """
     Цены площадок и Steam для сравнения: (источник, цены Steam, по площадкам, лотов).
 
@@ -3812,7 +3812,7 @@ async def _collect_market_prices(session):
     """
     if sih_client.enabled():
         try:
-            items = await sih_client.fetch_items(session)
+            items = await sih_client.fetch_items(session, max_age=max_age)
             steam_prices, by_market, counts = sih_client.split_by_market(items)
 
             if steam_prices:
@@ -3853,13 +3853,18 @@ async def _collect_market_prices(session):
                 # выглядели бы как «полей нет вовсе».
                 fields = ", ".join(sorted(sih_client.last_fields))
                 shape = f" (поля: {fields})" if fields else ""
+                # Насколько каталог живой — вопрос открытый, и ответ на него
+                # копится сам: сравниваем каждый новый ответ с предыдущим.
+                fresh = sih_client.last_refresh
+                freshness = f"\nСвежесть: {fresh.describe()}." if fresh else ""
                 return PriceSources(
                     "SIH + прайс-лист", fallback, by_market, counts, venues,
                     f"\u2139\ufe0f SIH отдал {len(items)} предметов, из них с лотами в "
                     f"наличии {with_stock}. Цену Steam он не отдаёт{shape}, "
                     f"поэтому она берётся из прайс-листа.\n"
                     f"Площадку SIH тоже не называет — «где купить» ниже это "
-                    f"подсказка по данным csgotrader, проверяй на месте.",
+                    f"подсказка по данным csgotrader, проверяй на месте."
+                    + freshness,
                 )
             raise sih_client.SihError(
                 f"отдал {len(items)} предметов без цены Steam, а прайс-лист не скачался"
@@ -3942,9 +3947,16 @@ async def _apply_markets_args(chat_id: int, args) -> dict:
         if minutes is not None and minutes <= 0:
             minutes = None  # 0 — понятный способ сказать «выключить»
         if minutes is not None and minutes < 10:
+            # Ограничение по вежливости к чужому сервису, а НЕ потому что
+            # данные не меняются: как часто обновляется каталог SIH, мы пока
+            # не знаем — это меряется и пишется в отчёт прогона («Свежесть»).
+            # Раньше здесь стояло обоснование «каталог обновляется раз в час»,
+            # взятое от csgotrader и к SIH отношения не имеющее.
             raise ValueError(
-                "Меньше 10 минут смысла нет: каталог у источника обновляется "
-                "примерно раз в час, и чаще придут те же самые числа."
+                "Меньше 10 минут пока не ставлю — незачем долбить чужой сервис, "
+                "не зная, как часто он вообще обновляет цены.\n"
+                "Свежесть меряется на каждом прогоне и пишется в отчёт: "
+                "если окажется, что цены меняются быстро, снизим порог."
             )
         await set_market_setting(chat_id, "interval", minutes)
 
@@ -4021,8 +4033,13 @@ async def _run_markets_scan(send, chat_id: int, saved: dict, *, quiet: bool = Fa
     max_count = saved.get("max_count")
 
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+        # Кэш не должен жить дольше, чем пауза между прогонами: иначе при
+        # автопрогоне раз в десять минут пять прогонов из шести вернули бы
+        # одни и те же числа, и делали бы вид, что проверили.
+        interval = saved.get("interval")
+        max_age = interval * 60 if interval else None
         try:
-            sources = await _collect_market_prices(session)
+            sources = await _collect_market_prices(session, max_age=max_age)
         except (sih_client.SihError, MarketsUnavailable) as e:
             await send(f"⚠️ {e}")
             return

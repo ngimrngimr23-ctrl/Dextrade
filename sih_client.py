@@ -448,21 +448,51 @@ _lock = asyncio.Lock()
 last_fields: set[str] = set()
 
 
+class RefreshStats(NamedTuple):
+    """Насколько каталог изменился между двумя ответами."""
+
+    age_seconds: float   # сколько прошло с прошлого ответа
+    compared: int        # по скольким предметам сравнивали
+    changed: int         # у скольких изменилась цена
+    added: int           # сколько предметов появилось впервые
+
+    @property
+    def changed_pct(self) -> float:
+        return 100 * self.changed / self.compared if self.compared else 0.0
+
+    def describe(self) -> str:
+        return (
+            f"за {self.age_seconds / 60:.0f} мин изменилось {self.changed} цен "
+            f"из {self.compared} ({self.changed_pct:.1f}%)"
+        )
+
+
+# Заполняется при каждом ОБНОВЛЕНИИ каталога (не при попадании в кэш).
+last_refresh: RefreshStats | None = None
+
+
 async def fetch_items(
     session: aiohttp.ClientSession,
     *,
     app_id: int = APP_ID_CS2,
     force_refresh: bool = False,
+    max_age: float | None = None,
 ) -> dict[str, SihItem]:
     """
     Весь каталог одним запросом.
 
     Под замком, потому что прогон /markets и автоскан могут прийти
     одновременно, а тянуть один и тот же большой ответ дважды незачем.
+
+    max_age — насколько старым дозволено быть ответу из кэша, в секундах.
+    Нужен потому, что срок годности кэша задаёт вызывающий, а не мы: при
+    автопрогоне раз в десять минут часовой кэш означал бы, что пять прогонов
+    из шести возвращают одни и те же числа. Молчаливо, разумеется.
     """
+    ttl = CACHE_TTL_SECONDS if max_age is None else max(0.0, max_age)
     async with _lock:
         cached = _cache.get(app_id)
-        if not force_refresh and cached and (time.time() - cached[1]) < CACHE_TTL_SECONDS:
+        if not force_refresh and cached and (time.time() - cached[1]) < ttl:
             return cached[0]
 
         try:
@@ -490,8 +520,32 @@ async def fetch_items(
         # price — и ни цены Steam, ни названия площадки среди них нет ни при
         # каких параметрах. Значит это не сбой, а форма ответа, и решать, что
         # с ней делать, должен вызывающий.
-        global last_fields
+        global last_fields, last_refresh
         last_fields = set(fields)
+
+        # Насколько живой каталог на самом деле — вопрос, на который у нас нет
+        # ответа от SIH, а догадка дорого стоит: часовой кэш поверх
+        # обновляющегося в реальном времени источника убивает весь смысл
+        # перехода на него. Меряем: сколько цен изменилось с прошлого ответа и
+        # за какое время. Пара прогонов — и вопрос закрыт данными.
+        if cached:
+            previous, fetched_at = cached
+            age = time.time() - fetched_at
+            common = [n for n in items if n in previous]
+            changed = sum(1 for n in common if previous[n].price != items[n].price)
+            last_refresh = RefreshStats(
+                age_seconds=age,
+                compared=len(common),
+                changed=changed,
+                added=len(items) - len(common),
+            )
+            log.info(
+                "sih: обновление через %.0f мин — изменилось %d цен из %d (%.1f%%), "
+                "новых предметов %d",
+                age / 60, changed, len(common),
+                100 * changed / len(common) if common else 0.0,
+                last_refresh.added,
+            )
 
         _cache[app_id] = (items, time.time())
         log.info(
