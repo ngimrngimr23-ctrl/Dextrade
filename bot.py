@@ -4376,6 +4376,36 @@ _PRICE_SOURCE_MARK = {
 }
 
 
+# Последняя записанная в лог форма ответа источника: набор полей и порядок
+# величины каталога. Нужна, чтобы не повторять пояснение без нужды.
+_last_source_shape: tuple | None = None
+
+
+def _log_source_shape(sources) -> None:
+    """
+    Коротко — всегда, подробно — только когда форма ответа изменилась.
+
+    Автопрогон раз в минуту писал в журнал одно и то же пояснение на четыреста
+    символов. Полезное в нём — состав полей и порядок числа предметов, а они
+    меняются раз в неделю; всё остальное повторялось сорок раз подряд и
+    прятало настоящие сообщения.
+    """
+    global _last_source_shape
+
+    fresh = sih_client.last_refresh
+    log.info(
+        "markets: источник %s, предметов %d%s",
+        sources.source,
+        len(sources.counts) or len(sources.steam),
+        f", свежесть {fresh.changed_pct:.1f}% за {fresh.age_seconds / 60:.0f} мин" if fresh else "",
+    )
+
+    shape = (tuple(sorted(sih_client.last_fields)), len(sources.by_market))
+    if shape != _last_source_shape:
+        _last_source_shape = shape
+        log.info("markets: форма ответа источника — %s", sources.note.replace("\n", " "))
+
+
 def _markets_offer_key(offer) -> str:
     """
     Ключ находки для отсева повторов.
@@ -4431,7 +4461,12 @@ async def _run_markets_scan(send, chat_id: int, saved: dict, *, quiet: bool = Fa
             # Раз в минуту оно превращается в спам, за которым теряются
             # настоящие уведомления.
             if quiet:
-                log.info("markets: %s", sources.note.replace("\n", " "))
+                # В лог — короткой строкой. Полное пояснение в четыреста
+                # символов раз в минуту забивает журнал так же, как забивало
+                # чат: за сорока одинаковыми абзацами не видно ничего
+                # другого. Само пояснение пишется отдельно и только когда
+                # меняется (см. _log_source_shape).
+                _log_source_shape(sources)
             else:
                 await send(sources.note)
 
