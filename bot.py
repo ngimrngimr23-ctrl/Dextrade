@@ -3698,10 +3698,11 @@ async def _verify_markets_against_steam(offers, min_discount_pct: float, min_vol
     )
 
     class Cached:
-        __slots__ = ("lowest", "volume", "median")
+        __slots__ = ("lowest", "volume", "median", "from_cache")
 
         def __init__(self, entry):
             self.lowest, self.volume, self.median = entry["price"], entry.get("volume"), None
+            self.from_cache = True
 
     async def check(offer, session):
         entry = cached.get(offer.market_hash_name)
@@ -3736,6 +3737,7 @@ async def _verify_markets_against_steam(offers, min_discount_pct: float, min_vol
 
             was = offer.steam_price
             offer.apply_live_steam(live.lowest, live.volume)
+            offer.price_source = "cache" if getattr(live, "from_cache", False) else "live"
 
             # Неизвестный объём НЕ считаем нулевым. Цена, взятая из листингов
             # (запасной путь, когда priceoverview забанен), объёма не содержит
@@ -4089,6 +4091,15 @@ async def markets_scan_job(context: ContextTypes.DEFAULT_TYPE):
         _reschedule_markets_job(context.job_queue, chat_id, fresh["interval"])
 
 
+# Пометка к цене Steam: откуда она взялась. Живая проверка знака не требует —
+# это норма; пометки нужны там, где число хуже, чем кажется.
+_PRICE_SOURCE_MARK = {
+    "live": "",
+    "cache": " <i>(из кэша)</i>",
+    "estimate": " <i>(оценка)</i>",
+}
+
+
 def _markets_offer_key(offer) -> str:
     """
     Ключ находки для отсева повторов.
@@ -4255,11 +4266,35 @@ async def _run_markets_scan(send, chat_id: int, saved: dict, *, quiet: bool = Fa
         await mark_offers_sent(chat_id, [_markets_offer_key(o) for o in found])
 
     found.sort(key=lambda o: o.discount_pct, reverse=True)
+    live_count = sum(1 for o in found if o.price_source == "live")
+    cache_count = sum(1 for o in found if o.price_source == "cache")
+    # Состояние проверки — в шапку, а не между строк.
+    #
+    # Раньше сообщение говорило только «найдено N», и при забаненном
+    # priceoverview это читалось как «проверено N», хотя живьём не проверялось
+    # ничего: все числа приходили из кэша. Уверенный список, по которому идут
+    # покупать, обязан честно говорить, чем он подтверждён.
+    if live_count == len(found):
+        checked = "все цены Steam проверены живьём только что"
+    elif live_count:
+        checked = (
+            f"живьём проверено {live_count} из {len(found)}, "
+            f"остальные — из кэша прошлых проверок"
+        )
+    elif cache_count:
+        checked = (
+            "⚠️ живьём сейчас НЕ проверена ни одна: цены из кэша прошлых "
+            "проверок. Steam на кулдауне или прокси не пропускают запросы — "
+            "см. /start → Состояние"
+        )
+    else:
+        checked = "⚠️ цены не подтверждены живым Steam — это оценка из прайс-листа"
+
     lines = [
         f"🏪 Дешевле Steam — найдено {len(found)}\n"
-        f"<i>Источник: {sources.source}, кэш обновляется раз в час. Это лучшее "
-        f"предложение по предмету, а не конкретный лот: проверяй на площадке перед "
-        f"покупкой. «Чистыми» — за вычетом комиссии Steam "
+        f"<i>Источник: {sources.source}. {checked}.\n"
+        f"Это лучшее предложение по предмету, а не конкретный лот: проверяй на "
+        f"площадке перед покупкой. «Чистыми» — за вычетом комиссии Steam "
         f"~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%.</i>"
     ]
     for o in found[:15]:
@@ -4285,7 +4320,8 @@ async def _run_markets_scan(send, chat_id: int, saved: dict, *, quiet: bool = Fa
         lines.append(
             f"<code>{html_module.escape(o.market_hash_name)}</code>\n"
             f"  {html_module.escape(o.market)} ${o.market_price:.2f} | "
-            f"Steam ${o.steam_price:.2f} | дешевле на {o.discount_pct:.1f}%\n"
+            f"Steam ${o.steam_price:.2f}{_PRICE_SOURCE_MARK.get(o.price_source, '')} | "
+            f"дешевле на {o.discount_pct:.1f}%\n"
             f"  чистыми при перепродаже: {'+' if net >= 0 else '-'}${abs(net):.2f}"
             f" | продаж в Steam за сутки: {o.steam_volume if o.steam_volume is not None else '?'}"
             f"{stock}{where}\n"

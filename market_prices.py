@@ -218,7 +218,7 @@ class MarketOffer:
     __slots__ = (
         "market", "market_hash_name", "market_price", "steam_price", "discount_pct",
         "steam_volume", "verified", "estimated_price", "listing_count",
-        "venue_hint",
+        "venue_hint", "price_source",
     )
 
     def __init__(self, market: str, name: str, market_price: float, steam_price: float):
@@ -242,6 +242,14 @@ class MarketOffer:
         # «Дешевле на 48%» без ответа на вопрос «дешевле ГДЕ» — не находка, а
         # ребус: пойти и купить по ней нельзя.
         self.venue_hint: tuple[str, float] | None = None
+        # Откуда взята цена Steam: "estimate" — прайс-лист, "cache" — прошлый
+        # живой ответ, "live" — спросили только что.
+        #
+        # Различать обязательно. Без этого сообщение «дешевле Steam — найдено
+        # 18» читается как «проверено 18», хотя при забаненном priceoverview и
+        # мёртвых прокси живьём не проверено НИ ОДНОЙ, и все числа взяты из
+        # кэша. Пользователь видит уверенный список и идёт по нему покупать.
+        self.price_source: str = "estimate"
 
     def apply_live_steam(self, lowest: float, volume: int | None) -> None:
         """Заменить оценку настоящей ценой из Steam и пересчитать выгоду."""
