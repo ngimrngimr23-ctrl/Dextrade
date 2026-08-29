@@ -21,6 +21,7 @@ GiftSatteliteAdapter (Upstash + локальный fallback).
 import json
 import os
 import time
+import zlib
 import logging
 from pathlib import Path
 from typing import Optional
@@ -644,6 +645,91 @@ async def set_dips_setting(chat_id: int, key: str, value) -> None:
     settings = await _get_chat_settings(chat_id)
     settings[f"dip_{key}"] = value
     await _save_chat_settings(chat_id, settings)
+
+
+# ---------------------------------------------------------------------------
+# История цен: накопленный минимум и активность по каждому предмету.
+#
+# Хранится ШАРДАМИ, а не одним ключом. Записей около тридцати тысяч, и целиком
+# они дают пару мегабайт — больше, чем разумно класть в одно значение Upstash.
+# Шард выбирается по хэшу имени, поэтому предмет всегда попадает в тот же
+# кусок, и сливать их между собой не нужно.
+# ---------------------------------------------------------------------------
+
+PRICE_HISTORY_KEY_PREFIX = "pricehist:"
+PRICE_HISTORY_SHARDS = 8
+LOCAL_PRICE_HISTORY_PATH = Path(__file__).parent / "price_history_local.json"
+
+
+def _history_shard(name: str) -> int:
+    """
+    Номер шарда по имени предмета.
+
+    Берём встроенный hash? Нет: он рандомизируется между запусками процесса
+    (PYTHONHASHSEED), и после каждого рестарта предмет уезжал бы в другой
+    шард, теряя накопленное. Нужна устойчивая функция.
+    """
+    return zlib.crc32(name.encode("utf-8")) % PRICE_HISTORY_SHARDS
+
+
+async def get_price_history() -> dict:
+    """Вся накопленная история: market_hash_name -> компактный список полей."""
+    if REDIS_ENABLED:
+        try:
+            keys = [f"{PRICE_HISTORY_KEY_PREFIX}{i}" for i in range(PRICE_HISTORY_SHARDS)]
+            raws = await _redis_cmd("MGET", *keys)
+            out = {}
+            for raw in raws or []:
+                if raw:
+                    try:
+                        out.update(json.loads(raw))
+                    except Exception:
+                        log.warning("история цен: шард не разобрался, пропускаю")
+            return out
+        except Exception:
+            log.warning("история цен: Upstash недоступен, читаю локальный файл")
+
+    if LOCAL_PRICE_HISTORY_PATH.exists():
+        try:
+            return json.loads(LOCAL_PRICE_HISTORY_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+async def save_price_history(history: dict) -> bool:
+    """
+    Записать историю. True — сохранено в Upstash (переживёт передеплой).
+
+    Возвращаем именно этот факт, а не «получилось ли вообще»: локальный файл
+    на Render эфемерен, и сохранение в него означает, что накопленное умрёт на
+    следующем деплое. Вызывающий должен иметь возможность об этом сказать.
+    """
+    if REDIS_ENABLED:
+        try:
+            shards: list[dict] = [{} for _ in range(PRICE_HISTORY_SHARDS)]
+            for name, row in history.items():
+                shards[_history_shard(name)][name] = row
+            commands = [
+                ["SET", f"{PRICE_HISTORY_KEY_PREFIX}{i}",
+                 json.dumps(shard, ensure_ascii=False, separators=(",", ":"))]
+                for i, shard in enumerate(shards)
+            ]
+            results = await _redis_pipeline(commands)
+            if any(isinstance(r, dict) and "error" in r for r in results):
+                raise RuntimeError(f"pipeline вернул ошибку: {results}")
+            return True
+        except Exception:
+            log.exception("история цен: не удалось записать в Upstash")
+
+    try:
+        LOCAL_PRICE_HISTORY_PATH.write_text(
+            json.dumps(history, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+    except Exception:
+        log.exception("история цен: не удалось записать локальный файл")
+    return False
 
 
 async def all_chat_ids_with_settings() -> list[int]:

@@ -132,6 +132,8 @@ from storage import (
     set_market_setting,
     get_dips_settings,
     set_dips_setting,
+    get_price_history,
+    save_price_history,
     get_steam_prices_batch,
     set_steam_price,
     get_extra_proxies,
@@ -152,6 +154,7 @@ import market_prices
 import menu
 import pricing
 import dips
+import price_history
 import proxy_pool
 import sih_client
 from csfloat_client import CSFloatError, CSFloatRateLimited
@@ -3788,6 +3791,75 @@ async def _verify_markets_against_steam(offers, min_discount_pct: float, min_vol
     return verified, rejected, unavailable
 
 
+HISTORY_JOB_NAME = "price_history_snapshot"
+
+# Как часто снимать срез цен. Раз в сутки: окна прайс-листа всё равно суточные,
+# чаще снимать нечего.
+HISTORY_INTERVAL_HOURS = float(os.environ.get("HISTORY_INTERVAL_HOURS", "24"))
+
+# Сколько дней наблюдений нужно, чтобы минимуму можно было верить. Меньше
+# недели — это не минимум, а просто самая низкая из трёх случайных цен.
+HISTORY_MATURE_DAYS = int(os.environ.get("HISTORY_MATURE_DAYS", "7"))
+
+
+async def _take_price_snapshot(*, force: bool = False) -> str:
+    """
+    Снять срез цен и слить с накопленным. Возвращает строку для лога.
+
+    Берём суточное окно прайс-листа — самую свежую цену, которая есть сразу на
+    весь каталог. Ни одного запроса к Steam: срез стоит того же, что и обычный
+    прогон /markets, то есть ничего.
+    """
+    raw = await get_price_history()
+
+    # Срез снимается и при старте процесса, а Render передеплоивает по
+    # нескольку раз в день. Без этой проверки каждый деплой добавлял бы
+    # предметам «ещё один день», и семидневная зрелость наступала бы за пару
+    # суток — минимум объявлялся бы надёжным, не будучи им.
+    since_last = time.time() - price_history.last_snapshot_at(raw)
+    min_gap = HISTORY_INTERVAL_HOURS * 3600 * 0.75
+    if not force and since_last < min_gap:
+        return f"прошлый срез был {since_last / 3600:.1f} ч назад, пропускаю"
+
+    details = await get_csgotrader_price_details()
+    if not details:
+        return "прайс-лист не скачался, срез пропущен"
+
+    prices = {
+        name: price.windows[ARB_PRICE_WINDOW]
+        for name, price in details.items()
+        if ARB_PRICE_WINDOW in price.windows
+    }
+    stored = price_history.decode(raw)
+    merged, stats = price_history.merge_snapshot(
+        stored, prices, mature_days=HISTORY_MATURE_DAYS
+    )
+    persisted = await save_price_history(price_history.encode(merged))
+
+    note = stats.describe(HISTORY_MATURE_DAYS)
+    if not persisted:
+        # На Render файловая система эфемерна: без Upstash накопленное умрёт
+        # на следующем деплое, а деплои частые. Молчать об этом нельзя —
+        # человек будет месяц ждать данных, которых не появится.
+        note += ". ⚠️ сохранено только локально — не переживёт передеплой, нужен UPSTASH_REDIS_REST_URL"
+    return note
+
+
+async def price_history_job(context: ContextTypes.DEFAULT_TYPE):
+    """Суточный срез цен. Одна джоба на процесс: история общая, не по чатам."""
+    try:
+        note = await _take_price_snapshot()
+        log.info("история цен: %s", note)
+    except Exception:
+        log.exception("история цен: срез не удался")
+    finally:
+        context.job_queue.run_once(
+            price_history_job,
+            when=HISTORY_INTERVAL_HOURS * 3600,
+            name=HISTORY_JOB_NAME,
+        )
+
+
 DIPS_JOB_PREFIX = "dips_scan_"
 
 # Порог просадки по умолчанию. Ниже 20% смысла нет: комиссия Steam ~13%, и
@@ -3890,7 +3962,19 @@ async def _run_dips_scan(send, chat_id: int, saved: dict, *, quiet: bool = False
             await send("⚠️ Прайс-лист не скачался — искать просадки не в чем.")
         return
 
-    found, dropped = dips.find_dips(details, min_drop_pct=min_drop)
+    # Накопленная история — то, из чего берётся настоящий минимум и признак
+    # активности. Её отсутствие не мешает искать: отбор идёт по окнам
+    # прайс-листа, история лишь обогащает найденное.
+    try:
+        records = price_history.decode(await get_price_history())
+    except Exception:
+        log.exception("dips: история цен не прочиталась, иду без неё")
+        records = {}
+
+    found, dropped = dips.find_dips(
+        details, min_drop_pct=min_drop,
+        history=records, mature_days=HISTORY_MATURE_DAYS,
+    )
     if not found:
         if not quiet:
             reasons = ", ".join(f"{k}: {v}" for k, v in dropped.items() if v)
@@ -3906,13 +3990,32 @@ async def _run_dips_scan(send, chat_id: int, saved: dict, *, quiet: bool = False
     top = found[:DIPS_VERIFY_LIMIT]
     live_prices = await _live_prices_for(chat_id, [d.market_hash_name for d in top])
 
+    tracked, mature, best_days = price_history.coverage(records, HISTORY_MATURE_DAYS)
+    if mature:
+        history_note = (
+            f"Минимум — настоящий, из собственных суточных срезов "
+            f"({mature} предметов накоплено). «Менялась» — в скольких днях "
+            f"цена сдвинулась: это НЕ число продаж, его взять неоткуда, но "
+            f"неподвижную цену от живой отличает."
+        )
+    elif tracked:
+        history_note = (
+            f"Настоящего минимума пока нет: накоплено {best_days} "
+            f"дн. из {HISTORY_MATURE_DAYS}, срез снимается раз в сутки."
+        )
+    else:
+        history_note = (
+            "Настоящего минимума пока нет: накопление истории только "
+            "началось, первые данные — через сутки."
+        )
+
     lines = [
         f"📉 Просадки от месячной нормы — найдено {len(found)}\n"
         f"<i>Цена сегодня против средней за 30 дней. Это НЕ арбитраж: разрыв "
         f"во времени, а не между площадками — чтобы заработать, цена должна "
         f"вернуться, и она может не вернуться. «Вернётся» — прибыль при "
         f"возврате к норме за вычетом комиссии "
-        f"~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%.</i>"
+        f"~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%.\n{history_note}</i>"
     ]
     shown = []
     evaporated = 0
@@ -3944,9 +4047,28 @@ async def _run_dips_scan(send, chat_id: int, saved: dict, *, quiet: bool = False
 
         gain = (dip.month * STEAM_FEE_MULTIPLIER - price_now) / price_now * 100
         shown.append(dip)
+
+        # Строка про накопленный минимум. Считаем её от price_now, а не от
+        # dip.today: если живая цена есть, «на минимуме» должно относиться
+        # именно к ней — иначе получится тот же разлад между соседними
+        # строками, из-за которого команда звала покупать подорожавшее.
+        extra = ""
+        if dip.low:
+            vs_low = (dip.low - price_now) / dip.low * 100
+            where = (
+                f"на {vs_low:.0f}% ниже него" if vs_low >= 0.1
+                else f"на {-vs_low:.0f}% выше него" if vs_low <= -0.1
+                else "ровно на нём"
+            )
+            extra = (
+                f"\n  минимум за {dip.history_days} дн. ${dip.low:.2f} — сейчас {where}"
+                f"\n  цена менялась в {dip.activity_pct:.0f}% дней"
+            )
+        mark = "🔻 " if dip.low and price_now <= dip.low * 1.001 else ""
+
         lines.append(
-            f"<code>{html_module.escape(dip.market_hash_name)}</code>\n"
-            f"  {now} | неделя ${dip.week:.2f} | месяц ${dip.month:.2f}\n"
+            f"{mark}<code>{html_module.escape(dip.market_hash_name)}</code>\n"
+            f"  {now} | неделя ${dip.week:.2f} | месяц ${dip.month:.2f}{extra}\n"
             f"  дешевле нормы на {drop_pct:.0f}%, при возврате "
             f"{'+' if gain >= 0 else ''}{gain:.0f}% чистыми\n"
             f'  <a href="{dip.steam_url}">Открыть в Steam</a>'
@@ -5160,6 +5282,36 @@ async def _status_lines(chat_id: int, jq) -> list[str]:
         extra = f", наценка ≤{f_markup:g}%" if f_markup is not None else ""
         lines.append(f"  Флоат: ≤{f_lo:g} или ≥{f_hi:g}{extra}")
 
+    # --- Просадки ----------------------------------------------------------
+    # Историю копит один общий процесс, а не чат, и растёт она неделями. Без
+    # этой строки «почему /dips не показывает минимум» никак не выяснить:
+    # снаружи накопление ничем себя не проявляет.
+    lines.append("")
+    lines.append("<b>Просадки (/dips)</b>")
+    dip_settings = await get_dips_settings(chat_id)
+    dip_drop = dip_settings["min_drop"] if dip_settings["min_drop"] is not None else DIPS_DEFAULT_DROP
+    if dip_settings["interval"]:
+        nxt = _next_run_in(jq, f"{DIPS_JOB_PREFIX}{chat_id}")
+        when = f"прогон через {_fmt_mins(nxt)}" if nxt is not None else "прогон не запланирован"
+        lines.append(f"  ▶️ автопрогон раз в {dip_settings['interval']:g} мин, {when}")
+    else:
+        lines.append("  ⏹ автопрогон выключен — /dips 30 60 чтобы включить")
+    lines.append(f"  порог: дешевле месячной нормы на {dip_drop:g}%+")
+    try:
+        records = price_history.decode(await get_price_history())
+    except Exception:
+        records = {}
+    tracked, mature, best_days = price_history.coverage(records, HISTORY_MATURE_DAYS)
+    if mature:
+        lines.append(f"  история цен: минимум готов у {mature} из {tracked} предметов")
+    elif tracked:
+        lines.append(
+            f"  история цен: {tracked} предметов, накоплено {best_days} дн. "
+            f"из {HISTORY_MATURE_DAYS} — минимума ещё нет"
+        )
+    else:
+        lines.append("  история цен: пусто, первый срез — в течение суток")
+
     return lines
 
 
@@ -6357,6 +6509,14 @@ async def _on_startup(app: Application):
         inv_restored += 1
     if inv_restored:
         log.info("inventory: восстановлены джобы слежения для %d чат(ов)", inv_restored)
+
+    # Срез цен — одна джоба на процесс, а не по чатам: история общая. Первый
+    # запуск скоро после старта, чтобы накопление начиналось сразу; повтор от
+    # самого себя, чтобы интервал считался от фактического среза. Лишние срезы
+    # на частых передеплоях отсекает проверка внутри _take_price_snapshot.
+    for job in app.job_queue.get_jobs_by_name(HISTORY_JOB_NAME):
+        job.schedule_removal()
+    app.job_queue.run_once(price_history_job, when=90, name=HISTORY_JOB_NAME)
 
 
 # ---------------------------------------------------------------------------
