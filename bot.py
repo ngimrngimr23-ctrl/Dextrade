@@ -3804,13 +3804,20 @@ async def _collect_market_prices(session):
                     "беру её из прайс-листа",
                     len(items), len(by_market),
                 )
+                with_stock = sum(1 for c in counts.values() if c)
+                # Поля показываем, только если знаем их: на попадании в кэш
+                # last_fields не обновляется, и пустые скобки в сообщении
+                # выглядели бы как «полей нет вовсе».
+                fields = ", ".join(sorted(sih_client.last_fields))
+                shape = f" (поля: {fields})" if fields else ""
                 return (
                     "SIH + прайс-лист",
                     fallback,
                     by_market,
                     counts,
-                    f"ℹ️ SIH не отдаёт цену Steam в get-items, поэтому площадки "
-                    f"({len(by_market)}) от него, а цена Steam из прайс-листа.",
+                    f"ℹ️ SIH отдал {len(items)} предметов, из них с лотами в "
+                    f"наличии {with_stock}. Цену Steam он не отдаёт{shape}, "
+                    f"поэтому она берётся из прайс-листа.",
                 )
             raise sih_client.SihError(
                 f"отдал {len(items)} предметов без цены Steam, а прайс-лист не скачался"

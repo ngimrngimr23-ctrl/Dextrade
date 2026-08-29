@@ -442,6 +442,11 @@ async def check_key(session: aiohttp.ClientSession) -> str:
 _cache: dict[int, tuple[dict[str, SihItem], float]] = {}
 _lock = asyncio.Lock()
 
+# Какие поля пришли в последнем ответе. Замер на проде: color, count, image,
+# phase, price — ни цены Steam, ни названия площадки. Держим на виду, чтобы
+# смена формата у SIH была заметна сразу, а не по молчаливой пропаже находок.
+last_fields: set[str] = set()
+
 
 async def fetch_items(
     session: aiohttp.ClientSession,
@@ -463,15 +468,6 @@ async def fetch_items(
         try:
             payload = await _fetch_items_payload(session, app_id)
             items, skipped, fields = parse_items(payload)
-            if items and not any(i.steam for i in items.values()):
-                # Каталог пришёл, а сравнивать не с чем. Это не «пусто» и не
-                # «сломалось» — это одно конкретное поле под неизвестным
-                # именем, и назвать пришедшие ключи дешевле, чем гадать.
-                raise SihError(
-                    f"отдал {len(items)} предметов, но ни у одного нет цены Steam.\n"
-                    f"Поля в ответе: {', '.join(sorted(fields)) or 'нет'}\n"
-                    f"Искал под именами: {', '.join(_STEAM_FIELDS)}"
-                )
         except Exception as e:
             if cached:
                 age = (time.time() - cached[1]) / 60
@@ -484,6 +480,18 @@ async def fetch_items(
 
         if not items:
             raise SihError("SIH вернул пустой каталог")
+
+        # Отсутствие цены Steam — НЕ повод отказываться от ответа.
+        #
+        # Сначала здесь стоял raise, и это была ошибка: он срабатывал раньше,
+        # чем вызывающий код успевал построить гибрид, то есть блокировал
+        # ровно тот путь, ради которого писался. Замер на проде показал, что
+        # get-items отдаёт всего пять полей — color, count, image, phase,
+        # price — и ни цены Steam, ни названия площадки среди них нет ни при
+        # каких параметрах. Значит это не сбой, а форма ответа, и решать, что
+        # с ней делать, должен вызывающий.
+        global last_fields
+        last_fields = set(fields)
 
         _cache[app_id] = (items, time.time())
         log.info(
@@ -550,6 +558,10 @@ def split_by_market(
         if item.steam:
             steam_prices[name] = item.steam
         counts[name] = item.count
+        # Названия площадки в ответе нет (замер на проде: приходят только
+        # color, count, image, phase, price). Значит price — это лучшее
+        # предложение по всему, что SIH видит, и разложить его по площадкам
+        # нечем. Складываем под одним именем, честно называя источник.
         by_market.setdefault(item.market or "SIH", {})[name] = item.price
 
     return steam_prices, by_market, counts
