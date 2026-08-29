@@ -504,6 +504,16 @@ async def save_extra_proxies(proxies: list[str]) -> None:
 # кэш убирает основную массу запросов.
 STEAM_PRICE_KEY_PREFIX = "steamprice:"
 STEAM_PRICE_TTL_SECONDS = 12 * 60 * 60
+
+# Отдельный, куда более короткий срок для записей БЕЗ объёма продаж.
+#
+# Такая запись — след недоступности priceoverview: цена в ней есть (взята
+# запасным путём из листингов), а ликвидности нет. Пролежав двенадцать часов,
+# она переживает выздоровление эндпоинта и продолжает отвечать «продаж: ?»
+# ещё полсуток после того, как узнать объём стало можно. Ровно это и
+# наблюдалось: живой прокси уже работал, свежий запрос возвращал объём 41, а
+# соседние предметы отвечали из кэша вопросительными знаками.
+STEAM_PRICE_NO_VOLUME_TTL_SECONDS = 30 * 60
 LOCAL_STEAM_PRICES_PATH = Path(__file__).parent / "steam_prices_local.json"
 
 
@@ -540,18 +550,29 @@ async def get_steam_prices_batch(names: list[str]) -> dict[str, dict]:
     out = {}
     for name in names:
         entry = data.get(name)
-        if entry and (now - entry.get("updated_at", 0)) < STEAM_PRICE_TTL_SECONDS:
+        if not entry:
+            continue
+        ttl = (
+            STEAM_PRICE_TTL_SECONDS if entry.get("volume") is not None
+            else STEAM_PRICE_NO_VOLUME_TTL_SECONDS
+        )
+        if (now - entry.get("updated_at", 0)) < ttl:
             out[name] = entry
     return out
 
 
 async def set_steam_price(name: str, price: float, volume: int | None) -> None:
     entry = {"price": price, "volume": volume, "updated_at": time.time()}
+    # Неполную запись держим коротко — см. STEAM_PRICE_NO_VOLUME_TTL_SECONDS.
+    ttl = (
+        STEAM_PRICE_TTL_SECONDS if volume is not None
+        else STEAM_PRICE_NO_VOLUME_TTL_SECONDS
+    )
     if REDIS_ENABLED:
         try:
             await _redis_cmd(
                 "SET", STEAM_PRICE_KEY_PREFIX + name,
-                json.dumps(entry), "EX", str(STEAM_PRICE_TTL_SECONDS),
+                json.dumps(entry), "EX", str(ttl),
             )
             return
         except Exception:

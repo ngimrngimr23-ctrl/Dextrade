@@ -1968,7 +1968,16 @@ async def _verify_against_steam(offers, min_discount_pct: float) -> list:
     # выжигал все адреса пула на полчаса, и второй канал приходил к пустому
     # пулу. Ресурс Steam общий, значит и экономить его надо сообща.
     cached = await get_steam_prices_batch([o.market_hash_name for o in todo])
-    fresh_budget = [o for o in todo if o.market_hash_name not in cached][:STEAM_LIVE_BUDGET]
+    # Как и в /markets: запись без объёма — след недоступности priceoverview,
+    # и держать её за полноценную значит продлевать «продаж: ?» на весь срок
+    # кэша уже после того, как эндпоинт освободился.
+    misses = [o for o in todo if o.market_hash_name not in cached]
+    volumeless = [
+        o for o in todo
+        if o.market_hash_name in cached
+        and cached[o.market_hash_name].get("volume") is None
+    ]
+    fresh_budget = (misses + volumeless)[:STEAM_LIVE_BUDGET]
 
     # Полос столько, сколько выдержит priceoverview, а НЕ сколько адресов в
     # пуле: этот эндпоинт режется жёстче всех, и 46 прокси означали 46
@@ -1991,16 +2000,16 @@ async def _verify_against_steam(offers, min_discount_pct: float) -> list:
 
     async def check(offer, session):
         entry = cached.get(offer.market_hash_name)
-        if entry:
-            return offer, Cached(entry)
+        # Бюджет проверяем ПЕРЕД кэшем: иначе неполная запись навсегда
+        # закрывает предмету дорогу к живому запросу.
         if offer not in fresh_budget:
-            return offer, None
+            return offer, Cached(entry) if entry else None
         async with semaphore:
             try:
                 live = await get_steam_market_price_retrying(session, offer.market_hash_name)
             except Exception:
                 log.info("arb: %s — Steam не ответил", offer.market_hash_name)
-                return offer, None
+                return offer, Cached(entry) if entry else None
             if live and live.lowest:
                 await set_steam_price(offer.market_hash_name, live.lowest, live.volume)
             return offer, live
@@ -3664,7 +3673,19 @@ async def _verify_markets_against_steam(offers, min_discount_pct: float, min_vol
     # от прогона к прогону повторяются.
     cached = await get_steam_prices_batch([o.market_hash_name for o in offers])
     misses = [o for o in offers if o.market_hash_name not in cached]
-    fresh_budget = misses[:STEAM_LIVE_BUDGET]
+
+    # Записи БЕЗ объёма продаж — следы недоступности priceoverview: цена в них
+    # есть, а ликвидности нет. Ставим их в очередь на живой запрос сразу за
+    # настоящими промахами, иначе «продаж: ?» переживает выздоровление
+    # эндпоинта. Наблюдалось ровно это: рабочий прокси уже стоял, свежий
+    # запрос возвращал объём 41, а соседние предметы отвечали из кэша
+    # вопросительными знаками — потому что кэш их короткого пути не отличал.
+    volumeless = [
+        o for o in offers
+        if o.market_hash_name in cached
+        and cached[o.market_hash_name].get("volume") is None
+    ]
+    fresh_budget = (misses + volumeless)[:STEAM_LIVE_BUDGET]
 
     # Полос столько, сколько выдержит priceoverview, а НЕ сколько адресов в
     # пуле: этот эндпоинт режется жёстче всех, и 46 прокси означали 46
@@ -3684,10 +3705,11 @@ async def _verify_markets_against_steam(offers, min_discount_pct: float, min_vol
 
     async def check(offer, session):
         entry = cached.get(offer.market_hash_name)
-        if entry:
-            return offer, Cached(entry)
+        # Порядок важен: бюджет проверяем ПЕРЕД кэшем. Раньше кэш срабатывал
+        # первым, и запись без объёма навсегда закрывала предмету дорогу к
+        # живому запросу — попасть в бюджет он мог, а воспользоваться им нет.
         if offer not in fresh_budget:
-            return offer, None
+            return offer, Cached(entry) if entry else None
         async with semaphore:
             try:
                 live = await get_steam_market_price_retrying(session, offer.market_hash_name)
@@ -3695,7 +3717,9 @@ async def _verify_markets_against_steam(offers, min_discount_pct: float, min_vol
                 # Не .exception(): при выжженном пуле это десятки одинаковых
                 # трейсбеков подряд, из-за которых настоящие ошибки не найти.
                 log.info("markets: %s — Steam не ответил", offer.market_hash_name)
-                return offer, None
+                # Живой запрос не вышел — отдаём хотя бы кэш, если он был:
+                # неполная запись всё же лучше выброшенной находки.
+                return offer, Cached(entry) if entry else None
             if live and live.lowest:
                 await set_steam_price(offer.market_hash_name, live.lowest, live.volume)
             return offer, live
