@@ -3775,6 +3775,44 @@ class MarketsUnavailable(Exception):
     """Цены площадок не собрались. Текст уходит пользователю как есть."""
 
 
+async def _fresh_steam_prices(session) -> dict[str, float]:
+    """
+    Цены Steam ТОЛЬКО из суточного окна прайс-листа.
+
+    Раньше здесь был get_csgotrader_prices, который берёт самое свежее
+    непустое окно с откатом на недельное, месячное и даже квартальное. Живой
+    прогон 2026-08-29 показал, чем это кончается: из 32077 цен только 17678
+    были суточными, а 14399 — старше, вплоть до 90 дней. Именно они и давали
+    «находки» вида
+
+        Sticker Slab | Lucky (Gold): оценка $49.99, Steam на самом деле $16.30
+        Sticker Slab | m0NESY (Gold): оценка $87.21, Steam на самом деле $30.95
+
+    Отношение 2-3x, ровно то, которое мы месяц считали дефектом единиц. Это не
+    единицы — это скины, подешевевшие за квартал, с ценником трёхмесячной
+    давности. Каждый такой предмет выглядит огромной скидкой и съедает бюджет
+    живых проверок.
+
+    Отсекать по возрасту окна правильнее, чем по величине скидки: предмет без
+    единой продажи за сутки всё равно не перепродать, то есть находкой он быть
+    не может по определению. Заодно та же логика, что и в арбитраже
+    (ARB_PRICE_WINDOW) — раньше два канала мерили цену по-разному.
+    """
+    details = await get_csgotrader_price_details(session)
+    if not details:
+        return {}
+    fresh = {
+        name: price.windows[ARB_PRICE_WINDOW]
+        for name, price in details.items()
+        if ARB_PRICE_WINDOW in price.windows
+    }
+    log.info(
+        "markets: цен с суточным окном %d из %d (остальные старше и в отбор не идут)",
+        len(fresh), len(details),
+    )
+    return fresh
+
+
 class PriceSources(NamedTuple):
     """
     Что собрали для сравнения. Именованной структурой, а не кортежем из шести
@@ -3858,7 +3896,7 @@ async def _collect_market_prices(session, max_age: float | None = None):
             # а разрешить его было нечем. Сейчас нечего опасаться — прайс-лист
             # проверен живым Steam (/pricecheck, медиана x1.13 = ширина
             # стакана), то есть известно, что он не врёт.
-            fallback = await get_csgotrader_prices(session)
+            fallback = await _fresh_steam_prices(session)
             if fallback:
                 log.info(
                     "markets: SIH дал %d предметов на %d площадках без цены Steam — "
@@ -3906,7 +3944,7 @@ async def _collect_market_prices(session, max_age: float | None = None):
     else:
         note = ""
 
-    steam_prices = await get_csgotrader_prices(session)
+    steam_prices = await _fresh_steam_prices(session)
     if not steam_prices:
         raise MarketsUnavailable("Прайс-лист Steam не скачался — сравнивать не с чем.")
     by_market = await market_prices.load_markets(session)

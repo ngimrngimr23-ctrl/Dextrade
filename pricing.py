@@ -811,11 +811,21 @@ async def get_steam_market_price(
     if not data or not data.get("success"):
         return None
 
-    volume = None
+    # Успешный ответ БЕЗ поля volume означает «за сутки не продано ничего», а
+    # не «мы не знаем». Steam просто не кладёт volume, когда сделок не было.
+    #
+    # Раньше здесь стоял None, и он был неотличим от «спросить не удалось».
+    # Последствие серьёзнее, чем вопросительный знак в сообщении: фильтр
+    # ликвидности написан как `volume is not None and volume < min_volume`,
+    # то есть неизвестное он намеренно пропускает. Значит предметы, у которых
+    # НУЛЬ продаж за сутки, проходили отбор — при том что это худшая из
+    # возможных находок: перепродать её нельзя вовсе.
+    volume = 0
     if data.get("volume"):
         try:
             volume = int(str(data["volume"]).replace(",", "").replace(" ", ""))
         except ValueError:
+            # Поле есть, но разобрать не вышло — вот это и правда «не знаем».
             volume = None
 
     return SteamMarketPrice(
