@@ -959,11 +959,11 @@ async def setfloatfilter(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if low is None or high is None:
             await update.message.reply_text(
                 "Фильтр флоата не задан — флоат не проверяется вообще (лишних запросов не тратим).\n\n"
-                "Формат: /setfloatfilter <низкий> <высокий>\nПример: /setfloatfilter 0.01 0.99 "
+                "Формат: /float порог <низкий> <высокий>\nПример: /float порог 0.01 0.99 "
                 "(поймает почти идеальный Factory New и предельно убитый Battle-Scarred)\n"
                 f"Проверяются все лоты на предмет (до {FLOAT_CHECK_TOP_N}, сколько Steam вообще отдаёт "
                 "за раз) — декодирование локальное, без сетевых запросов.\n"
-                "/setfloatfilter off — убрать фильтр"
+                "/float порог убрать — убрать фильтр"
             )
         else:
             await update.message.reply_text(
@@ -979,7 +979,7 @@ async def setfloatfilter(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if len(args) < 2:
         await update.message.reply_text(
-            "Нужны оба значения. Формат: /setfloatfilter <низкий> <высокий>, или /setfloatfilter off"
+            "Нужны оба значения. Формат: /float порог <низкий> <высокий>, или /float порог убрать"
         )
         return
 
@@ -987,7 +987,7 @@ async def setfloatfilter(update: Update, context: ContextTypes.DEFAULT_TYPE):
         low = float(args[0])
         high = float(args[1])
     except ValueError:
-        await update.message.reply_text("Оба значения должны быть числами от 0 до 1. Пример: /setfloatfilter 0.01 0.99")
+        await update.message.reply_text("Оба значения должны быть числами от 0 до 1. Пример: /float порог 0.01 0.99")
         return
 
     if not (0.0 <= low <= 1.0 and 0.0 <= high <= 1.0):
@@ -1020,10 +1020,10 @@ async def setfloatmarkup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if pct is None:
             await update.message.reply_text(
                 "Порог наценки для флоат-находок не задан — подходит любая цена.\n\n"
-                "Формат: /setfloatmarkup <макс%>\nПример: /setfloatmarkup 15 — показывать находку, "
+                "Формат: /float наценка <макс%>\nПример: /float наценка 15 — показывать находку, "
                 "только если её цена не больше чем на 15% выше самого дешёвого лота этого предмета "
                 "(иначе продавец уже знает о редком флоате и заложил его в цену).\n"
-                "/setfloatmarkup off — убрать ограничение"
+                "/float наценка убрать — убрать ограничение"
             )
         else:
             await update.message.reply_text(f"Текущий порог наценки для флоат-находок: ≤{pct:g}%.")
@@ -1037,7 +1037,7 @@ async def setfloatmarkup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         pct = float(args[0])
     except ValueError:
-        await update.message.reply_text("Значение должно быть числом. Пример: /setfloatmarkup 15")
+        await update.message.reply_text("Значение должно быть числом. Пример: /float наценка 15")
         return
 
     if pct < 0:
@@ -1429,7 +1429,7 @@ async def floatadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         low, high = await get_float_filter(chat_id)
         hint = (
             "\n\n⚠️ Порог флоата пока не задан — без него охота не идёт. "
-            "Задай: /start → Пороги → Флоат"
+            "Задай: /float порог 0.01 0.99, или /start → Пороги → Флоат"
             if low is None or high is None else ""
         )
         await update.message.reply_text(
@@ -1488,7 +1488,7 @@ async def floatadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     low, high = await get_float_filter(chat_id)
     if low is None or high is None:
-        lines.append("⚠️ Порог флоата не задан — охота не пойдёт. Задай: /start → Пороги → Флоат")
+        lines.append("⚠️ Порог флоата не задан — охота не пойдёт. Задай: /float порог 0.01 0.99")
     lines.append(f"Всего в списке флоата: {len(current)}.")
     await update.message.reply_text("\n\n".join(lines))
 
@@ -1538,22 +1538,65 @@ async def floatclear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Список флоата очищен — удалено {len(current)} предмет(ов).")
 
 
+def _float_settings_block(low, high, markup) -> str:
+    """
+    Памятка по настройке флоата — то, что показывает голый /float.
+
+    Пороги флоата раньше жили только в меню (/start → Пороги → Флоат), и это
+    была ровно та ловушка, ради которой команды и объединяли: человек набирает
+    /float, видит список и условие отбора — и не видит ни одного способа это
+    условие поменять. Ссылка на меню помогала мало: путь из трёх шагов к тому,
+    что рядом нужно набрать один раз. Кнопки в меню никуда не делись, здесь
+    просто второй путь, короткий.
+
+    Текущие значения подставляем в примеры: «/float порог 0.01 0.99» понятнее
+    любого описания, а с уже своими числами ещё и безопаснее — видно, что
+    именно изменится.
+    """
+    if low is None or high is None:
+        threshold_example = "/float порог 0.01 0.99"
+        threshold_hint = " — какой флоат считать редким (сейчас не задан, охота не идёт)"
+    else:
+        threshold_example = f"/float порог {low:g} {high:g}"
+        threshold_hint = " — какой флоат считать редким"
+
+    markup_example = f"/float наценка {markup:g}" if markup is not None else "/float наценка 15"
+    markup_hint = (
+        " — насколько дороже самого дешёвого лота находка ещё интересна"
+        if markup is not None else
+        " — то же, но пока без ограничения: подходит любая цена"
+    )
+
+    return (
+        "<b>Настройка</b>\n"
+        f"{threshold_example}{threshold_hint}\n"
+        f"{markup_example}{markup_hint}\n"
+        "/float порог убрать — выключить охоту совсем\n\n"
+        "<b>Список</b>\n"
+        "/float &lt;предмет&gt; — добавить · /float -2 — убрать второй · /float очистить\n\n"
+        "<b>Разово</b>\n"
+        "/float чек &lt;предмет&gt; — платят ли вообще за редкий флоат на этом скине"
+    )
+
+
 async def floatlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/floatlist — показать список предметов, по которым ищется редкий флоат."""
+    """/floatlist — список охоты за флоатом, условие отбора и как его менять."""
     chat_id = update.effective_chat.id
     items = await get_float_watchlist(chat_id)
     low, high = await get_float_filter(chat_id)
     markup = await get_float_markup(chat_id)
+    settings = _float_settings_block(low, high, markup)
 
     if not items:
         await update.message.reply_text(
-            "Список охоты за флоатом пуст — флоат сейчас не ищется ни по одному предмету.\n"
-            "Добавить: /float <предмет>"
+            "Список охоты за флоатом пуст — флоат сейчас не ищется ни по одному "
+            "предмету.\n\n" + settings,
+            parse_mode="HTML",
         )
         return
 
     if low is None or high is None:
-        threshold = "⚠️ порог не задан (/start → Пороги → Флоат) — охота не идёт"
+        threshold = "⚠️ порог не задан — охота не идёт"
     else:
         threshold = f"флоат ≤{low:g} или ≥{high:g}"
         if markup is not None:
@@ -1564,6 +1607,9 @@ async def floatlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{i}. {name}")
     for chunk in _chunk_lines(lines):
         await update.message.reply_text(chunk)
+    # Отдельным сообщением, а не хвостом списка: список бывает длинным и
+    # режется на куски, и памятка уехала бы в середину или потерялась в конце.
+    await update.message.reply_text(settings, parse_mode="HTML")
 
 
 _FLOAT_ACTIONS = {
@@ -1571,15 +1617,27 @@ _FLOAT_ACTIONS = {
     "убрать": "del", "удалить": "del", "del": "del", "-": "del",
     "очистить": "clear", "очисти": "clear", "clear": "clear",
     "чек": "check", "check": "check", "проверь": "check", "проверить": "check",
+    # Настройка отбора. Раньше жила только в меню, а команды setfloatfilter и
+    # setfloatmarkup остались доживать как старые имена — то есть настроить
+    # флоат из той же команды, где им пользуешься, было нельзя.
+    "порог": "filter", "пороги": "filter", "фильтр": "filter", "filter": "filter",
+    "наценка": "markup", "markup": "markup",
 }
+
+# Слова, которыми выключают порог. Подкоманда /float порог убрать понятнее,
+# чем «off» из setfloatfilter, но старое написание тоже принимаем: у него уже
+# есть мышечная память.
+_FLOAT_OFF_WORDS = {"убрать", "off", "выключить", "сброс", "нет", "-"}
 
 
 async def float_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /float                        — список охоты за флоатом и условие отбора
+    /float                        — список охоты, условие отбора и как его менять
     /float <предмет1>, <...>      — добавить предметы
     /float -2                     — убрать второй (можно «/float убрать 2»)
     /float очистить               — очистить список
+    /float порог 0.01 0.99        — какой флоат считать редким
+    /float наценка 15             — насколько дороже дешёвого лота ещё интересно
     /float чек <предмет> [флоат]  — платят ли за низкий флоат на этом скине
 
     «чек» — единственное тут, что не про список: это разовый разбор одного
@@ -1607,6 +1665,15 @@ async def float_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await floatclear(update, _SubCtx(context, args[1:]))
     if action == "check":
         return await floatcheck(update, _SubCtx(context, args[1:]))
+    if action in ("filter", "markup"):
+        rest = args[1:]
+        # «убрать» переводим в «off»: подкоманды говорят по-русски, а
+        # setfloatfilter/setfloatmarkup — старые команды со своим словарём, и
+        # переучивать их незачем.
+        if rest and rest[0].lower() in _FLOAT_OFF_WORDS:
+            rest = ["off"]
+        handler = setfloatfilter if action == "filter" else setfloatmarkup
+        return await handler(update, _SubCtx(context, rest))
 
     return await floatadd(update, context)
 
@@ -5362,7 +5429,7 @@ async def _status_lines(chat_id: int, jq) -> list[str]:
         hi = f"${p_hi:.2f}" if p_hi is not None else "—"
         lines.append(f"  Цена лота: {lo} … {hi}")
     if f_lo is None or f_hi is None:
-        lines.append("  Флоат: ⚠️ порог не задан — охота за флоатом не идёт (/start → Пороги → Флоат)")
+        lines.append("  Флоат: ⚠️ порог не задан — охота за флоатом не идёт (/float порог 0.01 0.99)")
     else:
         extra = f", наценка ≤{f_markup:g}%" if f_markup is not None else ""
         lines.append(f"  Флоат: ≤{f_lo:g} или ≥{f_hi:g}{extra}")
@@ -6364,9 +6431,14 @@ COMMANDS: tuple[Command, ...] = (
     Command(
         "float", float_cmd, "Списки",
         "Флоат: список и проверка скина",
-        "/float — список охоты за редким флоатом и условие отбора\n"
+        "/float — список охоты за редким флоатом, условие отбора и памятка "
+        "по его настройке\n"
         "/float <предмет1>, <предмет2> — добавить\n"
         "/float -2 — убрать второй, /float очистить — очистить\n"
+        "/float порог 0.01 0.99 — какой флоат считать редким "
+        "(/float порог убрать — выключить охоту)\n"
+        "/float наценка 15 — насколько дороже самого дешёвого лота находка ещё "
+        "интересна\n"
         "/float чек <предмет> [флоат] — платят ли за низкий флоат именно на "
         "этом скине\n"
         "Список отдельный от /watch: флоат имеет смысл искать на конкретных "
