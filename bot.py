@@ -3915,23 +3915,53 @@ async def _run_dips_scan(send, chat_id: int, saved: dict, *, quiet: bool = False
         f"~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%.</i>"
     ]
     shown = []
-    for dip in top[:15]:
+    evaporated = 0
+    for dip in top:
+        if len(shown) >= 15:
+            break
         live = live_prices.get(dip.market_hash_name)
-        gain = dip.recovery_gain_pct(STEAM_FEE_MULTIPLIER)
+
         if live:
-            # Живая цена есть — пересчитываем просадку по ней, это честнее.
-            actual_drop = (dip.month - live) / dip.month * 100
-            now = f"<b>сейчас ${live:.2f}</b> (просадка {actual_drop:.0f}%)"
+            # Живая цена есть — она и есть цена. Пересчитываем по ней ВСЁ:
+            # и просадку, и прибыль при возврате.
+            #
+            # Раньше пересчитывалась только просадка, а прибыль оставалась
+            # посчитанной по суточной средней — соседние строки противоречили
+            # друг другу. Хуже того, находка показывалась даже когда просадка
+            # уходила в минус: предмет успел подорожать, а бот всё равно звал
+            # его покупать. Именно это и заметно снаружи как «присылает те,
+            # что дороже».
+            price_now = live
+            drop_pct = (dip.month - live) / dip.month * 100
+            if drop_pct < min_drop:
+                evaporated += 1
+                continue
+            now = f"<b>сейчас ${live:.2f}</b>"
         else:
+            price_now = dip.today
+            drop_pct = dip.drop_pct
             now = f"сутки ${dip.today:.2f} <i>(оценка)</i>"
+
+        gain = (dip.month * STEAM_FEE_MULTIPLIER - price_now) / price_now * 100
         shown.append(dip)
         lines.append(
             f"<code>{html_module.escape(dip.market_hash_name)}</code>\n"
             f"  {now} | неделя ${dip.week:.2f} | месяц ${dip.month:.2f}\n"
-            f"  просадка от нормы {dip.drop_pct:.0f}%, при возврате "
+            f"  дешевле нормы на {drop_pct:.0f}%, при возврате "
             f"{'+' if gain >= 0 else ''}{gain:.0f}% чистыми\n"
             f'  <a href="{dip.steam_url}">Открыть в Steam</a>'
         )
+
+    if not shown:
+        if not quiet:
+            await send(
+                f"Кандидатов было {len(found)}, но живая цена не подтвердила ни "
+                f"одного: к моменту проверки просадка уже закрылась.\n"
+                f"Отбор идёт по средней за сутки, а она отстаёт от текущей цены."
+            )
+        return
+    if evaporated:
+        log.info("dips: %d кандидатов отсеяно живой ценой — просадка закрылась", evaporated)
 
     if quiet:
         keys = [_dip_key(d) for d in shown]

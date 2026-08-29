@@ -368,9 +368,16 @@ async def _download_csgotrader_prices(session: aiohttp.ClientSession) -> dict[st
 
     details: dict[str, dict] = {}
     by_window: dict[str, int] = {}
+    # Какие поля вообще есть в записи. Спрашивают, например, про число продаж
+    # за неделю или месяц — а есть ли оно в файле, из документации не следует
+    # (её нет). Тот же приём, что помог с SIH: не гадать, а показать, что
+    # реально пришло. Стоит один проход по первым записям.
+    seen_fields: set[str] = set()
     for name, entry in raw.items():
         if not isinstance(entry, dict):
             continue
+        if len(seen_fields) < 40:
+            seen_fields.update(entry.keys())
         windows = _collect_windows(entry)
         picked = _steam_price_from_windows(windows)
         if picked is not None:
@@ -381,6 +388,11 @@ async def _download_csgotrader_prices(session: aiohttp.ClientSession) -> dict[st
         "csgotrader: получено %s цен из %s записей в файле. Свежесть цены по окнам: %s",
         len(details), len(raw),
         ", ".join(f"{w} {by_window.get(w, 0)}" for w in CSGOTRADER_WINDOWS),
+    )
+    log.info(
+        "csgotrader: поля в записи предмета — %s (используем только %s)",
+        ", ".join(sorted(seen_fields)) or "нет",
+        ", ".join(CSGOTRADER_WINDOWS),
     )
     return details
 
