@@ -225,10 +225,25 @@ _STAT_WINDOWS = (("1мин", 60), ("5мин", 300), ("15мин", 900), ("60ми�
 # нужна монотонная величина, которую можно снять до прогона и после и вычесть.
 _request_totals: dict[str, int] = {}
 
+# Сколько раз пришлось сменить адрес из-за 429 и повторить ту же страницу.
+# Считается отдельно от запросов: такой повтор стоит вдвойне — и лишний запрос,
+# и выбитый из пула на LISTINGS_PROXY_COOLDOWN адрес, из-за чего у оставшихся
+# полос растёт нагрузка и вероятность следующего 429.
+_retry_totals: dict[str, int] = {}
+
 
 def request_totals() -> dict[str, int]:
     """Накопленное число запросов по областям. Только растёт, не обнуляется."""
     return dict(_request_totals)
+
+
+def retry_totals() -> dict[str, int]:
+    """Накопленное число повторов по причинам. Только растёт."""
+    return dict(_retry_totals)
+
+
+def note_retry(reason: str) -> None:
+    _retry_totals[reason] = _retry_totals.get(reason, 0) + 1
 
 
 def _record_steam_request(scope: str) -> None:
@@ -784,6 +799,7 @@ async def fetch_all_listings(
                     STEAM_POOL.mark_refused(route, LISTINGS_PROXY_COOLDOWN, f"HTTP 403: {e}")
                 else:
                     STEAM_POOL.mark_exhausted(route, LISTINGS_PROXY_COOLDOWN, f"ошибка соединения: {e}")
+            note_retry("транспорт")
             next_route = STEAM_POOL.next() if attempts_left > 0 else None
             if next_route:
                 attempts_left -= 1
@@ -819,6 +835,7 @@ async def fetch_all_listings(
                 # Раньше этой ветки не было вовсе: 429 обрывал весь скан и
                 # ставил кулдаун на 30 минут с удвоением до шести часов,
                 # хотя в пуле стояли свободные адреса.
+                note_retry("429")
                 if route:
                     STEAM_POOL.mark_exhausted(route, LISTINGS_PROXY_COOLDOWN, "Steam 429")
                 next_route = STEAM_POOL.next() if attempts_left > 0 else None

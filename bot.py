@@ -81,6 +81,7 @@ from steam_client import (
     load_persisted_cooldown,
     take_throttle_wait,
     request_totals as steam_request_totals,
+    retry_totals as steam_retry_totals,
     reset_cooldown as steam_reset_cooldown,
 )
 from csgo_api import search_items as search_csgo_items
@@ -1901,6 +1902,8 @@ class WatchlistScanReport(NamedTuple):
     workers: int = 0
     interval: float = 0.0
     throttle: float = 0.0
+    lanes: int = 0
+    retries: dict = None
 
 
 async def _run_watchlist_scan(
@@ -1951,6 +1954,7 @@ async def _run_watchlist_scan(
         # половину кода ради замера.
         steam_before = steam_request_totals()
         redis_before = redis_call_total()
+        retries_before = steam_retry_totals()
 
         queue: asyncio.Queue = asyncio.Queue()
         for entry in scan_plan:
@@ -2003,6 +2007,12 @@ async def _run_watchlist_scan(
         stats.count("sticker_requests",
                     steam_after.get("pricing", 0) - steam_before.get("pricing", 0))
         stats.count("redis_calls", redis_call_total() - redis_before)
+        retries_after = steam_retry_totals()
+        run_retries = {
+            k: retries_after.get(k, 0) - retries_before.get(k, 0)
+            for k in set(retries_after) | set(retries_before)
+        }
+        run_retries = {k: v for k, v in run_retries.items() if v}
         log.info(
             "watchlist: chat_id=%s прогон за %.1f с — предметов %d (ошибок %d), полос %d, пауза %.1f с. "
             "Суммарно по фазам (идут внахлёст): Steam %.1f с (из них троттлинг %.1f с), "
@@ -2023,6 +2033,9 @@ async def _run_watchlist_scan(
             found_any=found_any, items=stats.items, profile=stats, wall=elapsed,
             workers=workers, throttle=throttle_wait,
             interval=request_interval if request_interval is not None else MIN_REQUEST_INTERVAL,
+            # Прямой адрес плюс пул: столько исходящих полос было доступно, и
+            # именно между ними делится пауза троттлинга.
+            lanes=len(STEAM_POOL) + 1, retries=run_retries,
         )
     finally:
         _watchlist_running.discard(chat_id)
@@ -5249,6 +5262,7 @@ async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = report.profile.render(
             wall=report.wall, workers=report.workers,
             interval=report.interval, throttle=report.throttle,
+            lanes=report.lanes, retries=report.retries,
         )
         for chunk in _chunk_lines(text.split("\n")):
             try:
