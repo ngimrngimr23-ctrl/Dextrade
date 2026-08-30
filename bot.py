@@ -80,6 +80,7 @@ from steam_client import (
     blocking_cooldown,
     load_persisted_cooldown,
     take_throttle_wait,
+    request_totals as steam_request_totals,
     reset_cooldown as steam_reset_cooldown,
 )
 from csgo_api import search_items as search_csgo_items
@@ -135,6 +136,7 @@ from storage import (
     get_dips_settings,
     set_dips_setting,
     get_price_history,
+    redis_call_total,
     save_price_history,
     get_steam_prices_batch,
     set_steam_price,
@@ -157,6 +159,7 @@ import menu
 import pricing
 import dips
 import price_history
+import scan_profile
 import proxy_pool
 import sih_client
 from csfloat_client import CSFloatError, CSFloatRateLimited
@@ -674,6 +677,7 @@ async def _compute_offers(
     check_stickers: bool = True,
     check_floats: bool = True,
     settings: ScanSettings | None = None,
+    profile=None,
 ):
     """
     Общая логика для /scan, /scanfile и автоскана вотчлиста: цены стикеров -> офферы.
@@ -696,43 +700,47 @@ async def _compute_offers(
     float_low, float_high = settings.float_low, settings.float_high
     float_markup = settings.float_markup
 
+    # Ключи собираем множеством: один и тот же стикер на десяти лотах стоит
+    # одного поиска цены, а не десяти.
     all_sticker_keys = {s for l in listings for s in l.stickers}
-    sticker_prices = await get_sticker_prices(all_sticker_keys) if all_sticker_keys else {}
+    with scan_profile.Phase(profile, "stickers"):
+        sticker_prices = await get_sticker_prices(all_sticker_keys) if all_sticker_keys else {}
 
     # Флоат для ОХОТЫ (фильтр) считаем только когда фильтр задан и предмет за
     # этим следит — незачем декодировать все лоты, если результат никому не
     # нужен. А вот показать флоат на уже отобранных по стикерам офферах можно
     # всегда: декодирование локальное, сетевых запросов не делает, и офферов
     # обычно единицы.
-    float_offers = []
-    if check_floats and float_low is not None and float_high is not None and listings:
-        top_floats = _decode_floats(listings, limit=FLOAT_CHECK_TOP_N)
-        if top_floats:
-            float_offers = find_float_offers(
-                listings, top_floats, float_low, float_high,
-                max_markup_pct=float_markup,
-                float_low_min=settings.float_low_min if settings.float_low_min is not None else 0.0,
-                float_high_max=settings.float_high_max if settings.float_high_max is not None else 1.0,
+    with scan_profile.Phase(profile, "analysis"):
+        float_offers = []
+        if check_floats and float_low is not None and float_high is not None and listings:
+            top_floats = _decode_floats(listings, limit=FLOAT_CHECK_TOP_N)
+            if top_floats:
+                float_offers = find_float_offers(
+                    listings, top_floats, float_low, float_high,
+                    max_markup_pct=float_markup,
+                    float_low_min=settings.float_low_min if settings.float_low_min is not None else 0.0,
+                    float_high_max=settings.float_high_max if settings.float_high_max is not None else 1.0,
+                )
+
+        offers = []
+        if check_stickers:
+            offers = find_offers(
+                listings, sticker_prices, min_value, max_markup,
+                streak_max_markup_pct=streak_markup, min_price=min_price, max_price=max_price,
+                min_sticker_ratio=sticker_ratio,
             )
+        if offers:
+            matched_links = {o.inspect_link for o in offers if o.inspect_link}
+            sticker_floats = _decode_floats([l for l in listings if l.inspect_link in matched_links])
+            for offer in offers:
+                if offer.inspect_link:
+                    offer.float_value = sticker_floats.get(offer.inspect_link)
 
-    offers = []
-    if check_stickers:
-        offers = find_offers(
-            listings, sticker_prices, min_value, max_markup,
-            streak_max_markup_pct=streak_markup, min_price=min_price, max_price=max_price,
-            min_sticker_ratio=sticker_ratio,
-        )
-    if offers:
-        matched_links = {o.inspect_link for o in offers if o.inspect_link}
-        sticker_floats = _decode_floats([l for l in listings if l.inspect_link in matched_links])
-        for offer in offers:
-            if offer.inspect_link:
-                offer.float_value = sticker_floats.get(offer.inspect_link)
-
-    # Лот мог подойти сразу по обоим критериям — показываем его один раз,
-    # как стикерный оффер (там больше данных, и флоат теперь тоже виден).
-    seen_links = {o.inspect_link for o in offers if o.inspect_link}
-    float_offers = [o for o in float_offers if o.inspect_link not in seen_links]
+        # Лот мог подойти сразу по обоим критериям — показываем его один раз,
+        # как стикерный оффер (там больше данных, и флоат теперь тоже виден).
+        seen_links = {o.inspect_link for o in offers if o.inspect_link}
+        float_offers = [o for o in float_offers if o.inspect_link not in seen_links]
 
     return offers + float_offers, sticker_prices
 
@@ -1800,22 +1808,9 @@ def _offer_key(market_hash_name: str, offer: Offer) -> str:
     return hashlib.sha1(basis.encode("utf-8")).hexdigest()
 
 
-class _ScanStats:
-    """
-    Разбивка времени прогона по фазам — чтобы оптимизировать по замеру, а не
-    по ощущениям. Суммы считаются по всем предметам, поэтому при параллельной
-    обработке они БОЛЬШЕ реального времени прогона: это нормально и как раз
-    показывает, сколько удалось наложить друг на друга.
-    """
-
-    __slots__ = ("steam", "compute", "send", "items", "failed")
-
-    def __init__(self) -> None:
-        self.steam = 0.0    # запрос листингов: пауза троттлинга + сеть
-        self.compute = 0.0  # цены стикеров, отбор офферов, дедуп (Upstash + CPU)
-        self.send = 0.0     # отправка сообщений в Telegram
-        self.items = 0
-        self.failed = 0
+# Замер прогона живёт в scan_profile — там же объяснено, почему суммы по фазам
+# больше реального времени и почему счётчики операций важнее секунд.
+_ScanStats = scan_profile.ScanProfile
 
 
 async def _watchlist_scan_item(
@@ -1844,39 +1839,45 @@ async def _watchlist_scan_item(
     except Exception as e:
         log.warning("watchlist: %s (chat_id=%s): %s", market_hash_name, chat_id, e)
         if stats is not None:
-            stats.steam += time.perf_counter() - t0
-            stats.failed += 1
+            stats.add("steam", time.perf_counter() - t0)
+            stats.count("failed")
         return False
 
-    t1 = time.perf_counter()
+    if stats is not None:
+        stats.add("steam", time.perf_counter() - t0)
+        stats.count("listings", len(listings))
+        stats.count("with_stickers", sum(1 for l in listings if l.stickers))
+
     offers, sticker_prices = await _compute_offers(
         chat_id, listings, min_value, max_markup,
         check_stickers=check_stickers, check_floats=check_floats,
-        settings=settings,
+        settings=settings, profile=stats,
     )
 
     new_offers: list = []
     if offers:
         keys = [_offer_key(market_hash_name, o) for o in offers]
         # Одним запросом на весь лот, а не по запросу на каждый оффер.
-        is_new = await filter_new_offers(chat_id, keys)
+        with scan_profile.Phase(stats, "dedup"):
+            is_new = await filter_new_offers(chat_id, keys)
         new_offers = [o for o, fresh in zip(offers, is_new) if fresh]
 
-    t2 = time.perf_counter()
     sent = False
-    if new_offers:
-        chunks = _format_offers_chunks(new_offers, sticker_prices, market_hash_name)
-        chunks[0] = f"🔔 {html_module.escape(market_hash_name)}\n\n{chunks[0]}"
-        for chunk in chunks:
-            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML", disable_web_page_preview=True)
-        await mark_offers_sent(chat_id, [_offer_key(market_hash_name, o) for o in new_offers])
-        sent = True
+    with scan_profile.Phase(stats, "send"):
+        if new_offers:
+            chunks = _format_offers_chunks(new_offers, sticker_prices, market_hash_name)
+            chunks[0] = f"🔔 {html_module.escape(market_hash_name)}\n\n{chunks[0]}"
+            for chunk in chunks:
+                await bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML", disable_web_page_preview=True)
+            await mark_offers_sent(chat_id, [_offer_key(market_hash_name, o) for o in new_offers])
+            sent = True
 
     if stats is not None:
-        stats.steam += t1 - t0
-        stats.compute += t2 - t1
-        stats.send += time.perf_counter() - t2
-        stats.items += 1
+        stats.count("offers", len(offers))
+        stats.count("fresh", len(new_offers))
+        if sent:
+            stats.count("sent")
+        stats.count("items")
 
     # Пусто — молчим: автоскан идёт постоянно, и сообщение «ничего не нашлось»
     # на каждый предмет превратило бы его в спам.
@@ -1893,6 +1894,13 @@ class WatchlistScanReport(NamedTuple):
 
     found_any: bool
     items: int
+    # Профиль прогона. Нужен /scanall профиль, чтобы показать разбивку в чат;
+    # обычному отчёту «Готово» он не мешает — тот его просто не читает.
+    profile: object = None
+    wall: float = 0.0
+    workers: int = 0
+    interval: float = 0.0
+    throttle: float = 0.0
 
 
 async def _run_watchlist_scan(
@@ -1938,6 +1946,11 @@ async def _run_watchlist_scan(
         stats = _ScanStats()
         started = time.perf_counter()
         take_throttle_wait()  # обнуляем счётчик пауз перед прогоном
+        # Внешние вызовы считаем разностью монотонных счётчиков: точек выхода в
+        # сеть много, и протаскивать профайлер в каждую значило бы переписать
+        # половину кода ради замера.
+        steam_before = steam_request_totals()
+        redis_before = redis_call_total()
 
         queue: asyncio.Queue = asyncio.Queue()
         for entry in scan_plan:
@@ -1984,6 +1997,12 @@ async def _run_watchlist_scan(
 
         elapsed = time.perf_counter() - started
         throttle_wait = take_throttle_wait()
+        steam_after = steam_request_totals()
+        stats.count("steam_requests",
+                    steam_after.get("listings", 0) - steam_before.get("listings", 0))
+        stats.count("sticker_requests",
+                    steam_after.get("pricing", 0) - steam_before.get("pricing", 0))
+        stats.count("redis_calls", redis_call_total() - redis_before)
         log.info(
             "watchlist: chat_id=%s прогон за %.1f с — предметов %d (ошибок %d), полос %d, пауза %.1f с. "
             "Суммарно по фазам (идут внахлёст): Steam %.1f с (из них троттлинг %.1f с), "
@@ -2000,7 +2019,11 @@ async def _run_watchlist_scan(
                 chat_id=chat_id,
                 text=f"⏸ Автоскан остановлен на «{market_hash_name}»: {e}",
             )
-        return WatchlistScanReport(found_any=found_any, items=stats.items)
+        return WatchlistScanReport(
+            found_any=found_any, items=stats.items, profile=stats, wall=elapsed,
+            workers=workers, throttle=throttle_wait,
+            interval=request_interval if request_interval is not None else MIN_REQUEST_INTERVAL,
+        )
     finally:
         _watchlist_running.discard(chat_id)
 
@@ -5155,9 +5178,20 @@ async def _arb_reset(update):
     await update.message.reply_text("\n".join(lines))
 
 
+_PROFILE_WORDS = {"профиль", "profile", "замер", "-p"}
+
+
 async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/scanall — сканировать весь вотчлист прямо сейчас, не дожидаясь расписания."""
+    """
+    /scanall — сканировать весь вотчлист прямо сейчас, не дожидаясь расписания.
+    /scanall профиль — то же самое плюс разбивка по фазам и счётчики запросов.
+
+    Замер идёт ВСЕГДА (это несколько счётчиков, они ничего не стоят), «профиль»
+    только показывает его в чат. Так разбивка есть и у автосканов — в журнале,
+    — и её не приходится специально воспроизводить, когда что-то тормозит.
+    """
     chat_id = update.effective_chat.id
+    want_profile = bool(context.args) and context.args[0].lower() in _PROFILE_WORDS
     sticker_items, st_a = _drop_stattrak(await get_watchlist(chat_id))
     float_items, st_b = _drop_stattrak(await get_float_watchlist(chat_id))
     items = set(sticker_items) | set(float_items)
@@ -5202,6 +5236,12 @@ async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # None сюда дойти не должен: списки непустые и "уже идёт" отсеяно выше,
     # но проверка дешёвая, а падать на отчёте о завершении не хочется.
     await update.message.reply_text(_format_scan_done(report) if report is not None else "Готово.")
+    if want_profile and report is not None and report.profile is not None:
+        for chunk in _chunk_lines(report.profile.render(
+            wall=report.wall, workers=report.workers,
+            interval=report.interval, throttle=report.throttle,
+        ).split("\n")):
+            await update.message.reply_text(chunk, parse_mode="HTML")
 
 
 async def pricefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6538,7 +6578,10 @@ COMMANDS: tuple[Command, ...] = (
         "scanall", scanall, "Начать",
         "Проверить оба списка прямо сейчас",
         "/scanall — прогнать вотчлист и охоту за флоатом немедленно, "
-        "не дожидаясь расписания.",
+        "не дожидаясь расписания.\n"
+        "/scanall профиль — то же плюс отчёт: сколько времени ушло в каждую "
+        "фазу, сколько запросов к Steam и Upstash пришлось на один предмет и "
+        "какая доля времени — просто пауза троттлинга.",
     ),
     Command(
         "scan", scan, "Начать",

@@ -220,8 +220,21 @@ _requests_since_stats = 0
 _STAT_WINDOWS = (("1мин", 60), ("5мин", 300), ("15мин", 900), ("60мин", 3600), ("24ч", REQUEST_LOG_WINDOW_SECONDS))
 
 
+# Сколько запросов ушло к Steam за всё время жизни процесса, по областям.
+# Отдельно от _request_log: тот скользящий и обрезается по окну, а профайлеру
+# нужна монотонная величина, которую можно снять до прогона и после и вычесть.
+_request_totals: dict[str, int] = {}
+
+
+def request_totals() -> dict[str, int]:
+    """Накопленное число запросов по областям. Только растёт, не обнуляется."""
+    return dict(_request_totals)
+
+
 def _record_steam_request(scope: str) -> None:
     global _requests_since_stats
+
+    _request_totals[scope] = _request_totals.get(scope, 0) + 1
 
     now = time.time()
     _request_log.append((now, scope))

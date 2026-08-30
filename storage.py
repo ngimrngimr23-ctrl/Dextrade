@@ -54,6 +54,18 @@ def _local_save(data: dict) -> None:
     LOCAL_FALLBACK_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
+# Сколько HTTP-походов в Upstash сделал процесс. Монотонный: профайлер
+# снимает его до прогона и после и берёт разность. Считаем именно ПОХОДЫ, а не
+# команды — pipeline из ста команд это один поход и одна задержка сети, и
+# смешивать их значило бы мерить не то, что стоит времени.
+_redis_calls = 0
+
+
+def redis_call_total() -> int:
+    """Накопленное число HTTP-запросов к Upstash. Только растёт."""
+    return _redis_calls
+
+
 async def _redis_cmd(*args):
     """
     Одна команда Upstash REST. Бросает исключение при ошибке — вызывающий код ловит и падает на fallback.
@@ -61,6 +73,8 @@ async def _redis_cmd(*args):
     Сессия общая на процесс (см. http_session): раньше здесь открывалась новая
     на каждую команду, то есть полный TLS-хендшейк перед каждым GET/SET.
     """
+    global _redis_calls
+    _redis_calls += 1
     session = get_session()
     async with session.post(
         REDIS_URL,
@@ -105,6 +119,8 @@ async def set_price(key: str, matched_name: Optional[str], price: float, ttl_sec
 
 async def _redis_pipeline(commands: list[list]) -> list:
     """Несколько команд Upstash REST одним HTTP-запросом. Возвращает список {'result':...}/{'error':...} по порядку команд."""
+    global _redis_calls
+    _redis_calls += 1
     session = get_session()
     async with session.post(
         f"{REDIS_URL}/pipeline",
