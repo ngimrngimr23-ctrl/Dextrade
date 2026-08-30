@@ -5225,8 +5225,17 @@ async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    log.info("scanall: chat_id=%s начинаю скан %s предмет(ов)", chat_id, len(items))
-    await update.message.reply_text(f"Начинаю скан {len(items)} предмет(ов) из вотчлиста…")
+    log.info(
+        "scanall: chat_id=%s начинаю скан %s предмет(ов)%s",
+        chat_id, len(items), " (с профилем)" if want_profile else "",
+    )
+    # Про профиль говорим СРАЗУ. Он приходит только после прогона, а прогон
+    # идёт минуты — без этой строки нельзя отличить «флаг не распознан» от
+    # «ещё не досчитал», и выглядит это как будто профиль не работает.
+    await update.message.reply_text(
+        f"Начинаю скан {len(items)} предмет(ов) из вотчлиста…"
+        + ("\n📊 Профиль пришлю в конце, вместе с «Готово»." if want_profile else "")
+    )
     # Ручной запуск: пауза короче фоновой — человек ждёт ответа, а разовый
     # всплеск на пару минут Steam переносит (в отличие от круглосуточного
     # потока, см. MANUAL_REQUEST_INTERVAL).
@@ -5237,11 +5246,20 @@ async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # но проверка дешёвая, а падать на отчёте о завершении не хочется.
     await update.message.reply_text(_format_scan_done(report) if report is not None else "Готово.")
     if want_profile and report is not None and report.profile is not None:
-        for chunk in _chunk_lines(report.profile.render(
+        text = report.profile.render(
             wall=report.wall, workers=report.workers,
             interval=report.interval, throttle=report.throttle,
-        ).split("\n")):
-            await update.message.reply_text(chunk, parse_mode="HTML")
+        )
+        for chunk in _chunk_lines(text.split("\n")):
+            try:
+                await update.message.reply_text(chunk, parse_mode="HTML")
+            except Exception:
+                # Разметку Telegram может не принять (незакрытый тег, спецсимвол
+                # в имени предмета). Замер важнее оформления: шлём как есть.
+                # Молча проглотить нельзя — снаружи это выглядит как «профиль
+                # не работает», и именно так мы этот случай и нашли.
+                log.exception("scanall: профиль не ушёл с разметкой, шлю текстом")
+                await update.message.reply_text(chunk)
 
 
 async def pricefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
