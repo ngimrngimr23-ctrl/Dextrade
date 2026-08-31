@@ -80,6 +80,8 @@ from steam_client import (
     blocking_cooldown,
     load_persisted_cooldown,
     take_throttle_wait,
+    take_lock_wait,
+    lane_totals as steam_lane_totals,
     request_totals as steam_request_totals,
     retry_totals as steam_retry_totals,
     reset_cooldown as steam_reset_cooldown,
@@ -1904,6 +1906,7 @@ class WatchlistScanReport(NamedTuple):
     throttle: float = 0.0
     lanes: int = 0
     retries: dict = None
+    lock_wait: float = 0.0
 
 
 async def _run_watchlist_scan(
@@ -1955,6 +1958,8 @@ async def _run_watchlist_scan(
         steam_before = steam_request_totals()
         redis_before = redis_call_total()
         retries_before = steam_retry_totals()
+        lanes_before = steam_lane_totals()
+        take_lock_wait()  # обнуляем счётчик очереди на полосу перед прогоном
 
         queue: asyncio.Queue = asyncio.Queue()
         for entry in scan_plan:
@@ -2001,6 +2006,7 @@ async def _run_watchlist_scan(
 
         elapsed = time.perf_counter() - started
         throttle_wait = take_throttle_wait()
+        lock_wait = take_lock_wait()
         steam_after = steam_request_totals()
         stats.count("steam_requests",
                     steam_after.get("listings", 0) - steam_before.get("listings", 0))
@@ -2013,6 +2019,13 @@ async def _run_watchlist_scan(
             for k in set(retries_after) | set(retries_before)
         }
         run_retries = {k: v for k, v in run_retries.items() if v}
+        # Полосы, по которым РЕАЛЬНО ушёл хоть один запрос за этот прогон.
+        # Не размер пула: на счастливом пути всё идёт прямым адресом, и
+        # «48 адресов» в отчёте означало ровно одну работающую полосу.
+        lanes_after = steam_lane_totals()
+        used_lanes = sum(
+            1 for lane, n in lanes_after.items() if n > lanes_before.get(lane, 0)
+        )
         log.info(
             "watchlist: chat_id=%s прогон за %.1f с — предметов %d (ошибок %d), полос %d, пауза %.1f с. "
             "Суммарно по фазам (идут внахлёст): Steam %.1f с (из них троттлинг %.1f с), "
@@ -2035,7 +2048,7 @@ async def _run_watchlist_scan(
             interval=request_interval if request_interval is not None else MIN_REQUEST_INTERVAL,
             # Прямой адрес плюс пул: столько исходящих полос было доступно, и
             # именно между ними делится пауза троттлинга.
-            lanes=len(STEAM_POOL) + 1, retries=run_retries,
+            lanes=used_lanes, retries=run_retries, lock_wait=lock_wait,
         )
     finally:
         _watchlist_running.discard(chat_id)
@@ -5263,6 +5276,7 @@ async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
             wall=report.wall, workers=report.workers,
             interval=report.interval, throttle=report.throttle,
             lanes=report.lanes, retries=report.retries,
+            lock_wait=report.lock_wait,
         )
         for chunk in _chunk_lines(text.split("\n")):
             try:

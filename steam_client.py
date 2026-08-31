@@ -509,6 +509,15 @@ _lane_last: dict[str, float] = {}
 # от «Steam долго отвечал» — без этого разделения непонятно, что оптимизировать.
 _throttle_wait_seconds = 0.0
 
+# И отдельно — сколько простояли в ОЧЕРЕДИ на лок полосы, ещё не начав отсчёт
+# паузы. Это не то же самое: пауза лечится расписанием, очередь — числом полос.
+_lock_wait_seconds = 0.0
+
+# Сколько запросов ушло по каждой полосе. Нужно, чтобы отчёт показывал полосы
+# РЕАЛЬНО задействованные, а не размер пула: на счастливом пути всё идёт
+# прямым адресом, и «48 адресов» в отчёте означало ровно одну работающую полосу.
+_lane_requests: dict[str, int] = {}
+
 
 def take_throttle_wait() -> float:
     """Суммарная пауза троттлинга с прошлого вызова, в секундах (счётчик обнуляется)."""
@@ -516,6 +525,19 @@ def take_throttle_wait() -> float:
     value = _throttle_wait_seconds
     _throttle_wait_seconds = 0.0
     return value
+
+
+def take_lock_wait() -> float:
+    """Суммарное ожидание лока полосы с прошлого вызова (счётчик обнуляется)."""
+    global _lock_wait_seconds
+    value = _lock_wait_seconds
+    _lock_wait_seconds = 0.0
+    return value
+
+
+def lane_totals() -> dict[str, int]:
+    """Накопленное число запросов по полосам. Только растёт."""
+    return dict(_lane_requests)
 
 
 async def throttle_steam_request(
@@ -543,11 +565,19 @@ async def throttle_steam_request(
     на этом локе. Параллельность убирает простой (разбор ответа, походы в
     Upstash), но НЕ повышает нагрузку на Steam.
     """
-    global _last_request_at, _throttle_wait_seconds
+    global _last_request_at, _throttle_wait_seconds, _lock_wait_seconds
     lock = _lane_locks.get(lane)
     if lock is None:
         lock = _lane_locks[lane] = asyncio.Lock()
+
+    # Ожидание САМОГО лока меряем отдельно от паузы. Разница принципиальная:
+    # пауза — это наше расписание, а очередь на локе — это «полос меньше, чем
+    # воркеров». Пока их складывали, очередь на локе попадала в графу «сеть», и
+    # отчёт показывал 11.8 секунды сетевой задержки там, где большую часть
+    # составляло стояние за другими воркерами на одной полосе.
+    waiting_since = time.monotonic()
     async with lock:
+        _lock_wait_seconds += time.monotonic() - waiting_since
         gap = MIN_REQUEST_INTERVAL if interval is None else interval
         wait = gap - (time.monotonic() - _lane_last.get(lane, 0.0))
         if wait > 0:
@@ -555,6 +585,7 @@ async def throttle_steam_request(
             await asyncio.sleep(wait)
         now = time.monotonic()
         _lane_last[lane] = now
+        _lane_requests[lane] = _lane_requests.get(lane, 0) + 1
         if not lane:
             _last_request_at = now
         _record_steam_request(scope)

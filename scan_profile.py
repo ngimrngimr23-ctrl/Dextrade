@@ -31,6 +31,7 @@ steam_client и storage, а не прокидываются через стек 
 
 from __future__ import annotations
 
+import math
 import time
 
 # Фазы в порядке, в котором они идут по одному предмету. Порядок важен: отчёт
@@ -89,7 +90,8 @@ class ScanProfile:
 
     def render(
         self, *, wall: float, workers: int, interval: float, throttle: float,
-        lanes: int = 0, retries: dict[str, int] | None = None,
+        lock_wait: float = 0.0, lanes: int = 0,
+        retries: dict[str, int] | None = None,
     ) -> str:
         """
         Текстовый отчёт. wall — реальное время прогона, throttle — суммарное
@@ -122,22 +124,54 @@ class ScanProfile:
             lines.append(f"  {label}: {value:.1f} с ({value / capacity * 100:.0f}%)")
         lines.append("")
 
-        # Сеть и пауза требуют разных действий, поэтому и печатаются отдельно:
-        # паузу лечит расписание, сеть — маршрут и число одновременных запросов.
-        network = max(self.steam - throttle, 0.0)
+        # Три слагаемых фазы Steam, и все лечатся разным:
+        #   очередь на полосу — полос меньше, чем воркеров;
+        #   пауза            — наше собственное расписание;
+        #   сеть             — маршрут и скорость ответа Steam.
+        # Пока очередь считалась «сетью», отчёт показывал 11.8 с сетевой
+        # задержки там, где большую часть занимало стояние за другим воркером.
+        network = max(self.steam - throttle - lock_wait, 0.0)
         lines.append("<b>Где узкое место</b>")
-        lines.append(f"  ожидание сети: {network:.1f} с = {network / capacity * 100:.0f}% ёмкости")
+        lines.append(f"  очередь на полосу: {lock_wait:.1f} с = {lock_wait / capacity * 100:.0f}% ёмкости")
         lines.append(f"  пауза троттлинга: {throttle:.1f} с = {throttle / capacity * 100:.0f}% ёмкости")
-        busy = (self.steam + self.stickers) / capacity * 100
-        lines.append(f"  воркеры заняты: {busy:.0f}% времени")
+        lines.append(f"  ожидание сети: {network:.1f} с = {network / capacity * 100:.0f}% ёмкости")
+
+        reqs = self.steam_requests
+        if reqs:
+            lines.append(
+                f"  на запрос: очередь {lock_wait / reqs:.2f} с + пауза "
+                f"{throttle / reqs:.2f} с + сеть {network / reqs:.2f} с"
+            )
+            # Сколько воркеров нужно, чтобы сеть полностью пряталась за паузой.
+            # Больше этого числа не даёт ничего: полоса всё равно выпускает
+            # один запрос в interval секунд.
+            need = math.ceil((network / reqs) / interval) if interval else workers
+            lines.append(
+                f"  воркеров {workers}, чтобы спрятать сеть хватает {need}"
+                + (" — лишние только стоят в очереди" if workers > need else "")
+            )
         lines.append(
-            f"  воркеров {workers}, пауза {interval:g} с"
-            + (f", исходящих адресов {lanes}" if lanes else "")
+            f"  пауза {interval:g} с"
+            + (f", полос задействовано {lanes}" if lanes else "")
         )
-        if self.steam_requests:
-            lines.append(f"  на запрос: сеть {network / self.steam_requests:.2f} с "
-                         f"+ пауза {throttle / self.steam_requests:.2f} с")
-        lines.append(f"  {_verdict(network, throttle, busy)}")
+
+        # Сколько полос РАБОТАЛО на самом деле — не по числу адресов, а по
+        # пропускной способности: одна полоса выпускает запрос раз в interval
+        # секунд, значит (запросы × интервал) / время прогона и есть число
+        # полос, поделивших между собой поток.
+        #
+        #   541 × 4 / 2172 = 1.00  → одна полоса, прогон ею и связан
+        #   144 × 2 / 207  = 1.39  → полос было больше одной
+        #
+        # Считать «полосой» адрес, по которому ушёл один запрос из пятисот,
+        # нельзя — он ничего не разгрузил.
+        effective = (reqs * interval / wall) if wall else 0.0
+        lines.append(f"  {_verdict(effective, throttle, network, lock_wait)}")
+        if reqs and wall:
+            lines.append(
+                f"  <i>запросы × пауза ÷ время = {effective:.2f} — столько полос "
+                f"реально делили поток</i>"
+            )
         lines.append("")
 
         lines.append("<b>Внешние операции</b>")
@@ -154,12 +188,12 @@ class ScanProfile:
         total_retries = sum(retries.values())
         if total_retries:
             detail = ", ".join(f"{k} {v}" for k, v in sorted(retries.items()) if v)
-            share = total_retries / self.steam_requests * 100 if self.steam_requests else 0
+            share = total_retries / reqs * 100 if reqs else 0
             lines.append(f"  ⚠️ из них повторов: {total_retries} ({detail}) — {share:.0f}% запросов впустую")
             if retries.get("429"):
                 lines.append(
-                    f"     каждый 429 выбивает адрес из пула — оставшимся достаётся "
-                    f"больше нагрузки, и следующий 429 вероятнее"
+                    "     каждый 429 выбивает адрес из пула — оставшимся достаётся "
+                    "больше нагрузки, и следующий 429 вероятнее"
                 )
         lines.append("")
 
@@ -174,24 +208,44 @@ class ScanProfile:
 _TIME_FIELDS = frozenset({"steam", "stickers", "analysis", "dedup", "send"})
 
 
-def _verdict(network: float, throttle: float, busy_pct: float) -> str:
+def _verdict(effective_lanes: float, throttle: float,
+             network: float, lock_wait: float) -> str:
     """
     Вывод одной строкой. Намеренно не «оптимизируйте X»: отчёт должен сказать,
     что мерить дальше, а не назначить виноватого.
+
+    Первая проверка — насыщение единственной полосы, и это не эвристика, а
+    тождество: если (запросы × интервал) равно времени прогона, значит запросы
+    шли строго друг за другом по одной полосе, и никакая параллельность этого
+    не изменит.
+
+    Две прежние версии ошибались здесь по-разному. Первая проверяла занятость
+    воркеров и на живом прогоне посоветовала добавить воркеров там, где их и так
+    было больше нужного. Вторая сравнивала «запросы × интервал ≥ время × 0.9» и
+    принимала за насыщение случай 288 ≥ 207 — а превышение как раз ДОКАЗЫВАЕТ,
+    что полос было несколько.
     """
+    # Именно ОКРЕСТНОСТЬ единицы, а не «меньше единицы»: значение сильно ниже
+    # означает обратное — полоса простаивала, время ушло куда-то ещё.
+    if 0.9 <= effective_lanes <= 1.1:
+        return (
+            "→ УПЁРЛИСЬ В ОДНУ ПОЛОСУ: время прогона = запросы × пауза. Помогут "
+            "только меньше запросов, короче пауза или больше полос. Воркеры, "
+            "кэши и батчи не дадут ничего."
+        )
+    if lock_wait > throttle and lock_wait > network:
+        return (
+            "→ больше всего стоим в ОЧЕРЕДИ на полосу: воркеров больше, чем полос. "
+            "Помогут полосы, а не воркеры."
+        )
     if throttle > network:
         return (
             "→ времени больше уходит в собственную паузу, чем в сеть. Ускорит "
-            "МЕНЬШЕ запросов или больше исходящих адресов; воркеры не помогут."
-        )
-    if busy_pct >= 80:
-        return (
-            "→ воркеры насыщены ожиданием сети, а не паузой. Помогут: убрать "
-            "лишние запросы, добавить воркеров, ускорить маршрут."
+            "МЕНЬШЕ запросов или больше полос."
         )
     return (
-        "→ воркеры простаивают, и пауза не главная. Смотри самую дорогую фазу "
-        "выше — время уходит туда."
+        "→ время уходит в сеть, а не в расписание. Помогут: убрать лишние "
+        "запросы, ускорить маршрут, добавить воркеров до нужного числа выше."
     )
 
 
