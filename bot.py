@@ -42,6 +42,7 @@ import asyncio
 import datetime as dt
 import hashlib
 import html as html_module
+import io
 import json
 import logging
 import os
@@ -1390,8 +1391,39 @@ def _chunk_lines(lines: list[str], limit: int = 3800, sep: str = "\n") -> list[s
     return chunks
 
 
+# С какого размера список уходит файлом, а не сообщениями.
+#
+# 541 предмет — это шесть сообщений подряд по 3800 символов, в которых ничего
+# не найти и которые перекрывают всю переписку. Файл открывается одним нажатием,
+# ищется поиском и не засоряет чат. Порог поставлен там, где список перестаёт
+# помещаться в один экран телефона.
+LIST_AS_FILE_FROM = int(os.environ.get("LIST_AS_FILE_FROM", "30"))
+
+_FILE_WORDS = {"файл", "file", "txt", "выгрузи", "выгрузка", "экспорт"}
+
+
+async def _send_names_file(update, names: list[str], filename: str, caption: str) -> None:
+    """
+    Отправить список имён текстовым файлом.
+
+    Формат намеренно голый — одно имя в строке, без номеров и заголовков.
+    Такой файл можно открыть, отредактировать и скормить обратно, а нумерация
+    и шапка это ломают. Номер строки в любом редакторе и так равен номеру
+    предмета, по которому работает /watch убрать N.
+    """
+    payload = ("\n".join(names) + "\n").encode("utf-8")
+    await update.message.reply_document(
+        document=io.BytesIO(payload),
+        filename=filename,
+        caption=caption,
+    )
+
+
 async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/watchlist — показать текущий вотчлист и интервал автоскана."""
+    """
+    /watchlist — показать текущий вотчлист и интервал автоскана.
+    Длинный список уходит файлом; /watch файл — принудительно файлом.
+    """
     chat_id = update.effective_chat.id
     items = await get_watchlist(chat_id)
     interval = await _get_watch_interval(chat_id)
@@ -1403,7 +1435,25 @@ async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    lines = [f"📋 Вотчлист ({len(items)}), следующий прогон — через {interval:g} мин после конца текущего/предыдущего:"]
+    head = (
+        f"📋 Вотчлист ({len(items)}), следующий прогон — через {interval:g} мин "
+        f"после конца текущего/предыдущего"
+    )
+
+    forced = bool(context.args) and context.args[0].lower() in _FILE_WORDS
+    if forced or len(items) >= LIST_AS_FILE_FROM:
+        # Полный прогон по этому списку занимает ровно len × пауза секунд —
+        # см. scan_profile. Число полезное: по нему видно, раз во сколько
+        # реально проверяется каждый предмет.
+        minutes = len(items) * MIN_REQUEST_INTERVAL / 60
+        await _send_names_file(
+            update, items, f"watchlist_{len(items)}.txt",
+            f"{head}.\nОдин полный обход ≈ {minutes:.0f} мин "
+            f"({len(items)} × {MIN_REQUEST_INTERVAL:g} с на предмет).",
+        )
+        return
+
+    lines = [head + ":"]
     for i, name in enumerate(items, start=1):
         lines.append(f"{i}. {name}")
     for chunk in _chunk_lines(lines):
@@ -1456,6 +1506,9 @@ def _subcommand(args: list[str], table: dict[str, tuple]) -> tuple | None:
 
 _WATCH_ACTIONS = {
     "список": "list", "list": "list", "покажи": "list",
+    # Отдельным действием, а не синонимом "list": диспетчер срезает первое
+    # слово перед передачей в обработчик, и «файл» до него бы не доехал.
+    "файл": "file", "file": "file", "txt": "file", "выгрузи": "file",
     "убрать": "del", "удалить": "del", "del": "del", "-": "del",
     "очистить": "clear", "очисти": "clear", "clear": "clear",
     "стоп": "pause", "пауза": "pause", "стой": "pause", "pause": "pause", "stop": "pause",
@@ -1490,6 +1543,8 @@ async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = _WATCH_ACTIONS.get(head)
     if action == "list":
         return await watchlist_cmd(update, _SubCtx(context, args[1:]))
+    if action == "file":
+        return await watchlist_cmd(update, _SubCtx(context, ["файл"]))
     if action == "del":
         return await watchdel(update, _SubCtx(context, args[1:]))
     if action == "clear":
@@ -1697,11 +1752,17 @@ async def floatlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if markup is not None:
             threshold += f", наценка ≤{markup:g}%"
 
-    lines = [f"🔍 Охота за флоатом ({len(items)}), условие: {threshold}"]
-    for i, name in enumerate(items, start=1):
-        lines.append(f"{i}. {name}")
-    for chunk in _chunk_lines(lines):
-        await update.message.reply_text(chunk)
+    head = f"🔍 Охота за флоатом ({len(items)}), условие: {threshold}"
+
+    forced = bool(context.args) and context.args[0].lower() in _FILE_WORDS
+    if forced or len(items) >= LIST_AS_FILE_FROM:
+        await _send_names_file(update, items, f"floatlist_{len(items)}.txt", head + ".")
+    else:
+        lines = [head + ":"]
+        for i, name in enumerate(items, start=1):
+            lines.append(f"{i}. {name}")
+        for chunk in _chunk_lines(lines):
+            await update.message.reply_text(chunk)
     # Отдельным сообщением, а не хвостом списка: список бывает длинным и
     # режется на куски, и памятка уехала бы в середину или потерялась в конце.
     await update.message.reply_text(settings, parse_mode="HTML")
@@ -1712,6 +1773,7 @@ _FLOAT_ACTIONS = {
     "убрать": "del", "удалить": "del", "del": "del", "-": "del",
     "очистить": "clear", "очисти": "clear", "clear": "clear",
     "чек": "check", "check": "check", "проверь": "check", "проверить": "check",
+    "файл": "file", "file": "file", "txt": "file", "выгрузи": "file",
 }
 
 
@@ -1776,6 +1838,8 @@ async def float_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = _FLOAT_ACTIONS.get(head)
     if action == "list":
         return await floatlist_cmd(update, _SubCtx(context, args[1:]))
+    if action == "file":
+        return await floatlist_cmd(update, _SubCtx(context, ["файл"]))
     if action == "del":
         return await floatdel(update, _SubCtx(context, args[1:]))
     if action == "clear":
@@ -6640,7 +6704,9 @@ COMMANDS: tuple[Command, ...] = (
     Command(
         "watch", watch, "Списки",
         "Вотчлист: показать, добавить, убрать",
-        "/watch — показать вотчлист (охота по стикерам)\n"
+        "/watch — показать вотчлист (охота по стикерам). Длинный список "
+        "приходит файлом, коротким — сообщением\n"
+        "/watch файл — прислать файлом в любом случае\n"
         "/watch <предмет1>, <предмет2> — добавить; степень износа можно указать "
         "один раз последним элементом (FN/MW/FT/WW/BS)\n"
         "/watch -3 — убрать третий (или /watch убрать 3)\n"
@@ -6652,6 +6718,7 @@ COMMANDS: tuple[Command, ...] = (
         "Флоат: список и проверка скина",
         "/float — список охоты за редким флоатом, условие отбора и памятка "
         "по его настройке\n"
+        "/float файл — прислать список файлом\n"
         "/float <предмет1>, <предмет2> — добавить\n"
         "/float -2 — убрать второй, /float очистить — очистить\n"
         "/setfloatfilter 0.01 0.99 — FN до и BS от, края открыты "
