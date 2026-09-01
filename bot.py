@@ -1401,6 +1401,14 @@ LIST_AS_FILE_FROM = int(os.environ.get("LIST_AS_FILE_FROM", "30"))
 
 _FILE_WORDS = {"файл", "file", "txt", "выгрузи", "выгрузка", "экспорт"}
 
+# Слова, которыми выключают автопрогон.
+#
+# «0» сюда намеренно НЕ входит: первым аргументом /markets идёт спред, и
+# «/markets 0» это попытка задать нулевой порог, а не выключить расписание.
+# Ноль как «выключить» остаётся на своём месте — третьим аргументом, где он
+# означает именно интервал.
+_OFF_WORDS = {"off", "выкл", "выключить", "выключи", "стоп", "стой", "пауза"}
+
 
 async def _send_names_file(update, names: list[str], filename: str, caption: str) -> None:
     """
@@ -4506,6 +4514,16 @@ async def dips_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     chat_id = update.effective_chat.id
 
+    if context.args and context.args[0].lower() in _OFF_WORDS:
+        await set_dips_setting(chat_id, "interval", None)
+        _reschedule_dips_job(context.application.job_queue, chat_id, None)
+        await update.message.reply_text(
+            "⏹ Автопрогон /dips выключен. Порог просадки сохранён.\n"
+            "Включить обратно: /dips - 60 (раз в час)\n"
+            "Разовый прогон работает как раньше: просто /dips"
+        )
+        return
+
     if context.args:
         try:
             saved = await _apply_dips_args(chat_id, context.args)
@@ -5181,6 +5199,19 @@ async def markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     не больше 50 лотов, автопрогон раз в час. Пропустить средний — прочерком.
     """
     chat_id = update.effective_chat.id
+
+    # Выключение автопрогона — и БЕЗ разового прогона следом: «выключи» и
+    # «а теперь просканируй» это противоположные намерения, и делать второе
+    # в ответ на первое было бы сюрпризом.
+    if context.args and context.args[0].lower() in _OFF_WORDS:
+        await set_market_setting(chat_id, "interval", None)
+        _reschedule_markets_job(context.application.job_queue, chat_id, None)
+        await update.message.reply_text(
+            "⏹ Автопрогон /markets выключен. Пороги сохранены.\n"
+            "Включить обратно: /markets - - 60 (раз в час)\n"
+            "Разовый прогон работает как раньше: просто /markets"
+        )
+        return
 
     if context.args:
         try:
@@ -6755,11 +6786,12 @@ COMMANDS: tuple[Command, ...] = (
         "markets", markets, "Площадки",
         "Сравнить Steam с другими площадками",
         "/markets — сравнить цены Steam со сторонними площадками по всему каталогу\n"
+        "/markets выкл — выключить автопрогон (пороги сохранятся)\n"
         "/markets <спред%> [макс лотов] [минут] — задать пороги и автопрогон, "
         "например /markets 30 50 60: дешевле Steam от 30%, не больше 50 лотов "
         "на площадке, проверять раз в час\n"
-        "Пропустить значение — прочерком: /markets 30 - 60. Выключить "
-        "автопрогон — нулём. Интервал от 1 минуты; при частом прогоне бот "
+        "Пропустить значение — прочерком: /markets 30 - 60. Интервал от "
+        "1 минуты; при частом прогоне бот "
         "предупредит про расход живых запросов к Steam, но поставит что "
         "скажешь. Остальные пороги: /start → Пороги → Площадки.",
     ),
@@ -6787,6 +6819,7 @@ COMMANDS: tuple[Command, ...] = (
         "/dips — предметы, торгующиеся дешевле своей средней за 30 дней\n"
         "/dips <просадка%> [минут] — задать порог и автопрогон, например "
         "/dips 30 60\n"
+        "/dips выкл — выключить автопрогон (порог сохранится)\n"
         "Отбор идёт по всему каталогу локально, без запросов к Steam, поэтому "
         "работает даже когда всё остальное упирается в лимиты. StatTrak и "
         "наклейки исключены. Это НЕ арбитраж: разрыв во времени, а не между "
