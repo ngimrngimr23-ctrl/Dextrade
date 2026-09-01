@@ -2203,7 +2203,7 @@ async def _rotation_settings(chat_id: int, hot_names: set) -> tuple[int, int | N
 
 
 async def _run_watchlist_scan(
-    bot, chat_id: int, request_interval: float | None = None
+    bot, chat_id: int, request_interval: float | None = None, *, rotate: bool = True
 ) -> WatchlistScanReport | None:
     """
     Прогоняет весь вотчлист чата разом — общая логика для джобы по расписанию
@@ -2241,7 +2241,12 @@ async def _run_watchlist_scan(
     # пуст, split_cycle возвращает план как есть, то есть поведение прежнее.
     # Суть размена описана в scan_plan: бюджет запросов фиксирован, и
     # «проверять горячее чаще» означает «проверять холодное реже».
-    hot_names = set(await get_hot_watchlist(chat_id))
+    # rotate=False — ручной /scanall: он называется «сканировать всё» и должен
+    # делать именно это. Ротация нужна автопрогону, чтобы часто возвращаться к
+    # приоритетным; человек, набравший команду руками, просит полный обход, и
+    # отдавать ему шестую часть списка значило бы врать названием команды.
+    # Курсор при этом не двигаем: ручной прогон не должен сбивать круг.
+    hot_names = set(await get_hot_watchlist(chat_id)) if rotate else set()
     cursor, cold_per_cycle = await _rotation_settings(chat_id, hot_names)
     full_size = len(plan)
     plan, next_cursor = scan_plan.split_cycle(plan, hot_names, cursor, cold_per_cycle)
@@ -5592,15 +5597,21 @@ async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Про профиль говорим СРАЗУ. Он приходит только после прогона, а прогон
     # идёт минуты — без этой строки нельзя отличить «флаг не распознан» от
     # «ещё не досчитал», и выглядит это как будто профиль не работает.
-    await update.message.reply_text(
-        f"Начинаю скан {len(items)} предмет(ов) из вотчлиста…"
-        + ("\n📊 Профиль пришлю в конце, вместе с «Готово»." if want_profile else "")
-    )
+    # Ручной прогон идёт по ВСЕМУ списку, в отличие от автоскана с ротацией —
+    # говорим об этом прямо, иначе разница в числах между /scanall и /hot
+    # выглядит как ошибка.
+    minutes = len(items) * MANUAL_REQUEST_INTERVAL / 60
+    note = f"Начинаю скан {len(items)} предмет(ов) — весь список, ≈{minutes:.0f} мин."
+    if await get_hot_watchlist(chat_id):
+        note += "\n(Автопрогон берёт только часть — см. /hot. Здесь всё.)"
+    if want_profile:
+        note += "\n📊 Профиль пришлю в конце, вместе с «Готово»."
+    await update.message.reply_text(note)
     # Ручной запуск: пауза короче фоновой — человек ждёт ответа, а разовый
     # всплеск на пару минут Steam переносит (в отличие от круглосуточного
     # потока, см. MANUAL_REQUEST_INTERVAL).
     report = await _run_watchlist_scan(
-        context.bot, chat_id, request_interval=MANUAL_REQUEST_INTERVAL
+        context.bot, chat_id, request_interval=MANUAL_REQUEST_INTERVAL, rotate=False
     )
     # None сюда дойти не должен: списки непустые и "уже идёт" отсеяно выше,
     # но проверка дешёвая, а падать на отчёте о завершении не хочется.
@@ -6985,7 +6996,8 @@ COMMANDS: tuple[Command, ...] = (
         "scanall", scanall, "Начать",
         "Проверить оба списка прямо сейчас",
         "/scanall — прогнать вотчлист и охоту за флоатом немедленно, "
-        "не дожидаясь расписания.\n"
+        "не дожидаясь расписания. Идёт по ВСЕМУ списку, даже если у "
+        "автопрогона включена ротация приоритетных (/hot).\n"
         "/scanall профиль — то же плюс отчёт: сколько времени ушло в каждую "
         "фазу, сколько запросов к Steam и Upstash пришлось на один предмет и "
         "какая доля времени — просто пауза троттлинга.",
