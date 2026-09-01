@@ -832,11 +832,11 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _pricefile_mode.discard(chat_id)
     def_min, def_max = await _get_defaults(chat_id)
     if not args:
-        await update.message.reply_text(
-            f"Формат: /scanfile <ссылка или название предмета> [мин$ стикеров={def_min:.0f}] [макс наценка%={def_max:.0f}]\n"
-            f"Название — на английском: /scanfile AK-47 | Slate (Field-Tested)"
-        )
-        return
+        # Голый /scan раньше только печатал формат. Теперь он делает то, чего
+        # не хватало: быстрый прогон ТОЛЬКО по приоритетным. Пара получается
+        # естественная — /scan горячее, /scanall всё, — и старая форма
+        # /scan <предмет> продолжает работать как раньше.
+        return await _scan_hot(update, context, chat_id, def_min, def_max)
 
     query_or_url, parsed_min, parsed_max = _split_args(args)
     min_value = parsed_min if parsed_min is not None else def_min
@@ -847,6 +847,43 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return  # либо ошибка уже сообщена, либо ждём выбора номера
 
     await _proceed_scanfile(update, market_hash_name, min_value, max_markup)
+
+
+async def _scan_hot(update, context, chat_id: int, def_min: float, def_max: float) -> None:
+    """Прогон только по приоритетному списку — то, что делает голый /scan."""
+    hot = await get_hot_watchlist(chat_id)
+    if not hot:
+        await update.message.reply_text(
+            f"Приоритетный список пуст — сканировать нечего.\n"
+            f"Добавить: /hot <предмет1>, <предмет2>, ...\n"
+            f"Проверить один предмет: /scan <ссылка или название> "
+            f"[мин$ стикеров={def_min:.0f}] [макс наценка%={def_max:.0f}]\n"
+            f"Прогнать весь вотчлист: /scanall"
+        )
+        return
+
+    if chat_id in _watchlist_running:
+        await update.message.reply_text("Скан вотчлиста уже идёт, дождись его окончания.")
+        return
+    cooldown = blocking_cooldown()
+    if cooldown > 0:
+        await update.message.reply_text(
+            f"Steam на кулдауне после 429 — ещё {cooldown / 60:.0f} мин. "
+            f"Попробуй после этого."
+        )
+        return
+
+    minutes = len(hot) * MANUAL_REQUEST_INTERVAL / 60
+    await update.message.reply_text(
+        f"🔥 Сканирую {len(hot)} приоритетных, ≈{minutes:.0f} мин.\n"
+        f"Весь список ({len(set(await get_watchlist(chat_id)) | set(await get_float_watchlist(chat_id)))}) — /scanall"
+    )
+    report = await _run_watchlist_scan(
+        context.bot, chat_id, request_interval=MANUAL_REQUEST_INTERVAL, mode=SCAN_HOT
+    )
+    await update.message.reply_text(
+        _format_scan_done(report) if report is not None else "Готово."
+    )
 
 
 async def setdefaults(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2202,8 +2239,15 @@ async def _rotation_settings(chat_id: int, hot_names: set) -> tuple[int, int | N
     return cursor, cold_per_cycle
 
 
+# Что именно прогонять. Один явный параметр вместо набора флагов: режимов три,
+# и от них зависит и состав плана, и двигать ли курсор круга.
+SCAN_CYCLE = "cycle"  # автопрогон: приоритетные + кусок остальных, курсор двигается
+SCAN_ALL = "all"      # /scanall: весь список, курсор не трогаем
+SCAN_HOT = "hot"      # /scan: только приоритетные, курсор не трогаем
+
+
 async def _run_watchlist_scan(
-    bot, chat_id: int, request_interval: float | None = None, *, rotate: bool = True
+    bot, chat_id: int, request_interval: float | None = None, *, mode: str = SCAN_CYCLE
 ) -> WatchlistScanReport | None:
     """
     Прогоняет весь вотчлист чата разом — общая логика для джобы по расписанию
@@ -2241,22 +2285,28 @@ async def _run_watchlist_scan(
     # пуст, split_cycle возвращает план как есть, то есть поведение прежнее.
     # Суть размена описана в scan_plan: бюджет запросов фиксирован, и
     # «проверять горячее чаще» означает «проверять холодное реже».
-    # rotate=False — ручной /scanall: он называется «сканировать всё» и должен
-    # делать именно это. Ротация нужна автопрогону, чтобы часто возвращаться к
-    # приоритетным; человек, набравший команду руками, просит полный обход, и
-    # отдавать ему шестую часть списка значило бы врать названием команды.
-    # Курсор при этом не двигаем: ручной прогон не должен сбивать круг.
-    hot_names = set(await get_hot_watchlist(chat_id)) if rotate else set()
-    cursor, cold_per_cycle = await _rotation_settings(chat_id, hot_names)
+    # Ротация — только у автопрогона. Ручные команды называются «сканировать
+    # всё» и «сканировать приоритетные», и должны делать ровно это: отдавать
+    # человеку шестую часть списка в ответ на /scanall значило бы врать
+    # названием команды. Курсор круга ручные прогоны не двигают.
+    hot_names = set(await get_hot_watchlist(chat_id))
     full_size = len(plan)
-    plan, next_cursor = scan_plan.split_cycle(plan, hot_names, cursor, cold_per_cycle)
-    if len(plan) != full_size:
-        log.info(
-            "watchlist: chat_id=%s цикл — %d из %d предметов "
-            "(приоритетных %d, курсор %d→%d)",
-            chat_id, len(plan), full_size, len(hot_names), cursor, next_cursor,
-        )
-        await set_rotation_cursor(chat_id, next_cursor)
+
+    if mode == SCAN_HOT:
+        plan = [entry for entry in plan if entry[0] in hot_names]
+    elif mode == SCAN_CYCLE:
+        cursor, cold_per_cycle = await _rotation_settings(chat_id, hot_names)
+        plan, next_cursor = scan_plan.split_cycle(plan, hot_names, cursor, cold_per_cycle)
+        if len(plan) != full_size:
+            log.info(
+                "watchlist: chat_id=%s цикл — %d из %d предметов "
+                "(приоритетных %d, курсор %d→%d)",
+                chat_id, len(plan), full_size, len(hot_names), cursor, next_cursor,
+            )
+            await set_rotation_cursor(chat_id, next_cursor)
+
+    if not plan:
+        return None
 
     _watchlist_running.add(chat_id)
     try:
@@ -5611,7 +5661,7 @@ async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # всплеск на пару минут Steam переносит (в отличие от круглосуточного
     # потока, см. MANUAL_REQUEST_INTERVAL).
     report = await _run_watchlist_scan(
-        context.bot, chat_id, request_interval=MANUAL_REQUEST_INTERVAL, rotate=False
+        context.bot, chat_id, request_interval=MANUAL_REQUEST_INTERVAL, mode=SCAN_ALL
     )
     # None сюда дойти не должен: списки непустые и "уже идёт" отсеяно выше,
     # но проверка дешёвая, а падать на отчёте о завершении не хочется.
@@ -7004,7 +7054,8 @@ COMMANDS: tuple[Command, ...] = (
     ),
     Command(
         "scan", scan, "Начать",
-        "Проверить один предмет",
+        "Прогнать приоритетные",
+        "/scan — прогнать только приоритетные (/hot). Быстро: их немного\n"
         "/scan <ссылка или название> [мин$ стикеров] [макс наценка%] — разовая "
         "проверка одного предмета. Название на английском, с | или без: "
         "/scan AK-47 | Slate или /scan AK-47 Slate.",
@@ -7032,6 +7083,7 @@ COMMANDS: tuple[Command, ...] = (
         "/hot <предмет1>, <предмет2> — добавить (формат как у /watch)\n"
         "/hot -2 — убрать второй, /hot очистить — очистить\n"
         "/hot файл — прислать список файлом\n"
+        "/scan — прогнать приоритетные прямо сейчас\n"
         "/hot остальные 60 — сколько НЕприоритетных брать за цикл "
         "(/hot остальные все — выключить ротацию)\n"
         "Время цикла равно (предметы × пауза), поэтому добавить предметы "
