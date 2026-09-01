@@ -126,6 +126,11 @@ from storage import (
     get_watchlist,
     set_watchlist,
     get_float_watchlist,
+    get_hot_watchlist,
+    set_hot_watchlist,
+    get_rotation,
+    set_rotation_cursor,
+    set_cold_per_cycle,
     set_float_watchlist,
     get_watch_paused,
     set_watch_paused,
@@ -163,6 +168,7 @@ import menu
 import pricing
 import dips
 import price_history
+import scan_plan
 import scan_profile
 import proxy_pool
 import sih_client
@@ -1454,11 +1460,17 @@ async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # см. scan_profile. Число полезное: по нему видно, раз во сколько
         # реально проверяется каждый предмет.
         minutes = len(items) * MIN_REQUEST_INTERVAL / 60
-        await _send_names_file(
-            update, items, f"watchlist_{len(items)}.txt",
+        caption = (
             f"{head}.\nОдин полный обход ≈ {minutes:.0f} мин "
-            f"({len(items)} × {MIN_REQUEST_INTERVAL:g} с на предмет).",
+            f"({len(items)} × {MIN_REQUEST_INTERVAL:g} с на предмет)."
         )
+        # Подсказка ровно там, где человек видит, что обход долгий, — а не в
+        # справочнике, куда за ней надо сначала догадаться пойти.
+        if not await get_hot_watchlist(chat_id):
+            caption += (
+                "\nЧасть проверять чаще остальных: /hot <предметы>"
+            )
+        await _send_names_file(update, items, f"watchlist_{len(items)}.txt", caption)
         return
 
     lines = [head + ":"]
@@ -1466,6 +1478,201 @@ async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{i}. {name}")
     for chunk in _chunk_lines(lines):
         await update.message.reply_text(chunk)
+
+
+_HOT_ACTIONS = {
+    "список": "list", "list": "list", "покажи": "list",
+    "убрать": "del", "удалить": "del", "del": "del", "-": "del",
+    "очистить": "clear", "очисти": "clear", "clear": "clear",
+    "файл": "file", "file": "file", "txt": "file", "выгрузи": "file",
+    "остальные": "rest", "прочие": "rest", "хвост": "rest", "rest": "rest",
+}
+
+
+async def _hot_status_lines(chat_id: int) -> list[str]:
+    """Что даёт текущий приоритетный список — числами, а не обещаниями."""
+    hot = await get_hot_watchlist(chat_id)
+    sticker_items = await get_watchlist(chat_id)
+    float_items = await get_float_watchlist(chat_id)
+    total = len(set(sticker_items) | set(float_items) | set(hot))
+    _, cold_per_cycle = await _rotation_settings(chat_id, set(hot))
+    return scan_plan.describe_cycle(
+        hot_count=len(hot), cold_count=max(total - len(hot), 0),
+        cold_per_cycle=cold_per_cycle,
+        request_interval=MIN_REQUEST_INTERVAL,
+        gap_minutes=await _get_watch_interval(chat_id),
+    )
+
+
+async def hot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /hot                     — приоритетный список и что даёт расписание
+    /hot <предмет1>, <...>   — добавить (формат тот же, что у /watch)
+    /hot -2                  — убрать второй (или /hot убрать 2)
+    /hot очистить            — очистить, вернуться к обычному обходу
+    /hot файл                — прислать список файлом
+    /hot остальные 60        — сколько НЕприоритетных брать за цикл
+
+    Зачем отдельный список. Время цикла равно (предметы × пауза) — измерено на
+    живых прогонах с точностью 0.2%. Значит добавить предметов «сверх» нельзя:
+    бюджет запросов фиксирован, и приоритет означает перераспределение, а не
+    прибавку. Приоритетные идут каждый цикл, остальные — по кругу.
+    """
+    chat_id = update.effective_chat.id
+    args = list(context.args)
+    head = args[0].lower().strip() if args else ""
+
+    if head.startswith("-") and head[1:].strip().isdigit():
+        return await _hot_del(update, chat_id, head[1:].strip())
+
+    action = _HOT_ACTIONS.get(head)
+
+    if action == "del":
+        return await _hot_del(update, chat_id, " ".join(args[1:]).strip())
+
+    if action == "clear":
+        await set_hot_watchlist(chat_id, [])
+        await set_rotation_cursor(chat_id, 0)
+        lines = await _hot_status_lines(chat_id)
+        return await update.message.reply_text(
+            "Приоритетный список очищен — вернулись к обычному обходу.\n\n"
+            + "\n".join(lines)
+        )
+
+    if action == "rest":
+        rest = args[1:]
+        if not rest:
+            return await update.message.reply_text(
+                "Сколько НЕприоритетных предметов брать за цикл?\n"
+                "Пример: /hot остальные 60. Ноль или «все» — без ротации, "
+                "каждый цикл проверяются все."
+            )
+        word = rest[0].lower()
+        if word in ("все", "всё", "all", "0"):
+            await set_cold_per_cycle(chat_id, 0)
+        else:
+            try:
+                value = int(float(word))
+            except ValueError:
+                return await update.message.reply_text(
+                    f"{rest[0]!r} — не число. Пример: /hot остальные 60"
+                )
+            if value < 1:
+                return await update.message.reply_text(
+                    "Должно быть от 1. Убрать ротацию: /hot остальные все"
+                )
+            await set_cold_per_cycle(chat_id, value)
+        return await update.message.reply_text("\n".join(await _hot_status_lines(chat_id)))
+
+    if action in ("list", "file") or not args:
+        hot = await get_hot_watchlist(chat_id)
+        status = "\n".join(await _hot_status_lines(chat_id))
+        if not hot:
+            return await update.message.reply_text(
+                "🔥 Приоритетный список пуст — обход идёт по всему вотчлисту "
+                "подряд.\n"
+                "Добавить: /hot <предмет1>, <предмет2>, ...\n\n" + status
+            )
+        head_line = f"🔥 Приоритетный список ({len(hot)})"
+        if action == "file" or len(hot) >= LIST_AS_FILE_FROM:
+            await _send_names_file(
+                update, hot, f"hotlist_{len(hot)}.txt", head_line + ".\n" + status
+            )
+            return
+        lines = [head_line + ":"]
+        lines += [f"{i}. {name}" for i, name in enumerate(hot, start=1)]
+        lines.append("")
+        lines.append(status)
+        for chunk in _chunk_lines(lines):
+            await update.message.reply_text(chunk)
+        return
+
+    return await _hot_add(update, chat_id, context, args)
+
+
+async def _hot_add(update, chat_id: int, context, args) -> None:
+    """Добавление — тем же разбором имён, что и /watch, включая общий износ."""
+    parts = [p.strip() for p in " ".join(args).split(",") if p.strip()]
+
+    global_wear = None
+    if len(parts) > 1 and parts[-1].lower() in _WEAR_ALIASES:
+        global_wear = _WEAR_ALIASES[parts[-1].lower()]
+        parts = parts[:-1]
+
+    current = await get_hot_watchlist(chat_id)
+    added, warnings, duplicates, unresolved = [], [], [], []
+    for part in parts:
+        if global_wear and "(" not in part:
+            part = f"{part} ({global_wear})"
+        names, warning = await _resolve_for_watchlist(part)
+        if not names:
+            unresolved.append(warning)
+            continue
+        if warning:
+            warnings.append(warning)
+        for name in names:
+            if name in current:
+                duplicates.append(name)
+                continue
+            current.append(name)
+            added.append(name)
+
+    await set_hot_watchlist(chat_id, current)
+
+    lines = [_add_tally(added, duplicates, unresolved)]
+    for block in (
+        _add_names_block("Добавлено в приоритетные", added),
+        _add_names_block("Уже были в приоритетных", duplicates),
+    ):
+        if block:
+            lines.append(block)
+    if warnings:
+        lines.append("Уточни, если не то:\n" + "\n".join(f"• {w}" for w in warnings))
+    if unresolved:
+        lines.append("Не распознал:\n" + "\n".join(f"• {s}" for s in unresolved))
+
+    # Предмет, которого нет в вотчлисте, приоритетным быть не может: обход
+    # идёт по вотчлисту, и приоритет лишь меняет порядок внутри него.
+    watch_items = set(await get_watchlist(chat_id)) | set(await get_float_watchlist(chat_id))
+    orphans = [n for n in added if n not in watch_items]
+    if orphans:
+        lines.append(
+            "⚠️ Этих нет ни в /watch, ни в /float, поэтому сканироваться они не "
+            "будут — приоритет только меняет порядок внутри списков:\n"
+            + "\n".join(f"• {n}" for n in orphans[:_ADD_LIST_LIMIT])
+        )
+
+    lines.append("")
+    lines.append("\n".join(await _hot_status_lines(chat_id)))
+    for chunk in _chunk_lines(lines, sep="\n\n"):
+        await update.message.reply_text(chunk)
+
+
+async def _hot_del(update, chat_id: int, arg: str) -> None:
+    current = await get_hot_watchlist(chat_id)
+    if not current:
+        return await update.message.reply_text("Приоритетный список пуст.")
+    if not arg:
+        return await update.message.reply_text(
+            "Формат: /hot убрать <номер из /hot или точное название>"
+        )
+    if arg.isdigit():
+        idx = int(arg) - 1
+        if not (0 <= idx < len(current)):
+            return await update.message.reply_text(f"Номер должен быть от 1 до {len(current)}.")
+        removed = current.pop(idx)
+    else:
+        match = next((x for x in current if x.lower() == arg.lower()), None)
+        if match is None:
+            return await update.message.reply_text(f"«{arg}» в приоритетном списке нет.")
+        current.remove(match)
+        removed = match
+    await set_hot_watchlist(chat_id, current)
+    await update.message.reply_text(
+        f"Убрал из приоритетных: «{removed}». Осталось {len(current)}.\n"
+        f"Из вотчлиста предмет НЕ удалён — он просто вернулся в общую очередь.\n\n"
+        + "\n".join(await _hot_status_lines(chat_id))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1981,6 +2188,20 @@ class WatchlistScanReport(NamedTuple):
     lock_wait: float = 0.0
 
 
+async def _rotation_settings(chat_id: int, hot_names: set) -> tuple[int, int | None]:
+    """
+    (курсор, сколько «остальных» за цикл) с подстановкой значения по умолчанию.
+
+    Значение по умолчанию подставляется, ТОЛЬКО когда приоритетный список
+    непуст: иначе ротация включилась бы сама собой у всех, кто про неё не
+    просил, и часть вотчлиста молча перестала бы проверяться каждый прогон.
+    """
+    cursor, cold_per_cycle = await get_rotation(chat_id)
+    if hot_names and cold_per_cycle is None:
+        cold_per_cycle = scan_plan.DEFAULT_COLD_PER_CYCLE
+    return cursor, cold_per_cycle
+
+
 async def _run_watchlist_scan(
     bot, chat_id: int, request_interval: float | None = None
 ) -> WatchlistScanReport | None:
@@ -2009,10 +2230,28 @@ async def _run_watchlist_scan(
     # Steam ОДИН раз и проверяем сразу по обоим критериям — иначе платили бы
     # двумя запросами за одни и те же лоты. Порядок: сначала обычный вотчлист,
     # затем предметы, которые нужны только под флоат.
+    # Переменная называется plan, а не scan_plan: одноимённый модуль уже
+    # импортирован, и совпадение имён здесь ломало бы вызов его функции.
     float_set = set(float_items)
-    scan_plan = [(name, True, name in float_set) for name in sticker_items]
+    plan = [(name, True, name in float_set) for name in sticker_items]
     sticker_set = set(sticker_items)
-    scan_plan += [(name, False, True) for name in float_items if name not in sticker_set]
+    plan += [(name, False, True) for name in float_items if name not in sticker_set]
+
+    # Приоритетные — каждый цикл, остальные по кругу. Пока приоритетный список
+    # пуст, split_cycle возвращает план как есть, то есть поведение прежнее.
+    # Суть размена описана в scan_plan: бюджет запросов фиксирован, и
+    # «проверять горячее чаще» означает «проверять холодное реже».
+    hot_names = set(await get_hot_watchlist(chat_id))
+    cursor, cold_per_cycle = await _rotation_settings(chat_id, hot_names)
+    full_size = len(plan)
+    plan, next_cursor = scan_plan.split_cycle(plan, hot_names, cursor, cold_per_cycle)
+    if len(plan) != full_size:
+        log.info(
+            "watchlist: chat_id=%s цикл — %d из %d предметов "
+            "(приоритетных %d, курсор %d→%d)",
+            chat_id, len(plan), full_size, len(hot_names), cursor, next_cursor,
+        )
+        await set_rotation_cursor(chat_id, next_cursor)
 
     _watchlist_running.add(chat_id)
     try:
@@ -2034,7 +2273,7 @@ async def _run_watchlist_scan(
         take_lock_wait()  # обнуляем счётчик очереди на полосу перед прогоном
 
         queue: asyncio.Queue = asyncio.Queue()
-        for entry in scan_plan:
+        for entry in plan:
             queue.put_nowait(entry)
 
         found_any = False
@@ -2073,7 +2312,7 @@ async def _run_watchlist_scan(
         # Параллельность нужна не чтобы просить чаще, а чтобы не простаивать:
         # пока по одному предмету идёт разбор ответа и походы в Upstash,
         # запрос по следующему уже в пути.
-        workers = min(SCAN_CONCURRENCY, len(scan_plan))
+        workers = min(SCAN_CONCURRENCY, len(plan))
         await asyncio.gather(*(worker() for _ in range(workers)))
 
         elapsed = time.perf_counter() - started
@@ -5727,6 +5966,33 @@ async def _status_lines(chat_id: int, jq) -> list[str]:
         extra = f", наценка ≤{f_markup:g}%" if f_markup is not None else ""
         lines.append(f"  Флоат: {_float_condition(fn_from, f_lo, f_hi, bs_to)}{extra}")
 
+    # --- Площадки ----------------------------------------------------------
+    lines.append("")
+    lines.append("<b>Площадки (/markets)</b>")
+    mk = await get_market_settings(chat_id)
+    if mk["interval"]:
+        nxt = _next_run_in(jq, f"{MARKETS_JOB_PREFIX}{chat_id}")
+        when = f"прогон через {_fmt_mins(nxt)}" if nxt is not None else "прогон не запланирован"
+        lines.append(f"  ▶️ автопрогон раз в {mk['interval']:g} мин, {when}")
+    else:
+        lines.append("  ⏹ автопрогон выключен — /markets 30 - 60 чтобы включить")
+    mk_disc = mk["min_discount"] if mk["min_discount"] is not None else MARKETS_DEFAULT_DISCOUNT
+    lines.append(f"  порог: дешевле Steam на {mk_disc:g}%+")
+    if mk.get("max_count"):
+        lines.append(f"  не больше {mk['max_count']:g} лотов на площадке")
+    lines.append(f"  источник цен: {'SIH' if sih_client.enabled() else 'csgotrader'}")
+
+    # --- Приоритет ---------------------------------------------------------
+    # Отдельным блоком, потому что отвечает на вопрос, которого раньше не было
+    # видно нигде: раз во сколько РЕАЛЬНО проверяется предмет. «Интервал 2 мин»
+    # из блока автоскана — это пауза МЕЖДУ прогонами, а не период проверки.
+    lines.append("")
+    lines.append("<b>Приоритет (/hot)</b>")
+    hot_items = await get_hot_watchlist(chat_id)
+    lines.append(f"  приоритетных: {len(hot_items)}")
+    for line in await _hot_status_lines(chat_id):
+        lines.append("  " + line.strip())
+
     # --- Просадки ----------------------------------------------------------
     # Историю копит один общий процесс, а не чат, и растёт она неделями. Без
     # этой строки «почему /dips не показывает минимум» никак не выяснить:
@@ -6743,6 +7009,24 @@ COMMANDS: tuple[Command, ...] = (
         "/watch -3 — убрать третий (или /watch убрать 3)\n"
         "/watch очистить — очистить список\n"
         "/watch стоп | /watch старт — пауза автоскана и обратно",
+    ),
+    Command(
+        # menu=None: в выпадающем списке Telegram её нет намеренно. Меню мы
+        # сокращали с 39 команд до одиннадцати, и место в нём заслуживает то,
+        # что набирают часто. Приоритетный список настраивают один раз, а
+        # находят его из подписи к /watch и из раздела «Состояние».
+        "hot", hot_cmd, "Списки", None,
+        "/hot — приоритетный список и что даёт расписание\n"
+        "/hot <предмет1>, <предмет2> — добавить (формат как у /watch)\n"
+        "/hot -2 — убрать второй, /hot очистить — очистить\n"
+        "/hot файл — прислать список файлом\n"
+        "/hot остальные 60 — сколько НЕприоритетных брать за цикл "
+        "(/hot остальные все — выключить ротацию)\n"
+        "Время цикла равно (предметы × пауза), поэтому добавить предметы "
+        "«сверх» нельзя: приоритет перераспределяет запросы, а не добавляет "
+        "их. Приоритетные идут каждый цикл, остальные — по кругу и потому "
+        "реже. Предмет должен быть в /watch или /float — /hot только меняет "
+        "порядок внутри них.",
     ),
     Command(
         "float", float_cmd, "Списки",

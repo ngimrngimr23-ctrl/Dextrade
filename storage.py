@@ -891,6 +891,41 @@ async def set_float_watchlist(chat_id: int, items: list[str]) -> None:
     await _save_watchlist_entry(chat_id, float_items=items)
 
 
+async def get_hot_watchlist(chat_id: int) -> list[str]:
+    """
+    Приоритетные предметы: их сканируем КАЖДЫЙ цикл, остальные — по кругу.
+
+    Живёт в той же записи, что вотчлист и список флоата, а не отдельным ключом:
+    все три читаются в начале каждого прогона, и разносить их по ключам значило
+    бы три похода в Upstash вместо одного.
+    """
+    return (await _get_watchlist_entry(chat_id)).get("hot_items", [])
+
+
+async def set_hot_watchlist(chat_id: int, items: list[str]) -> None:
+    await _save_watchlist_entry(chat_id, hot_items=items)
+
+
+async def get_rotation(chat_id: int) -> tuple[int, Optional[int]]:
+    """
+    (позиция курсора по «остальным», сколько их брать за цикл).
+
+    Курсор переживает перезапуск намеренно: иначе после каждого передеплоя
+    Render круг начинался бы заново с первого предмета, и хвост списка не
+    проверялся бы никогда.
+    """
+    entry = await _get_watchlist_entry(chat_id)
+    return int(entry.get("cold_cursor", 0)), entry.get("cold_per_cycle")
+
+
+async def set_rotation_cursor(chat_id: int, cursor: int) -> None:
+    await _save_watchlist_entry(chat_id, cold_cursor=int(cursor))
+
+
+async def set_cold_per_cycle(chat_id: int, value: Optional[int]) -> None:
+    await _save_watchlist_entry(chat_id, cold_per_cycle=value)
+
+
 async def get_watch_paused(chat_id: int) -> bool:
     """Приостановлен ли автоскан вотчлиста (/watchpause). Сам список при этом сохраняется."""
     return bool((await _get_watchlist_entry(chat_id)).get("paused"))
