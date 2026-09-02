@@ -140,6 +140,7 @@ from storage import (
     mark_offers_sent,
     get_all_chat_settings,
     SENT_OFFER_TTL_SECONDS,
+    WATCH_OFFER_TTL_SECONDS,
     get_market_settings,
     set_market_setting,
     get_dips_settings,
@@ -2118,12 +2119,34 @@ async def float_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _offer_key(market_hash_name: str, offer: Offer) -> str:
     """
-    Стабильный ключ конкретного лота — по inspect-ссылке (уникальна для
-    каждого экземпляра предмета в Steam), либо, если её нет, по сочетанию
-    название+цена+стикеры. Нужен, чтобы не слать один и тот же оффер
-    повторно в течение SENT_OFFER_TTL_SECONDS (см. storage.py).
+    Отпечаток конкретного ЭКЗЕМПЛЯРА предмета: название+качество, флоат и
+    наклейки в порядке слотов. По нему находка молчит неделю
+    (WATCH_OFFER_TTL_SECONDS, см. storage.py).
+
+    Почему не по inspect-ссылке, как было раньше. В ссылке вида M…A…D… первые
+    два числа — идентификатор лота на площадке и идентификатор предмета в
+    инвентаре, и оба меняются, как только лот сняли и выставили заново. Продавцы
+    так делают постоянно (переставить цену, поднять в выдаче), и каждый раз это
+    выглядело как новый лот: тот же ствол с тем же флоатом и теми же наклейками
+    прилетал в чат снова. Ключ по содержимому от этого не зависит — переставить
+    цену можно, а флоат нет.
+
+    Цена в ключ намеренно НЕ входит. Здесь это не новость: интересен сам
+    экземпляр (редкие наклейки, редкий флоат), а не то, что он подешевел на
+    доллар. У площадок и просадок наоборот — там цена в ключе есть, см.
+    _markets_offer_key.
+
+    Флоат берётся из inspect-ссылки локально (cs_inspect.py) и есть почти
+    всегда; если ссылка старого формата и флоат не раскодировался, откатываемся
+    на название+цена+наклейки. Это хуже — тот же лот с новой ценой пройдёт как
+    новый, — но всё равно лучше нестабильной ссылки.
     """
-    basis = offer.inspect_link or f"{market_hash_name}|{offer.price}|{','.join(offer.stickers)}"
+    if offer.float_value is not None:
+        # repr, а не форматирование: округление до пяти знаков склеило бы
+        # два разных экземпляра с близким флоатом в один ключ.
+        basis = f"{market_hash_name}|{offer.float_value!r}|{','.join(offer.stickers)}"
+    else:
+        basis = f"{market_hash_name}|{offer.price}|{','.join(offer.stickers)}"
     return hashlib.sha1(basis.encode("utf-8")).hexdigest()
 
 
@@ -2188,7 +2211,11 @@ async def _watchlist_scan_item(
             chunks[0] = f"🔔 {html_module.escape(market_hash_name)}\n\n{chunks[0]}"
             for chunk in chunks:
                 await bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML", disable_web_page_preview=True)
-            await mark_offers_sent(chat_id, [_offer_key(market_hash_name, o) for o in new_offers])
+            await mark_offers_sent(
+                chat_id,
+                [_offer_key(market_hash_name, o) for o in new_offers],
+                ttl=WATCH_OFFER_TTL_SECONDS,
+            )
             sent = True
 
     if stats is not None:

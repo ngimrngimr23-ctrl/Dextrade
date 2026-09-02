@@ -948,11 +948,25 @@ async def all_watchlist_chat_ids() -> list[int]:
 
 # ---------------------------------------------------------------------------
 # Дедупликация офферов автоскана вотчлиста: не слать один и тот же лот
-# повторно в один чат, если его уже присылали в пределах SENT_OFFER_TTL_SECONDS.
+# повторно в один чат, если его уже присылали в пределах TTL.
+#
+# Срок хранения разный и это намеренно. Конкретный экземпляр предмета на Steam
+# Market никуда не девается неделями: его переставляют в цене, снимают и
+# выставляют заново, и каждый раз это тот же самый скин с тем же флоатом и теми
+# же наклейками — присылать его снова нечего. Поэтому у находок вотчлиста
+# WATCH_OFFER_TTL_SECONDS = 7 дней.
+#
+# А вот у площадок, просадок и арбитража в ключ входит цена: повторное
+# уведомление там приходит только когда предмет реально подешевел, и это
+# новость, а не повтор. Им длинный срок не нужен, у них остаётся 5 часов.
+# Отдельно стоят «предупреждения» (инвентарь закрыт, CSFloat блокирует IP) —
+# им длинный срок прямо вреден: неделю молчать о том, что функция не работает,
+# нельзя.
 # ---------------------------------------------------------------------------
 
 SENT_OFFER_KEY_PREFIX = "sentoffer:"
 SENT_OFFER_TTL_SECONDS = 5 * 60 * 60  # 5 часов
+WATCH_OFFER_TTL_SECONDS = 7 * 24 * 60 * 60  # 7 дней
 LOCAL_SENT_OFFERS_PATH = Path(__file__).parent / "sent_offers_local.json"
 
 
@@ -966,11 +980,18 @@ def _local_sent_offers_load() -> dict:
 
 
 def _local_sent_offers_save(data: dict) -> None:
-    LOCAL_SENT_OFFERS_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    # Храним МОМЕНТ ИСТЕЧЕНИЯ, а не момент отправки: у разных ключей теперь
+    # разный TTL, и по одному только времени отправки прочитать срок уже нельзя.
+    #
+    # Заодно выкидываем протухшее. Без этого файл рос бы вечно: раньше срок был
+    # один и короткий, и на это можно было закрыть глаза, с недельным — уже нет.
+    now = time.time()
+    alive = {k: v for k, v in data.items() if v > now}
+    LOCAL_SENT_OFFERS_PATH.write_text(json.dumps(alive, ensure_ascii=False), encoding="utf-8")
 
 
 async def was_offer_sent_recently(chat_id: int, offer_key: str) -> bool:
-    """True, если этот же оффер уже отправляли в этот чат за последние SENT_OFFER_TTL_SECONDS."""
+    """True, если этот же оффер уже отправляли в этот чат и запись ещё не истекла."""
     full_key = f"{SENT_OFFER_KEY_PREFIX}{chat_id}:{offer_key}"
 
     if REDIS_ENABLED:
@@ -979,8 +1000,8 @@ async def was_offer_sent_recently(chat_id: int, offer_key: str) -> bool:
         except Exception:
             pass
 
-    sent_at = _local_sent_offers_load().get(full_key)
-    return sent_at is not None and (time.time() - sent_at) < SENT_OFFER_TTL_SECONDS
+    expires_at = _local_sent_offers_load().get(full_key)
+    return expires_at is not None and expires_at > time.time()
 
 
 async def filter_new_offers(chat_id: int, offer_keys: list[str]) -> list[bool]:
@@ -1013,14 +1034,18 @@ async def filter_new_offers(chat_id: int, offer_keys: list[str]) -> list[bool]:
 
     data = _local_sent_offers_load()
     now = time.time()
-    return [
-        not (data.get(k) is not None and (now - data[k]) < SENT_OFFER_TTL_SECONDS)
-        for k in full_keys
-    ]
+    return [not (data.get(k) is not None and data[k] > now) for k in full_keys]
 
 
-async def mark_offers_sent(chat_id: int, offer_keys: list[str]) -> None:
-    """Пачкой: отметить сразу несколько офферов отправленными (один pipeline вместо SET на каждый)."""
+async def mark_offers_sent(
+    chat_id: int, offer_keys: list[str], ttl: int = SENT_OFFER_TTL_SECONDS,
+) -> None:
+    """
+    Пачкой: отметить сразу несколько офферов отправленными (один pipeline вместо SET на каждый).
+
+    ttl — на сколько секунд замолчать по этим ключам. Находкам вотчлиста
+    передают WATCH_OFFER_TTL_SECONDS (неделя), остальным подходит умолчание.
+    """
     if not offer_keys:
         return
 
@@ -1029,7 +1054,7 @@ async def mark_offers_sent(chat_id: int, offer_keys: list[str]) -> None:
     if REDIS_ENABLED:
         try:
             results = await _redis_pipeline(
-                [["SET", k, "1", "EX", str(SENT_OFFER_TTL_SECONDS)] for k in full_keys]
+                [["SET", k, "1", "EX", str(ttl)] for k in full_keys]
             )
             if any(isinstance(r, dict) and "error" in r for r in results):
                 raise RuntimeError(f"pipeline вернул ошибку хотя бы по одной команде: {results}")
@@ -1038,24 +1063,26 @@ async def mark_offers_sent(chat_id: int, offer_keys: list[str]) -> None:
             log.warning("mark_offers_sent: Upstash недоступен, пишу в локальный файл", exc_info=True)
 
     data = _local_sent_offers_load()
-    now = time.time()
+    expires_at = time.time() + ttl
     for k in full_keys:
-        data[k] = now
+        data[k] = expires_at
     _local_sent_offers_save(data)
 
 
-async def mark_offer_sent(chat_id: int, offer_key: str) -> None:
+async def mark_offer_sent(
+    chat_id: int, offer_key: str, ttl: int = SENT_OFFER_TTL_SECONDS,
+) -> None:
     full_key = f"{SENT_OFFER_KEY_PREFIX}{chat_id}:{offer_key}"
 
     if REDIS_ENABLED:
         try:
-            await _redis_cmd("SET", full_key, "1", "EX", str(SENT_OFFER_TTL_SECONDS))
+            await _redis_cmd("SET", full_key, "1", "EX", str(ttl))
             return
         except Exception:
             pass
 
     data = _local_sent_offers_load()
-    data[full_key] = time.time()
+    data[full_key] = time.time() + ttl
     _local_sent_offers_save(data)
 
 
