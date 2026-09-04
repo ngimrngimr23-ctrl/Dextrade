@@ -169,6 +169,7 @@ import menu
 import pricing
 import dips
 import price_history
+import scan_errors
 import scan_plan
 import scan_profile
 import proxy_pool
@@ -2182,7 +2183,10 @@ async def _watchlist_scan_item(
         log.warning("watchlist: %s (chat_id=%s): %s", market_hash_name, chat_id, e)
         if stats is not None:
             stats.add("steam", time.perf_counter() - t0)
-            stats.count("failed")
+            # Не count("failed"), а note_error: само исключение нужно целиком,
+            # чтобы показать причину в чате (см. scan_errors). Счётчик failed
+            # note_error двигает сам.
+            stats.note_error(market_hash_name, e)
         return False
 
     if stats is not None:
@@ -2452,9 +2456,27 @@ def _format_scan_done(report: "WatchlistScanReport") -> str:
     Единый текст итога и для /scanall, и для автоскана — специально ОДИН И ТОТ
     ЖЕ формат, чтобы пользователь видел одинаковое сообщение независимо от
     того, кто запустил прогон.
+
+    Ошибки прогона идут сюда же, а не отдельным сообщением: они относятся
+    именно к этому прогону, и «Готово» без них врёт. Отдельно про случай,
+    когда упало ВСЁ: тогда и первая строка другая — писать «проверено 618,
+    ничего не нашлось» там, где ни один предмет не проверился, нельзя.
     """
-    tail = "есть новые находки — см. выше." if report.found_any else "ничего подходящего не нашлось."
-    return f"Готово: проверено {report.items} предмет(ов), {tail}"
+    errors = getattr(report.profile, "errors", []) if report.profile else []
+    failed = len(errors)
+    # report.items считает только УСПЕШНО обработанные предметы: упавший
+    # возвращается из _watchlist_scan_item до строки count("items"). Значит
+    # взято за прогон было items + failed, и вычитать ошибки ещё раз нельзя.
+    attempted = report.items + failed
+
+    if failed and not report.items:
+        head = f"Готово: проверить не удалось ни одного предмета из {attempted}."
+    else:
+        tail = "есть новые находки — см. выше." if report.found_any else "ничего подходящего не нашлось."
+        head = f"Готово: проверено {report.items} предмет(ов), {tail}"
+
+    lines = [head] + scan_errors.summarize(errors, items=attempted)
+    return "\n".join(lines)
 
 
 async def watchlist_scan_job(context: ContextTypes.DEFAULT_TYPE):
@@ -7625,6 +7647,51 @@ async def _run_with_webhook(app, token: str) -> bool:
     return True
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Последний рубеж: неожиданное исключение в любой команде, кнопке или джобе.
+
+    Без него python-telegram-bot просто пишет трейсбек в лог и молчит — а лог
+    на Render живёт в другом окне, и со стороны чата сбой выглядит как «бот
+    задумался и не ответил». Ошибку, из-за которой команда не отработала,
+    человек должен видеть там же, где отдал команду.
+
+    Куда слать. У джоб нет update, поэтому chat_id ищем сначала в апдейте,
+    потом в данных джобы; если чата определить не удалось, ограничиваемся
+    логом — рассылать сбой всем подряд хуже, чем промолчать.
+
+    Текст чистим (scan_errors.scrub): в исключение легко попадает пароль от
+    прокси или кусок куки, а сообщение в Telegram — это уже наружу.
+    """
+    exc = context.error
+    log.exception("необработанная ошибка", exc_info=exc)
+
+    chat_id = None
+    if isinstance(update, Update) and update.effective_chat:
+        chat_id = update.effective_chat.id
+    elif getattr(context, "job", None) is not None:
+        data = context.job.data or {}
+        chat_id = data.get("chat_id") if isinstance(data, dict) else None
+    if chat_id is None:
+        return
+
+    where = ""
+    if isinstance(update, Update) and update.effective_message and update.effective_message.text:
+        where = f" на «{update.effective_message.text.split()[0]}»"
+    elif getattr(context, "job", None) is not None:
+        where = f" в фоновой задаче «{context.job.name}»"
+
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"❌ Сбой{where}: {scan_errors.reason(exc)}\nПодробности — в логах Render.",
+        )
+    except Exception:
+        # Отправка отчёта об ошибке сама упала — это уже только в лог, иначе
+        # получится бесконечная петля из обработчика ошибок в самого себя.
+        log.exception("не удалось отправить сообщение об ошибке в chat_id=%s", chat_id)
+
+
 def _build_application(token: str):
     """
     Собрать Application со всеми обработчиками. Отдельной функцией, потому что
@@ -7661,6 +7728,7 @@ def _build_application(token: str):
     app.add_handler(CallbackQueryHandler(menu_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_selection))
+    app.add_error_handler(on_error)
     return app
 
 

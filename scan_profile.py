@@ -67,11 +67,18 @@ class ScanProfile:
         "items", "failed",
         "listings", "with_stickers", "offers", "fresh", "sent",
         "steam_requests", "redis_calls", "sticker_requests",
+        "errors",
     )
 
     def __init__(self) -> None:
         for name in self.__slots__:
+            if name == "errors":
+                continue
             setattr(self, name, 0.0 if name in _TIME_FIELDS else 0)
+        # Сами исключения, а не только их счётчик: счётчик failed говорит, что
+        # что-то сломалось, но не что именно, и в чат с ним не выйдешь.
+        # Пары (предмет, исключение) — группировка и текст живут в scan_errors.
+        self.errors: list[tuple[str, BaseException]] = []
 
     # --- накопление --------------------------------------------------------
 
@@ -80,6 +87,11 @@ class ScanProfile:
 
     def count(self, field: str, n: int = 1) -> None:
         setattr(self, field, getattr(self, field) + n)
+
+    def note_error(self, market_hash_name: str, exc: BaseException) -> None:
+        """Запомнить сбой по предмету. failed растёт вместе с этим списком."""
+        self.errors.append((market_hash_name, exc))
+        self.failed += 1
 
     @property
     def compute(self) -> float:
