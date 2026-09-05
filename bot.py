@@ -592,6 +592,8 @@ async def handle_text_selection(update: Update, context: ContextTypes.DEFAULT_TY
     """
     if await _handle_pending_setting(update, context):
         return
+    if await _handle_pending_input(update, context):
+        return
 
     chat_id = update.effective_chat.id
     pending = _pending_search.get(chat_id)
@@ -6198,6 +6200,108 @@ async def _status_lines(chat_id: int, jq) -> list[str]:
 # нельзя: там ждут номер варианта предмета, здесь — число.
 _pending_setting: dict[int, str] = {}
 
+# Чат ждёт текст для операции меню: chat_id -> ключ из _MENU_INPUT.
+# Третье ожидание, и снова отдельное. Все три просят «пришли сообщение», но
+# ждут разного: номер варианта, число порога, название предмета. Свести их в
+# одно поле означало бы применять ввод не туда при любой накладке.
+_pending_input: dict[int, str] = {}
+
+
+class MenuInput(NamedTuple):
+    """
+    Что делать с текстом, который пришёл после нажатия кнопки.
+
+    handler — существующий обработчик команды, args — как из введённого текста
+    собрать его context.args. Смысл в том, что кнопка НЕ несёт своей логики:
+    она только спрашивает и передаёт в ту же команду, которую человек мог бы
+    набрать руками. Поэтому меню нельзя рассинхронизировать с командами — это
+    один и тот же код.
+    """
+
+    handler: object
+    prompt: str
+    args: object          # str -> list[str]
+    back: str             # куда вернуть меню после выполнения
+
+
+def _as_one_arg(text: str) -> list[str]:
+    """Весь текст одним аргументом — так имена скинов с пробелами не рассыпаются."""
+    return [text]
+
+
+def _as_words(text: str) -> list[str]:
+    return text.split()
+
+
+def _as_removal(text: str) -> list[str]:
+    """
+    Номер предмета для удаления. Пользователь наверняка пришлёт просто «3»,
+    а обработчик удаления как раз этого и ждёт, так что преобразование
+    тривиальное — но оставлено явным, чтобы формат ввода был виден в таблице.
+    """
+    return text.split()
+
+
+# Кнопка -> вопрос -> существующая команда. Ни одной новой бизнес-логики:
+# меню только спрашивает и зовёт то же, что человек набрал бы руками.
+_MENU_INPUT: dict[str, MenuInput] = {
+    "w_add": MenuInput(
+        watchadd,
+        "Что добавить в вотчлист?\n\n"
+        "Названия через запятую. Степень износа можно указать один раз "
+        "последним элементом.\n"
+        "Пример: <code>AK-47 | Redline, AWP | Asiimov, FT</code>",
+        _as_one_arg, "watch",
+    ),
+    "w_del": MenuInput(
+        watchdel,
+        "Какой предмет убрать? Пришли его номер из списка.\n"
+        "Пример: <code>3</code>",
+        _as_removal, "watch",
+    ),
+    "f_add": MenuInput(
+        floatadd,
+        "Что добавить в список охоты за флоатом?\n\n"
+        "Названия через запятую.\n"
+        "Пример: <code>AWP | Asiimov (Field-Tested)</code>",
+        _as_one_arg, "float",
+    ),
+    "f_del": MenuInput(
+        floatdel,
+        "Какой предмет убрать из списка флоата? Пришли его номер.\n"
+        "Пример: <code>2</code>",
+        _as_removal, "float",
+    ),
+    "f_check": MenuInput(
+        floatcheck,
+        "Какой скин проверить?\n\n"
+        "Отвечает на вопрос, платят ли вообще за низкий флоат именно на нём — "
+        "до того, как добавлять его в список.\n"
+        "Пример: <code>AWP | Asiimov (Field-Tested)</code>",
+        _as_one_arg, "float",
+    ),
+    "i_link": MenuInput(
+        inv,
+        "Пришли ссылку на профиль Steam.\n\n"
+        "Инвентарь должен быть открыт.\n"
+        "Пример: <code>https://steamcommunity.com/id/username</code>",
+        _as_words, "inv",
+    ),
+    "i_watch": MenuInput(
+        invwatch,
+        "На сколько процентов должен подорожать предмет, чтобы сообщить?\n"
+        "Пример: <code>15</code> (или <code>off</code>, чтобы выключить)",
+        _as_words, "inv",
+    ),
+    "p_add": MenuInput(
+        proxyadd,
+        "Пришли адреса прокси.\n\n"
+        "Сколько угодно за раз — через запятую, пробел или с новой строки.\n"
+        "Формат: <code>http://логин:пароль@хост:порт</code>",
+        _as_one_arg, "proxy",
+    ),
+}
+
 
 class _MenuMessage:
     """
@@ -6831,6 +6935,102 @@ async def _menu_screen(chat_id: int, node: str, context) -> tuple[str, object]:
             menu.root(),
         )
 
+    if node == "watch":
+        items = await get_watchlist(chat_id)
+        hot = await get_hot_watchlist(chat_id)
+        paused = await get_watch_paused(chat_id)
+        interval = await _get_watch_interval(chat_id)
+        # Время обхода — по тождеству «предметы × пауза», проверенному на живых
+        # прогонах. Здесь оно уместнее всего: человек видит длину списка и
+        # сразу цену этой длины в минутах.
+        minutes = len(items) * MIN_REQUEST_INTERVAL / 60
+        lines = [
+            "📋 <b>Вотчлист</b>",
+            "<i>Охота за лотами с недооценёнными наклейками.</i>",
+            "",
+            f"Предметов: <b>{len(items)}</b>",
+        ]
+        if items:
+            lines.append(f"Полный обход ≈ {minutes:.0f} мин ({len(items)} × {MIN_REQUEST_INTERVAL:g} с)")
+        if hot:
+            lines.append(f"Из них приоритетных: <b>{len(hot)}</b>")
+        lines.append("")
+        lines.append(
+            "⏸ Автоскан на паузе."
+            if paused
+            else f"▶️ Автоскан включён, пауза между прогонами {interval:g} мин."
+        )
+        if not items:
+            lines.append("")
+            lines.append(
+                "⚠️ Список пуст — сканировать нечего.\n"
+                "Нажми «Добавить» или пришли <code>/watch AK-47 | Redline (Field-Tested)</code>"
+            )
+        return "\n".join(lines), menu.watchlist(paused)
+
+    if node == "float":
+        items = await get_float_watchlist(chat_id)
+        settings = await _load_scan_settings(chat_id)
+        lines = [
+            "💎 <b>Охота за флоатом</b>",
+            "<i>Список отдельный от вотчлиста: редкий флоат имеет смысл искать "
+            "на конкретных скинах.</i>",
+            "",
+            f"Предметов: <b>{len(items)}</b>",
+        ]
+        if settings.float_low is None or settings.float_high is None:
+            # Пустой порог здесь важнее пустого списка: со списком, но без
+            # порога флоат не проверяется вообще, и это ровно тот случай,
+            # когда «ничего не находит» выглядит как поломка.
+            lines.append("")
+            lines.append(
+                "⚠️ Порог флоата не задан — охота выключена и запросов не тратит.\n"
+                "Задать: «Пороги флоата» ниже или <code>/setfloatfilter 0.01 0.99</code>"
+            )
+        else:
+            lines.append("")
+            lines.append(
+                f"Условие: {_float_condition(settings.float_low_min, settings.float_low, settings.float_high, settings.float_high_max)}"
+            )
+        return "\n".join(lines), menu.float_list()
+
+    if node == "inv":
+        steam_id = await get_inventory_steamid(chat_id)
+        growth = await get_inventory_growth(chat_id)
+        lines = ["📦 <b>Инвентарь</b>", ""]
+        if not steam_id:
+            lines.append(
+                "Аккаунт не привязан.\n\n"
+                "<i>Привязав, можно оценить инвентарь по текущим ценам Steam и "
+                "получать сообщения, когда предмет заметно подорожал. Инвентарь "
+                "должен быть открыт.</i>"
+            )
+        else:
+            lines.append(f"Аккаунт: <code>{html_module.escape(str(steam_id))}</code>")
+            lines.append(
+                f"Слежение: рост от {growth:g}%" if growth is not None
+                else "Слежение выключено."
+            )
+        return "\n".join(lines), menu.inventory(bool(steam_id))
+
+    if node.startswith("ask:"):
+        action = node.split(":", 1)[1]
+        if action == "w_clear":
+            items = await get_watchlist(chat_id)
+            return (
+                f"🗑 <b>Очистить вотчлист?</b>\n\n"
+                f"Будет удалено <b>{len(items)}</b> предмет(ов). Отменить нельзя.",
+                menu.confirm("w_clear", "watch"),
+            )
+        if action == "f_clear":
+            items = await get_float_watchlist(chat_id)
+            return (
+                f"🗑 <b>Очистить список флоата?</b>\n\n"
+                f"Будет удалено <b>{len(items)}</b> предмет(ов). Отменить нельзя.",
+                menu.confirm("f_clear", "float"),
+            )
+        return "Не знаю такого подтверждения.", menu.root()
+
     if node == "lists":
         sticker_items = await get_watchlist(chat_id)
         float_items = await get_float_watchlist(chat_id)
@@ -6866,9 +7066,10 @@ async def _menu_screen(chat_id: int, node: str, context) -> tuple[str, object]:
 
     if node == "set":
         return (
-            "⚙️ <b>Пороги</b>\n\n"
+            "⚙️ <b>Настройки</b>\n\n"
             "Что и когда бот считает находкой. Выбери раздел — внутри видно "
-            "текущие значения и что каждое означает.",
+            "текущие значения и что каждое означает.\n\n"
+            "<i>Ниже — служебное: прокси и прайс-лист стикеров.</i>",
             menu.sections(),
         )
 
@@ -6980,18 +7181,47 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _show_menu(query, chat_id, f"set:{setting.section}", context)
         return
 
+    # Кнопка просит текст: запоминаем ожидание и спрашиваем. Сам вызов
+    # обработчика будет в _handle_pending_input, когда ответ придёт.
+    if payload in _MENU_INPUT:
+        spec = _MENU_INPUT[payload]
+        _pending_setting.pop(chat_id, None)  # два ожидания разом — верный способ применить не туда
+        _pending_input[chat_id] = payload
+        await shim.message.reply_text(
+            f"{spec.prompt}\n\n<i>Или /start, чтобы выйти.</i>", parse_mode="HTML"
+        )
+        return
+
     if payload == "scanall":
         await scanall(shim, context)
     elif payload == "arbnow":
         await arbnow(shim, context)
     elif payload == "markets":
         await markets(shim, _SubCtx(context, []))
+    elif payload == "dips":
+        await dips_cmd(shim, _SubCtx(context, []))
+    elif payload == "help":
+        await help_cmd(shim, context)
     elif payload == "pause":
         await watchpause(shim, context)
-        await _show_menu(query, chat_id, "lists", context)
+        await _show_menu(query, chat_id, "watch", context)
     elif payload == "resume":
         await watchresume(shim, context)
-        await _show_menu(query, chat_id, "lists", context)
+        await _show_menu(query, chat_id, "watch", context)
+    elif payload == "w_list":
+        await watchlist_cmd(shim, _SubCtx(context, []))
+    elif payload == "w_clear":
+        await watchclear(shim, context)
+        await _show_menu(query, chat_id, "watch", context)
+    elif payload == "w_hot":
+        await hot_cmd(shim, _SubCtx(context, []))
+    elif payload == "f_list":
+        await floatlist_cmd(shim, _SubCtx(context, []))
+    elif payload == "f_clear":
+        await floatclear(shim, context)
+        await _show_menu(query, chat_id, "float", context)
+    elif payload == "i_value":
+        await inv(shim, _SubCtx(context, []))
     elif payload == "arbreset":
         await _arb_reset(shim)
         await _show_menu(query, chat_id, "state", context)
@@ -7049,9 +7279,37 @@ async def _handle_pending_setting(update: Update, context: ContextTypes.DEFAULT_
     return True
 
 
+async def _handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Текст, присланный после кнопки «Добавить»/«Удалить»/«Проверить».
+    True — сообщение съедено.
+
+    Ожидание снимается ДО вызова обработчика, а не после. Иначе упавшая
+    команда оставила бы чат в режиме ожидания навсегда, и каждое следующее
+    сообщение — включая «привет» — уезжало бы в неё же.
+    """
+    chat_id = update.effective_chat.id
+    key = _pending_input.pop(chat_id, None)
+    if key is None:
+        return False
+
+    spec = _MENU_INPUT.get(key)
+    if spec is None:
+        log.error("_handle_pending_input: неизвестный ключ %r", key)
+        return False
+
+    text = (update.message.text or "").strip()
+    if not text:
+        return True
+
+    await spec.handler(update, _SubCtx(context, spec.args(text)))
+    return True
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/start — главное меню. Всё остальное достижимо отсюда в один-два нажатия."""
     _pending_setting.pop(update.effective_chat.id, None)
+    _pending_input.pop(update.effective_chat.id, None)
     text, keyboard = await _menu_screen(update.effective_chat.id, "root", context)
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 

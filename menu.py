@@ -244,30 +244,139 @@ def _back(node: str) -> InlineKeyboardButton:
 
 def root() -> InlineKeyboardMarkup:
     """
-    Главный экран. Первыми — действия, а не настройки: в девяти случаях из
-    десяти меню открывают, чтобы что-то запустить, а не чтобы подкрутить порог.
+    Главный экран: сначала запуски, потом предметные разделы, в конце
+    служебное.
+
+    Порядок не случайный. В девяти случаях из десяти меню открывают, чтобы
+    что-то запустить, а не подкрутить порог, поэтому три «сейчас» стоят
+    первыми. Дальше — то, чем управляют регулярно (вотчлист, флоат,
+    инвентарь), и только потом состояние с настройками.
+
+    Прокси и прайс-лист с этого экрана убраны внутрь настроек намеренно: это
+    администрирование инфраструктуры, а не торговля. Держать их рядом с
+    «Сканировать сейчас» — то же самое, что показывать пользователю
+    внутреннее устройство бота.
     """
     return _rows(
         [InlineKeyboardButton("🔎 Сканировать сейчас", callback_data=f"{ACT}|scanall")],
         [InlineKeyboardButton("💱 Арбитраж сейчас", callback_data=f"{ACT}|arbnow")],
-        [InlineKeyboardButton("🏪 Площадки сейчас", callback_data=f"{ACT}|markets")],
         [
-            InlineKeyboardButton("📋 Списки", callback_data=f"{NAV}|lists"),
-            InlineKeyboardButton("📊 Состояние", callback_data=f"{NAV}|state"),
+            InlineKeyboardButton("🏪 Площадки", callback_data=f"{ACT}|markets"),
+            InlineKeyboardButton("📉 Просадки", callback_data=f"{ACT}|dips"),
         ],
         [
-            InlineKeyboardButton("⚙️ Пороги", callback_data=f"{NAV}|set"),
-            InlineKeyboardButton("🌐 Прокси", callback_data=f"{NAV}|proxy"),
+            InlineKeyboardButton("📋 Вотчлист", callback_data=f"{NAV}|watch"),
+            InlineKeyboardButton("💎 Флоат", callback_data=f"{NAV}|float"),
         ],
-        [InlineKeyboardButton("📄 Прайс-лист", callback_data=f"{NAV}|prices")],
+        [InlineKeyboardButton("📦 Инвентарь", callback_data=f"{NAV}|inv")],
+        [
+            InlineKeyboardButton("📊 Статус", callback_data=f"{NAV}|state"),
+            InlineKeyboardButton("⚙️ Настройки", callback_data=f"{NAV}|set"),
+        ],
+        [InlineKeyboardButton("❓ Помощь", callback_data=f"{ACT}|help")],
+    )
+
+
+def watchlist(paused: bool) -> InlineKeyboardMarkup:
+    """
+    Экран вотчлиста: операции над списком плюс управление автосканом.
+
+    Операции и настройки намеренно разведены. Здесь только то, что делают со
+    СПИСКОМ (добавить, убрать, показать, очистить) и с его прогоном (запустить,
+    поставить на паузу). Пороги отбора — что считать находкой — живут в
+    настройках, потому что их трогают раз в месяц, а список правят постоянно.
+    """
+    toggle = (
+        InlineKeyboardButton("▶️ Возобновить автоскан", callback_data=f"{ACT}|resume")
+        if paused
+        else InlineKeyboardButton("⏸ Пауза автоскана", callback_data=f"{ACT}|pause")
+    )
+    return _rows(
+        [InlineKeyboardButton("🔎 Сканировать сейчас", callback_data=f"{ACT}|scanall")],
+        [
+            InlineKeyboardButton("➕ Добавить", callback_data=f"{ACT}|w_add"),
+            InlineKeyboardButton("➖ Удалить", callback_data=f"{ACT}|w_del"),
+        ],
+        [
+            InlineKeyboardButton("📋 Показать", callback_data=f"{ACT}|w_list"),
+            InlineKeyboardButton("🗑 Очистить", callback_data=f"{NAV}|ask:w_clear"),
+        ],
+        [toggle],
+        [InlineKeyboardButton("🔥 Приоритетные", callback_data=f"{ACT}|w_hot")],
+        [_back("root")],
+    )
+
+
+def float_list() -> InlineKeyboardMarkup:
+    """
+    Экран охоты за флоатом. Тот же набор операций, что у вотчлиста, плюс
+    разовая проверка «платят ли вообще за низкий флоат на этом скине».
+
+    Называется float_list, а не float: имя float в модуле затенило бы
+    встроенный тип, и первая же аннотация с ним начала бы врать.
+    """
+    return _rows(
+        [
+            InlineKeyboardButton("➕ Добавить", callback_data=f"{ACT}|f_add"),
+            InlineKeyboardButton("➖ Удалить", callback_data=f"{ACT}|f_del"),
+        ],
+        [
+            InlineKeyboardButton("📋 Показать", callback_data=f"{ACT}|f_list"),
+            InlineKeyboardButton("🗑 Очистить", callback_data=f"{NAV}|ask:f_clear"),
+        ],
+        [InlineKeyboardButton("🔬 Проверить скин", callback_data=f"{ACT}|f_check")],
+        [InlineKeyboardButton("⚙️ Пороги флоата", callback_data=f"{NAV}|set:float")],
+        [_back("root")],
+    )
+
+
+def inventory(linked: bool) -> InlineKeyboardMarkup:
+    """
+    Экран инвентаря. Пока аккаунт не привязан, показывать «оценить» и
+    «следить» нечестно — они всё равно ответят «сначала привяжи».
+    """
+    if not linked:
+        return _rows(
+            [InlineKeyboardButton("🔗 Привязать аккаунт", callback_data=f"{ACT}|i_link")],
+            [_back("root")],
+        )
+    return _rows(
+        [InlineKeyboardButton("💰 Оценить сейчас", callback_data=f"{ACT}|i_value")],
+        [InlineKeyboardButton("🔔 Следить за ростом", callback_data=f"{ACT}|i_watch")],
+        [InlineKeyboardButton("🔗 Сменить аккаунт", callback_data=f"{ACT}|i_link")],
+        [_back("root")],
+    )
+
+
+def confirm(action: str, back_node: str) -> InlineKeyboardMarkup:
+    """
+    Спросить подтверждение перед необратимым действием.
+
+    Нужно ровно из-за перехода на кнопки. Команда /watch очистить требовала
+    напечатать слово «очистить» — это само по себе было подтверждением. Кнопка
+    же стирает шестьсот предметов одним касанием, промахнуться по соседней
+    «Показать» легко, а отмены нет.
+    """
+    return _rows(
+        [InlineKeyboardButton("🗑 Да, очистить", callback_data=f"{ACT}|{action}")],
+        [InlineKeyboardButton("‹ Отмена", callback_data=f"{NAV}|{back_node}")],
     )
 
 
 def sections() -> InlineKeyboardMarkup:
+    """
+    Настройки: пороги отбора плюс два служебных раздела.
+
+    Прокси и прайс-лист — не пороги, у них нет числового значения, поэтому
+    они не в SECTIONS, а дописаны отдельными кнопками. Место им всё же здесь:
+    это настройка инфраструктуры, и с главного экрана она уехала именно сюда.
+    """
     rows = [
         [InlineKeyboardButton(sec.title, callback_data=f"{NAV}|set:{sec.key}")]
         for sec in SECTIONS
     ]
+    rows.append([InlineKeyboardButton("🌐 Прокси", callback_data=f"{NAV}|proxy")])
+    rows.append([InlineKeyboardButton("📄 Прайс-лист стикеров", callback_data=f"{NAV}|prices")])
     rows.append([_back("root")])
     return InlineKeyboardMarkup(rows)
 
@@ -291,6 +400,12 @@ def editing(setting: Setting) -> InlineKeyboardMarkup:
 
 
 def lists(paused: bool) -> InlineKeyboardMarkup:
+    """
+    Прежний общий экран «Списки». Оставлен рабочим: на него ведут ссылки из
+    старых сообщений в чате, а кнопка в уже отправленном сообщении живёт
+    вечно и после перестройки меню не обновляется. Из нового главного экрана
+    сюда не попасть — там вотчлист и флоат разведены по своим экранам.
+    """
     toggle = (
         InlineKeyboardButton("▶️ Включить автоскан", callback_data=f"{ACT}|resume")
         if paused
@@ -299,6 +414,10 @@ def lists(paused: bool) -> InlineKeyboardMarkup:
     return _rows(
         [InlineKeyboardButton("🔎 Сканировать сейчас", callback_data=f"{ACT}|scanall")],
         [toggle],
+        [
+            InlineKeyboardButton("📋 Вотчлист", callback_data=f"{NAV}|watch"),
+            InlineKeyboardButton("💎 Флоат", callback_data=f"{NAV}|float"),
+        ],
         [_back("root")],
     )
 
@@ -320,10 +439,13 @@ def state(show_reset: bool) -> InlineKeyboardMarkup:
 
 
 def proxy() -> InlineKeyboardMarkup:
+    # «Назад» ведёт в настройки, а не на главный: теперь сюда приходят оттуда,
+    # и возврат на главный терял бы место, откуда пришли.
     return _rows(
         [InlineKeyboardButton("🔍 Проверить прокси", callback_data=f"{ACT}|proxycheck")],
+        [InlineKeyboardButton("➕ Добавить прокси", callback_data=f"{ACT}|p_add")],
         [InlineKeyboardButton("🗑 Забыть добавленные", callback_data=f"{ACT}|proxyclear")],
-        [_back("root")],
+        [_back("set")],
     )
 
 
@@ -333,5 +455,5 @@ def prices() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔑 Проверить ключ SIH", callback_data=f"{ACT}|sihkey")],
         [InlineKeyboardButton("📥 Загрузить прайс-лист", callback_data=f"{ACT}|pricefile")],
         [InlineKeyboardButton("🗑 Очистить прайс-лист", callback_data=f"{ACT}|clearprices")],
-        [_back("root")],
+        [_back("set")],
     )
