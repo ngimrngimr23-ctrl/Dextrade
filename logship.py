@@ -45,8 +45,30 @@ log = logging.getLogger("steam_bot.logship")
 
 API = "https://api.github.com"
 
+def _normalize_repo(raw: str) -> str:
+    """
+    Привести LOG_GITHUB_REPO к виду owner/repo.
+
+    Терпим то, что реально вставляют вместо голого owner/repo: полную ссылку
+    со страницы репозитория, хвост .git от clone-адреса, лишние слэши. Это не
+    угождение неряшливости — значение задают на телефоне в поле Render, где
+    скопировать URL целиком проще, чем вырезать из него два слова.
+
+    Пробел вместо слэша НЕ чиним молча: это опечатка, и подставить за человека
+    слэш значит угадать. Такое значение отвергает validate_repo с прямым
+    указанием, что не так.
+    """
+    value = raw.strip().strip("/")
+    for prefix in ("https://github.com/", "http://github.com/", "git@github.com:"):
+        if value.lower().startswith(prefix):
+            value = value[len(prefix):]
+    if value.lower().endswith(".git"):
+        value = value[:-4]
+    return value.strip("/")
+
+
 TOKEN = os.environ.get("LOG_GITHUB_TOKEN", "").strip()
-REPO = os.environ.get("LOG_GITHUB_REPO", "").strip()          # owner/repo
+REPO = _normalize_repo(os.environ.get("LOG_GITHUB_REPO", ""))  # owner/repo
 BRANCH = os.environ.get("LOG_GITHUB_BRANCH", "main").strip()
 PATH = os.environ.get("LOG_GITHUB_PATH", "dextrade.log").strip()
 INTERVAL_MINUTES = float(os.environ.get("LOG_SHIP_MINUTES", "30"))
@@ -93,6 +115,36 @@ class LogShipError(RuntimeError):
     """Выгрузка не удалась. Текст уходит человеку, поэтому он человеческий."""
 
 
+def validate_repo(value: str) -> str | None:
+    """
+    Что не так с LOG_GITHUB_REPO. None — всё в порядке.
+
+    Значение показываем в кавычках: пробел вместо слэша в логе выглядит
+    неотличимо от слэша, и именно на этом уже потеряли время.
+    """
+    if not value:
+        return "LOG_GITHUB_REPO пуст — нужен вид owner/repo."
+    if "/" not in value:
+        hint = ""
+        if " " in value:
+            hint = " Похоже, вместо слэша пробел."
+        return (
+            f"LOG_GITHUB_REPO = «{value}» — не похоже на owner/repo.{hint}\n"
+            f"Нужно ровно так: ngimrngimr23-ctrl/Dextrade-logs"
+        )
+    if value.count("/") > 1:
+        return (
+            f"LOG_GITHUB_REPO = «{value}» — лишние слэши. "
+            f"Нужны только владелец и имя: owner/repo."
+        )
+    owner, _, name = value.partition("/")
+    if not owner or not name:
+        return f"LOG_GITHUB_REPO = «{value}» — пустой владелец или имя репозитория."
+    if " " in value:
+        return f"LOG_GITHUB_REPO = «{value}» — внутри пробел, так имя не найдётся."
+    return None
+
+
 async def check(session: aiohttp.ClientSession | None = None) -> str:
     """
     Проверить настройку до первой выгрузки: жив ли токен, есть ли репозиторий
@@ -102,6 +154,14 @@ async def check(session: aiohttp.ClientSession | None = None) -> str:
     """
     if not enabled():
         return status()
+
+    # Формат проверяем ДО сети. Иначе кривое значение уезжает в URL и
+    # возвращается как 404 «репозиторий не найден» — сообщение, которое
+    # обвиняет токен и уводит от настоящей причины. Ровно так и вышло:
+    # в переменную попал пробел вместо слэша, а бот сказал про права токена.
+    problem = validate_repo(REPO)
+    if problem:
+        raise LogShipError(problem)
 
     own = session is None
     session = session or aiohttp.ClientSession()
@@ -113,11 +173,20 @@ async def check(session: aiohttp.ClientSession | None = None) -> str:
                     "возможно, он истёк или скопирован не полностью."
                 )
             if resp.status == 404:
+                # Формат уже проверен выше, значит имя как минимум осмысленное.
+                # Для приватного репозитория GitHub отвечает 404, а не 403,
+                # когда у токена нет к нему доступа — то есть «не найден» здесь
+                # почти всегда означает «токен его не видит».
                 raise LogShipError(
-                    f"Репозиторий {REPO} не найден (404). Либо имя не то, либо у "
-                    f"токена нет к нему доступа — для приватного репозитория "
-                    f"нужен fine-grained токен с правом Contents: Read and write "
-                    f"именно на этот репозиторий."
+                    f"Репозиторий «{REPO}» не найден (404).\n"
+                    f"Для приватного репозитория GitHub отвечает 404 и когда его "
+                    f"просто нет, и когда токен его не видит — это одно и то же "
+                    f"сообщение. Проверь по порядку:\n"
+                    f"1) в токене выбран именно этот репозиторий "
+                    f"(Only select repositories);\n"
+                    f"2) в Permissions добавлено Contents со значением "
+                    f"Read and write, и счётчик Repositories показывает 1, а не 0;\n"
+                    f"3) имя написано точно: {REPO}"
                 )
             if resp.status != 200:
                 raise LogShipError(f"GitHub ответил {resp.status} на проверку {REPO}.")
