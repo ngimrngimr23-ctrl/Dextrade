@@ -170,6 +170,7 @@ import pricing
 import dips
 import price_history
 import logsetup
+import logship
 import scan_errors
 import scan_plan
 import scan_profile
@@ -5997,6 +5998,28 @@ async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     есть наружу, а в логи попадают адреса прокси вместе с паролями.
     """
     args = [a.lower() for a in context.args]
+
+    if args and args[0] in ("github", "гитхаб", "гит", "выгрузи", "push"):
+        if not logship.enabled():
+            await update.message.reply_text(
+                "Выгрузка на GitHub не настроена.\n\n"
+                "Нужны две переменные окружения на Render:\n"
+                "• <code>LOG_GITHUB_REPO</code> — вида owner/repo, "
+                "ПРИВАТНЫЙ репозиторий\n"
+                "• <code>LOG_GITHUB_TOKEN</code> — fine-grained токен с правом "
+                "Contents: Read and write на этот репозиторий\n\n"
+                "Ключ присылать сюда не надо — он задаётся только на Render.",
+                parse_mode="HTML",
+            )
+            return
+        try:
+            note = await logship.ship(logsetup.dump(), note="по команде")
+        except logship.LogShipError as e:
+            await update.message.reply_text(str(e))
+            return
+        await update.message.reply_text(note, disable_web_page_preview=True)
+        return
+
     min_level = logging.WARNING if any(a in _LOG_PROBLEM_WORDS for a in args) else None
     everything = any(a in ("всё", "все", "all", "полный") for a in args)
 
@@ -6029,6 +6052,32 @@ async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buf = io.BytesIO(payload)
     buf.name = "dextrade.log"
     await update.message.reply_document(document=buf, filename="dextrade.log", caption=caption)
+
+
+LOG_SHIP_JOB_NAME = "logship"
+
+
+async def log_ship_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Периодическая выгрузка лога в репозиторий на GitHub.
+
+    Сбой выгрузки НЕ должен ничего ронять и не должен спамить в чат: это
+    вспомогательная функция, и её поломка не повод мешать работе бота. Всё
+    уходит в лог — тот самый, который не выгрузился, но он есть в /logs.
+    """
+    try:
+        note = await logship.ship(logsetup.dump(), note="автовыгрузка")
+        log.info("logship: %s", note)
+    except logship.LogShipError as e:
+        log.warning("logship: %s", e)
+    except Exception:
+        log.exception("logship: непредвиденная ошибка выгрузки")
+    finally:
+        context.job_queue.run_once(
+            log_ship_job,
+            when=logship.INTERVAL_MINUTES * 60,
+            name=LOG_SHIP_JOB_NAME,
+        )
 
 
 async def pricefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7866,6 +7915,7 @@ COMMANDS: tuple[Command, ...] = (
         "/logs 500 — столько строк\n"
         "/logs ошибки — только предупреждения и ошибки, с трейсбеками\n"
         "/logs всё — файл целиком\n"
+        "/logs github — выгрузить лог в репозиторий (если настроен)\n"
         "Нужна, чтобы разбор сбоя не начинался с ручного копирования из "
         "панели Render. Пароли прокси и токены из файла вычищаются.",
     ),
@@ -8026,6 +8076,25 @@ async def _on_startup(app: Application):
     for job in app.job_queue.get_jobs_by_name(HISTORY_JOB_NAME):
         job.schedule_removal()
     app.job_queue.run_once(price_history_job, when=90, name=HISTORY_JOB_NAME)
+
+    # Выгрузка лога в репозиторий — только если настроена. Проверяем ЗДЕСЬ, на
+    # старте, а не при первой выгрузке: узнать «репозиторий публичный, писать
+    # не буду» через полчаса работы хуже, чем сразу. Проверка не должна мешать
+    # запуску, поэтому её отказ — это запись в лог, а не исключение наверх.
+    if logship.enabled():
+        for job in app.job_queue.get_jobs_by_name(LOG_SHIP_JOB_NAME):
+            job.schedule_removal()
+        try:
+            log.info("logship: %s", await logship.check())
+            app.job_queue.run_once(
+                log_ship_job, when=120, name=LOG_SHIP_JOB_NAME,
+            )
+        except logship.LogShipError as e:
+            log.warning("logship: выгрузка не включена — %s", e)
+        except Exception:
+            log.exception("logship: не смог проверить настройку выгрузки")
+    else:
+        log.info("logship: %s", logship.status())
 
 
 # ---------------------------------------------------------------------------
