@@ -685,19 +685,31 @@ async def set_market_setting(chat_id: int, key: str, value) -> None:
 
 async def get_dips_settings(chat_id: int) -> dict:
     """
-    Настройки поиска просадок: {'min_drop': %, 'interval': мин}.
+    Настройки поиска просадок.
+
+    min_drop — просадка от месячной нормы, %
+    interval — автопрогон, мин
+    min_volume — минимум продаж, ШТУК В НЕДЕЛЮ (0 — фильтр выключен)
+    min_price / max_price — диапазон цены предмета
+
     None в любом поле — не задано, действует значение по умолчанию из кода.
+    Отдельно про min_volume: там None и 0 значат РАЗНОЕ. None — «не трогали,
+    работает умолчание», 0 — «человек сознательно выключил фильтр». Свести их
+    в одно значение нельзя: выключить фильтр стало бы невозможно.
     """
     s = await _get_chat_settings(chat_id)
     return {
         "min_drop": s.get("dip_min_drop"),
         "interval": s.get("dip_interval"),
+        "min_volume": s.get("dip_min_volume"),
+        "min_price": s.get("dip_min_price"),
+        "max_price": s.get("dip_max_price"),
     }
 
 
 async def set_dips_setting(chat_id: int, key: str, value) -> None:
-    """key — одно из: min_drop, interval."""
-    allowed = {"min_drop", "interval"}
+    """key — одно из: min_drop, interval, min_volume, min_price, max_price."""
+    allowed = {"min_drop", "interval", "min_volume", "min_price", "max_price"}
     if key not in allowed:
         raise ValueError(f"неизвестная настройка просадок: {key}")
     settings = await _get_chat_settings(chat_id)

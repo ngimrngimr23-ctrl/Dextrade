@@ -4644,6 +4644,17 @@ async def _apply_dips_args(chat_id: int, args) -> dict:
             raise ValueError("Интервал считается в минутах, меньше одной не бывает.")
         await set_dips_setting(chat_id, "interval", minutes)
 
+    if len(args) >= 3:
+        # Третьим — ликвидность, штук в неделю. Ноль здесь означает именно
+        # «выключить фильтр» и записывается нулём, а не None: None читается
+        # как «не задано» и вернул бы умолчание, то есть выключить фильтр
+        # этим путём стало бы невозможно.
+        volume = number(args[2], "продаж в неделю")
+        if volume is not None:
+            if volume < 0:
+                raise ValueError("Продаж в неделю не может быть меньше нуля.")
+            await set_dips_setting(chat_id, "min_volume", volume)
+
     return await get_dips_settings(chat_id)
 
 
@@ -4680,9 +4691,15 @@ async def dips_scan_job(context: ContextTypes.DEFAULT_TYPE):
         _reschedule_dips_job(context.job_queue, chat_id, fresh["interval"])
 
 
-def _dip_key(dip) -> str:
-    """Ключ для отсева повторов. Цена в ключе: подешевел ещё — это новость."""
-    return f"dip:{dip.market_hash_name}:{dip.today:.2f}"
+def _dip_key(market_hash_name: str, price: float) -> str:
+    """
+    Ключ для отсева повторов. Цена в ключе: подешевел ещё — это новость.
+
+    Цену принимаем аргументом, а не берём dip.today. Раньше ключ считался по
+    суточной средней, а решение и показ — по живой цене: предмет, у которого
+    живая цена изменилась, а средняя за сутки нет, молча подавлялся.
+    """
+    return f"dip:{market_hash_name}:{price:.2f}"
 
 
 async def _run_dips_scan(send, chat_id: int, saved: dict, *, quiet: bool = False) -> None:
@@ -4709,7 +4726,18 @@ async def _dips_scan_body(send, chat_id: int, saved: dict, *, quiet: bool = Fals
     отбор по всему каталогу, потом живая проверка верхушки. Окна отвечают на
     вопрос «куда смотреть», живой запрос — «правда ли это сейчас».
     """
-    min_drop = saved["min_drop"] if saved["min_drop"] is not None else DIPS_DEFAULT_DROP
+    # Через .get(), а не по ключу: прогон не должен падать целиком из-за
+    # неполного словаря настроек. Ключи добавлялись со временем, и жёсткий
+    # доступ означал бы, что любой вызывающий со старым набором роняет
+    # KeyError вместо того, чтобы отработать на умолчаниях.
+    def _setting(key, default=None):
+        value = saved.get(key)
+        return default if value is None else value
+
+    min_drop = _setting("min_drop", DIPS_DEFAULT_DROP)
+    min_week_volume = _setting("min_volume", dips.DEFAULT_MIN_WEEK_VOLUME)
+    min_price = _setting("min_price", dips.MIN_PRICE)
+    max_price = saved.get("max_price")
 
     details = await get_csgotrader_price_details()
     if not details:
@@ -4728,6 +4756,7 @@ async def _dips_scan_body(send, chat_id: int, saved: dict, *, quiet: bool = Fals
 
     found, dropped = dips.find_dips(
         details, min_drop_pct=min_drop,
+        min_price=min_price, max_price=max_price,
         history=records, mature_days=HISTORY_MATURE_DAYS,
     )
     if not found:
@@ -4764,52 +4793,112 @@ async def _dips_scan_body(send, chat_id: int, saved: dict, *, quiet: bool = Fals
             "началось, первые данные — через сутки."
         )
 
+    liquidity_note = (
+        f"Только то, что продаётся от {min_week_volume:g} шт/нед — объём Steam "
+        f"за сутки × 7, то есть оценка по одному дню."
+        if min_week_volume
+        else "Фильтр ликвидности выключен: среди находок может быть то, что "
+             "почти не торгуется и к норме не вернётся."
+    )
     lines = [
-        f"📉 Просадки от месячной нормы — найдено {len(found)}\n"
-        f"<i>Цена сегодня против средней за 30 дней. Это НЕ арбитраж: разрыв "
+        f"📉 Просадки от месячной нормы — кандидатов {len(found)}\n"
+        f"<i>Живая цена против средней за 30 дней. Это НЕ арбитраж: разрыв "
         f"во времени, а не между площадками — чтобы заработать, цена должна "
         f"вернуться, и она может не вернуться. «Вернётся» — прибыль при "
         f"возврате к норме за вычетом комиссии "
-        f"~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%.\n{history_note}</i>"
+        f"~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%.\n{liquidity_note}\n"
+        f"{history_note}</i>"
     ]
-    shown = []
-    evaporated = 0
+    # Живая проверка каждого кандидата. Всё, что решает — просадка, минимум,
+    # ликвидность — считается по цене ПРЯМО СЕЙЧАС, а не по средней за сутки.
+    # Средняя годится, чтобы понять, куда смотреть, но не чтобы покупать:
+    # предмет мог полдня стоять на минимуме и к вечеру подорожать, а средняя
+    # всё равно покажет «на минимуме».
+    verified = []      # (dip, цена сейчас, просадка сейчас, объём/нед, на минимуме)
+    evaporated = 0     # просадка закрылась к моменту проверки
+    illiquid = 0       # продаётся реже порога
+    unverified = 0     # живой цены нет — подтвердить нечем
     for dip in top:
-        if len(shown) >= 15:
-            break
-        live = live_prices.get(dip.market_hash_name)
+        quote = live_prices.get(dip.market_hash_name)
 
-        if live:
-            # Живая цена есть — она и есть цена. Пересчитываем по ней ВСЁ:
-            # и просадку, и прибыль при возврате.
-            #
-            # Раньше пересчитывалась только просадка, а прибыль оставалась
-            # посчитанной по суточной средней — соседние строки противоречили
-            # друг другу. Хуже того, находка показывалась даже когда просадка
-            # уходила в минус: предмет успел подорожать, а бот всё равно звал
-            # его покупать. Именно это и заметно снаружи как «присылает те,
-            # что дороже».
-            price_now = live
-            drop_pct = (dip.month - live) / dip.month * 100
-            if drop_pct < min_drop:
-                evaporated += 1
+        if quote is None:
+            # Раньше такие показывались с пометкой «(оценка)». Пока фильтр
+            # ликвидности выключен, так и оставляем — данные те же, что были.
+            # А вот с включённым фильтром показывать их нельзя: ликвидность
+            # берётся из того же ответа, которого нет, то есть подтвердить
+            # предмет нечем ни по цене, ни по объёму. «Не знаю» — не то же
+            # самое, что «проходит».
+            if min_week_volume:
+                unverified += 1
                 continue
-            now = f"<b>сейчас ${live:.2f}</b>"
-        else:
-            price_now = dip.today
-            drop_pct = dip.drop_pct
-            now = f"сутки ${dip.today:.2f} <i>(оценка)</i>"
+            verified.append((dip, dip.today, dip.drop_pct, None, False))
+            continue
 
-        gain = (dip.month * STEAM_FEE_MULTIPLIER - price_now) / price_now * 100
-        shown.append(dip)
+        price_now = quote.price
+        drop_pct = dip.drop_pct_at(price_now)
+        if drop_pct < min_drop:
+            evaporated += 1
+            continue
 
-        # Строка про накопленный минимум. Считаем её от price_now, а не от
-        # dip.today: если живая цена есть, «на минимуме» должно относиться
-        # именно к ней — иначе получится тот же разлад между соседними
-        # строками, из-за которого команда звала покупать подорожавшее.
+        per_week = dips.week_volume(quote.volume)
+        if min_week_volume:
+            if per_week is None or per_week < min_week_volume:
+                illiquid += 1
+                continue
+
+        verified.append((dip, price_now, drop_pct, per_week, dip.is_at_low(price_now)))
+
+    if not verified:
+        if not quiet:
+            why = []
+            if evaporated:
+                why.append(f"просадка уже закрылась — {evaporated}")
+            if illiquid:
+                why.append(f"продаётся реже {min_week_volume:g} шт/нед — {illiquid}")
+            if unverified:
+                why.append(f"Steam не ответил, подтвердить нечем — {unverified}")
+            await send(
+                f"Кандидатов было {len(found)}, живой ценой не подтверждён ни один.\n"
+                + ("Причины: " + ", ".join(why) if why else "")
+            )
+        return
+
+    # Сортировка — ТОЛЬКО здесь, когда живые цены уже известны. Сначала те,
+    # кто стоит на своём минимуме прямо сейчас: спрашивали именно про них.
+    verified.sort(key=lambda v: (v[4], v[2]), reverse=True)
+    shown = [v[0] for v in verified[:15]]
+
+    log.info(
+        "dips: кандидатов %d, проверено %d, показано %d. Отсев живой проверкой: "
+        "просадка закрылась %d, неликвид %d, не подтверждено %d",
+        len(found), len(top), len(shown), evaporated, illiquid, unverified,
+    )
+
+    # Дедуп ДО сборки текста: он решает не только «слать или молчать», но и
+    # ЧТО слать. Раньше отфильтрованный список никуда не шёл — сообщение
+    # собиралось из всех находок, и одна новая просадка тянула за собой
+    # повторную отправку остальных четырнадцати.
+    if quiet:
+        keys = [_dip_key(name, price) for name, price in
+                ((v[0].market_hash_name, v[1]) for v in verified[:15])]
+        fresh = await filter_new_offers(chat_id, keys)
+        if not any(fresh):
+            log.info("dips: все просадки уже присылались, молчу")
+            return
+        await mark_offers_sent(chat_id, [k for k, is_new in zip(keys, fresh) if is_new])
+        verified = [v for v, is_new in zip(verified[:15], fresh) if is_new]
+        shown = [v[0] for v in verified]
+
+    for dip, price_now, drop_pct, per_week, at_low in verified[:15]:
+        gain = dip.recovery_gain_pct(price_now, STEAM_FEE_MULTIPLIER)
+        now = (
+            f"<b>сейчас ${price_now:.2f}</b>" if per_week is not None or min_week_volume
+            else f"сутки ${price_now:.2f} <i>(оценка)</i>"
+        )
+
         extra = ""
         if dip.low:
-            vs_low = (dip.low - price_now) / dip.low * 100
+            vs_low = dip.below_low_pct(price_now)
             where = (
                 f"на {vs_low:.0f}% ниже него" if vs_low >= 0.1
                 else f"на {-vs_low:.0f}% выше него" if vs_low <= -0.1
@@ -4819,43 +4908,52 @@ async def _dips_scan_body(send, chat_id: int, saved: dict, *, quiet: bool = Fals
                 f"\n  минимум за {dip.history_days} дн. ${dip.low:.2f} — сейчас {where}"
                 f"\n  цена менялась в {dip.activity_pct:.0f}% дней"
             )
-        mark = "🔻 " if dip.low and price_now <= dip.low * 1.001 else ""
+        if per_week is not None:
+            extra += f"\n  продаётся ≈{per_week:.0f} шт/нед"
 
         lines.append(
-            f"{mark}<code>{html_module.escape(dip.market_hash_name)}</code>\n"
+            f"{'🔻 ' if at_low else ''}<code>{html_module.escape(dip.market_hash_name)}</code>\n"
             f"  {now} | неделя ${dip.week:.2f} | месяц ${dip.month:.2f}{extra}\n"
             f"  дешевле нормы на {drop_pct:.0f}%, при возврате "
             f"{'+' if gain >= 0 else ''}{gain:.0f}% чистыми\n"
             f'  <a href="{dip.steam_url}">Открыть в Steam</a>'
         )
 
-    if not shown:
-        if not quiet:
-            await send(
-                f"Кандидатов было {len(found)}, но живая цена не подтвердила ни "
-                f"одного: к моменту проверки просадка уже закрылась.\n"
-                f"Отбор идёт по средней за сутки, а она отстаёт от текущей цены."
-            )
-        return
-    if evaporated:
-        log.info("dips: %d кандидатов отсеяно живой ценой — просадка закрылась", evaporated)
-
-    if quiet:
-        keys = [_dip_key(d) for d in shown]
-        fresh = await filter_new_offers(chat_id, keys)
-        if not any(fresh):
-            log.info("dips: все просадки уже присылались, молчу")
-            return
-        await mark_offers_sent(chat_id, [k for k, is_new in zip(keys, fresh) if is_new])
-
-    if len(found) > 15:
-        lines.append(f"<i>…и ещё {len(found) - 15}. Подними порог, чтобы список был короче.</i>")
+    # Остаток считаем от реально показанного, а не от пятнадцати: после
+    # отсева живой проверкой показанных бывает меньше, и «…и ещё 30» под
+    # списком из восьми строк просто врало.
+    rest = len(found) - len(shown)
+    if rest > 0:
+        lines.append(
+            f"<i>…и ещё {rest} кандидат(ов) — живой ценой не проверялись "
+            f"(проверяем первые {DIPS_VERIFY_LIMIT}). Подними порог, чтобы "
+            f"список был короче.</i>"
+        )
 
     for chunk in _chunk_lines(lines, sep="\n\n"):
         await send(chunk, parse_mode="HTML", disable_web_page_preview=True)
 
 
-async def _live_prices_for(chat_id: int, names: list[str]) -> dict[str, float]:
+class LiveQuote(NamedTuple):
+    """
+    Живая цена и суточный объём — то, что priceoverview отдаёт одним ответом.
+
+    Объём здесь появился не просто так: он и раньше приходил в этом же ответе
+    и даже сохранялся в кэш через set_steam_price, но наружу не возвращался и
+    терялся. То есть фильтр ликвидности для /dips стоил ровно ноль
+    дополнительных запросов — данные уже были на руках.
+
+    volume — ШТУК ЗА СУТКИ. Ноль означает «за сутки не продано ничего» (Steam
+    просто не кладёт поле), None — «спросить не удалось». Разница
+    принципиальная: ноль это худшая из возможных находок, а None — отсутствие
+    сведений, и обходиться с ними одинаково нельзя.
+    """
+
+    price: float
+    volume: int | None = None
+
+
+async def _live_prices_for(chat_id: int, names: list[str]) -> dict[str, LiveQuote]:
     """
     Живая цена Steam по списку имён — сколько получится в рамках бюджета.
 
@@ -4866,7 +4964,10 @@ async def _live_prices_for(chat_id: int, names: list[str]) -> dict[str, float]:
     if not names:
         return {}
     cached = await get_steam_prices_batch(names)
-    out = {n: e["price"] for n, e in cached.items() if e.get("price")}
+    out = {
+        n: LiveQuote(e["price"], e.get("volume"))
+        for n, e in cached.items() if e.get("price")
+    }
 
     misses = [n for n in names if n not in cached][:STEAM_LIVE_BUDGET]
     if not misses:
@@ -4882,13 +4983,13 @@ async def _live_prices_for(chat_id: int, names: list[str]) -> dict[str, float]:
                 return name, None
             if live and live.lowest:
                 await set_steam_price(name, live.lowest, live.volume)
-                return name, live.lowest
+                return name, LiveQuote(live.lowest, live.volume)
             return name, None
 
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
-        for name, price in await asyncio.gather(*(one(session, n) for n in misses)):
-            if price:
-                out[name] = price
+        for name, quote in await asyncio.gather(*(one(session, n) for n in misses)):
+            if quote:
+                out[name] = quote
     return out
 
 
@@ -4923,16 +5024,29 @@ async def dips_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         saved = await get_dips_settings(chat_id)
 
     min_drop = saved["min_drop"] if saved["min_drop"] is not None else DIPS_DEFAULT_DROP
+    min_vol = (
+        saved["min_volume"] if saved["min_volume"] is not None
+        else dips.DEFAULT_MIN_WEEK_VOLUME
+    )
     schedule = (
         f"автопрогон раз в {saved['interval']:g} мин"
         if saved["interval"] else "автопрогон выключен"
     )
+    liquidity = (
+        "Фильтр ликвидности выключен — покажу и то, что почти не торгуется."
+        if not min_vol
+        else f"Только то, что продаётся от {min_vol:g} шт/нед "
+             f"(объём Steam за сутки × 7 — оценка по одному дню)."
+    )
     await update.message.reply_text(
         f"Ищу предметы дешевле месячной нормы от {min_drop:g}%, {schedule}.\n"
+        f"{liquidity}\n"
+        f"Просадка проверяется по ЖИВОЙ цене, а не по средней за сутки.\n"
         f"Свежие просадки: неделя должна держаться у месяца, иначе это не "
         f"просадка, а падение.\n"
         f"StatTrak и наклейки не участвуют.\n\n"
-        f"Формат: /dips <просадка%> [минут между прогонами]"
+        f"Формат: /dips <просадка%> [минут] [шт/нед]\n"
+        f"Пример: /dips 30 60 10 — просадка от 30%, раз в час, от 10 продаж в неделю"
     )
     await _run_dips_scan(update.message.reply_text, chat_id, saved)
 
@@ -6349,6 +6463,7 @@ async def _settings_snapshot(chat_id: int) -> dict[str, str]:
     f_markup = await get_float_markup(chat_id)
     arb = await get_arb_settings(chat_id)
     mk = await get_market_settings(chat_id)
+    dp = await get_dips_settings(chat_id)
     watch_interval = await _get_watch_interval(chat_id)
 
     def pair(lo, hi, fmt=_fmt_money) -> str:
@@ -6392,6 +6507,20 @@ async def _settings_snapshot(chat_id: int) -> dict[str, str]:
         ),
         "mk_interval": (
             "выключен" if not mk["interval"] else f"раз в {mk['interval']:g} мин"
+        ),
+        "dp_drop": f"{dp['min_drop'] if dp['min_drop'] is not None else DIPS_DEFAULT_DROP:g}%",
+        # Ноль показываем как «выключено», а не как «от 0 шт/нед»: это и есть
+        # выключенный фильтр, и человек должен видеть именно это слово.
+        "dp_vol": (
+            "выключено" if dp["min_volume"] == 0
+            else f"от {dp['min_volume'] if dp['min_volume'] is not None else dips.DEFAULT_MIN_WEEK_VOLUME:g} шт/нед"
+        ),
+        "dp_price": pair(
+            dp["min_price"] if dp["min_price"] is not None else dips.MIN_PRICE,
+            dp["max_price"],
+        ),
+        "dp_int": (
+            "выключен" if not dp["interval"] else f"раз в {dp['interval']:g} мин"
         ),
         "wt_int": f"{watch_interval:g} мин",
     }
@@ -6607,6 +6736,43 @@ async def _apply_setting(chat_id: int, key: str, value, context) -> str:
         }[key]
         await set_market_setting(chat_id, storage_key, value)
         return f"✅ {setting.label}: {value:g}\n\nПроверить прямо сейчас: /markets"
+
+    if key == "dp_int":
+        await set_dips_setting(chat_id, "interval", value)
+        _reschedule_dips_job(jq, chat_id, value)
+        return (
+            "✅ Автопрогон просадок выключен."
+            if value is None
+            else f"✅ Просадки проверяются сами раз в {value:g} мин. "
+                 "Присылаю только новые находки."
+        )
+
+    if key == "dp_price":
+        lo, hi = value if value is not None else (None, None)
+        await set_dips_setting(chat_id, "min_price", lo)
+        await set_dips_setting(chat_id, "max_price", hi)
+        return (
+            "✅ Фильтр цены для просадок снят."
+            if value is None
+            else f"✅ Просадки: только предметы {_fmt_money(lo)} … {_fmt_money(hi)}."
+        )
+
+    if key == "dp_vol":
+        # None здесь означает «выключить», и записываем именно 0, а не None:
+        # None в хранилище читается как «не задано» и вернул бы умолчание,
+        # то есть кнопка «Выключить» молча включала бы фильтр обратно.
+        await set_dips_setting(chat_id, "min_volume", 0 if value is None else value)
+        return (
+            "✅ Фильтр ликвидности выключен — покажу и то, что почти не торгуется."
+            if value is None
+            else f"✅ Просадки: только предметы, продающиеся от {value:g} шт/нед.\n"
+                 f"<i>Steam отдаёт объём за сутки, недельный считается как "
+                 f"суточный × 7 — это оценка по одному дню.</i>"
+        )
+
+    if key == "dp_drop":
+        await set_dips_setting(chat_id, "min_drop", value)
+        return f"✅ Просадка от нормы: {value:g}%\n\nПроверить прямо сейчас: /dips"
 
     if key == "wt_int":
         await set_watch_gap(chat_id, value)
@@ -7515,12 +7681,16 @@ COMMANDS: tuple[Command, ...] = (
         "dips", dips_cmd, "Площадки",
         "Просадки: дешевле месячной нормы",
         "/dips — предметы, торгующиеся дешевле своей средней за 30 дней\n"
-        "/dips <просадка%> [минут] — задать порог и автопрогон, например "
-        "/dips 30 60\n"
-        "/dips выкл — выключить автопрогон (порог сохранится)\n"
-        "Отбор идёт по всему каталогу локально, без запросов к Steam, поэтому "
-        "работает даже когда всё остальное упирается в лимиты. StatTrak и "
-        "наклейки исключены. Это НЕ арбитраж: разрыв во времени, а не между "
+        "/dips <просадка%> [минут] [шт/нед] — задать пороги и автопрогон, "
+        "например /dips 30 60 10\n"
+        "/dips выкл — выключить автопрогон (пороги сохранятся)\n"
+        "Остальное — /start → Настройки → Просадки.\n"
+        "Отбор по каталогу идёт локально, без запросов к Steam; живая цена "
+        "тратится только на верхушку — по ней и проверяются просадка, "
+        "ликвидность и «стоит ли на минимуме прямо сейчас».\n"
+        "Неликвид отсеивается: предмет, продающийся реже порога, к «норме» не "
+        "вернётся, потому что покупателя у него нет. StatTrak и наклейки "
+        "исключены. Это НЕ арбитраж: разрыв во времени, а не между "
         "площадками — цена должна вернуться, и она может не вернуться.",
     ),
     Command(
