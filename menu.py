@@ -472,6 +472,12 @@ def state(show_reset: bool) -> InlineKeyboardMarkup:
     rows = []
     if show_reset:
         rows.append([InlineKeyboardButton("♻️ Сбросить кулдаун", callback_data=f"{ACT}|arbreset")])
+    # Логи живут именно здесь: за ними идут ровно тогда, когда смотрят
+    # состояние и видят, что что-то не так.
+    rows.append([
+        InlineKeyboardButton("📄 Лог", callback_data=f"{ACT}|logs"),
+        InlineKeyboardButton("⚠️ Только ошибки", callback_data=f"{ACT}|logs_err"),
+    ])
     rows.append([InlineKeyboardButton("🔄 Обновить", callback_data=f"{NAV}|state")])
     rows.append([_back("root")])
     return InlineKeyboardMarkup(rows)

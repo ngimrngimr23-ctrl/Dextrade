@@ -169,6 +169,7 @@ import menu
 import pricing
 import dips
 import price_history
+import logsetup
 import scan_errors
 import scan_plan
 import scan_profile
@@ -176,7 +177,10 @@ import proxy_pool
 import sih_client
 from csfloat_client import CSFloatError, CSFloatRateLimited
 
-logging.basicConfig(level=logging.INFO)
+# Логи идут в три места сразу: stdout (панель Render, как было), файл с
+# ротацией и кольцо в памяти. Ради /logs — чтобы разбор сбоя не начинался с
+# ручного копирования из панели. Секреты вычищаются на выходе, см. logsetup.
+logsetup.setup(logging.INFO)
 log = logging.getLogger("steam_bot")
 
 # httpx на INFO печатает полный URL каждого запроса к Telegram, а токен бота —
@@ -5968,6 +5972,65 @@ async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(chunk)
 
 
+# Слова, которыми просят только проблемы, а не весь лог.
+_LOG_PROBLEM_WORDS = {"ошибки", "ошибка", "проблемы", "errors", "error", "warn", "warnings"}
+
+# Сколько строк отдавать по умолчанию. Полный файл бывает в мегабайты, а
+# отвечает на вопрос обычно хвост — с него и начинают.
+LOG_DEFAULT_LINES = 2000
+
+
+async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /logs                — последние строки лога файлом
+    /logs 500            — последние 500 строк
+    /logs ошибки         — только WARNING и выше (с трейсбеками)
+    /logs ошибки 200     — то же, последние 200 строк
+    /logs всё            — весь файл целиком
+
+    Зачем команда. Бот живёт на Render, и до сих пор единственным способом
+    посмотреть, что случилось, была панель Render: открыть, найти нужный
+    кусок глазами, скопировать руками. Панель показывает хвост и режет
+    длинные строки, поэтому диагностика регулярно приходила обрезанной.
+
+    Секреты из лога вычищаются на выходе (logsetup): файл уходит в чат, то
+    есть наружу, а в логи попадают адреса прокси вместе с паролями.
+    """
+    args = [a.lower() for a in context.args]
+    min_level = logging.WARNING if any(a in _LOG_PROBLEM_WORDS for a in args) else None
+    everything = any(a in ("всё", "все", "all", "полный") for a in args)
+
+    lines = None if everything else LOG_DEFAULT_LINES
+    for a in args:
+        if a.isdigit():
+            lines = int(a)
+            break
+
+    payload = logsetup.dump(lines=lines, min_level=min_level)
+    body = payload.decode("utf-8", "replace").strip()
+    if not body:
+        st = logsetup.stats()
+        await update.message.reply_text(
+            "Лог пуст.\n"
+            + ("Только ошибки не нашлись — это хорошая новость."
+               if min_level else
+               f"Файл {st['file']}, в памяти {st['ring_lines']} строк.")
+        )
+        return
+
+    st = logsetup.stats()
+    what = "только предупреждения и ошибки" if min_level else "все строки"
+    caption = (
+        f"Лог: {what}, {body.count(chr(10)) + 1} строк.\n"
+        f"Файл на диске {st['file_bytes'] / 1024:.0f} КБ, в памяти "
+        f"{st['ring_lines']} из {st['ring_capacity']} строк."
+    )
+
+    buf = io.BytesIO(payload)
+    buf.name = "dextrade.log"
+    await update.message.reply_document(document=buf, filename="dextrade.log", caption=caption)
+
+
 async def pricefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     _pricefile_mode.add(chat_id)
@@ -6508,6 +6571,15 @@ class _MenuMessage:
 
     async def reply_text(self, text, **kwargs):
         return await self._bot.send_message(chat_id=self.chat_id, text=text, **kwargs)
+
+    async def reply_document(self, document, **kwargs):
+        """
+        Файлом умеют отвечать не только /logs, но и «список файлом» у /watch и
+        /float. Без этого метода любая такая команда, запущенная КНОПКОЙ,
+        падала бы на AttributeError — и падала бы тихо: у обработчиков есть
+        общий except, который списывает сбой на «предмет не проверился».
+        """
+        return await self._bot.send_document(chat_id=self.chat_id, document=document, **kwargs)
 
 
 class _MenuUpdate:
@@ -7463,6 +7535,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _show_menu(query, chat_id, "float", context)
     elif payload == "i_value":
         await inv(shim, _SubCtx(context, []))
+    elif payload == "logs":
+        await logs_cmd(shim, _SubCtx(context, []))
+    elif payload == "logs_err":
+        await logs_cmd(shim, _SubCtx(context, ["ошибки"]))
     elif payload == "arbreset":
         await _arb_reset(shim)
         await _show_menu(query, chat_id, "state", context)
@@ -7780,6 +7856,18 @@ COMMANDS: tuple[Command, ...] = (
         "запрос не удался (например, IP на кулдауне после 429). Бот пришлёт "
         "ссылку на JSON: открой в браузере, сохрани Ctrl+S и пришли файл сюда. "
         "Файл можно слать и без команды.",
+    ),
+    Command(
+        # menu=None: в выпадающем списке Telegram её нет — там место тому,
+        # что набирают каждый день, а логи смотрят, когда что-то сломалось.
+        # Находится из /help и из раздела «Состояние».
+        "logs", logs_cmd, "Служебное", None,
+        "/logs — прислать лог файлом (последние 2000 строк)\n"
+        "/logs 500 — столько строк\n"
+        "/logs ошибки — только предупреждения и ошибки, с трейсбеками\n"
+        "/logs всё — файл целиком\n"
+        "Нужна, чтобы разбор сбоя не начинался с ручного копирования из "
+        "панели Render. Пароли прокси и токены из файла вычищаются.",
     ),
     Command(
         "help", help_cmd, "Служебное",
