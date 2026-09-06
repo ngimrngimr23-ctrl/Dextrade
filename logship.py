@@ -87,15 +87,60 @@ def enabled() -> bool:
     return bool(TOKEN and REPO)
 
 
+# Имена, которые мы читаем. Нужны, чтобы находить опечатки: переменную задают
+# руками в поле Render, и промах в одной букве выглядит как «ничего не
+# настроено» — сообщение, по которому не догадаешься, что искать.
+_KNOWN_VARS = (
+    "LOG_GITHUB_TOKEN", "LOG_GITHUB_REPO", "LOG_GITHUB_BRANCH",
+    "LOG_GITHUB_PATH", "LOG_GITHUB_ALLOW_PUBLIC",
+    "LOG_SHIP_MINUTES", "LOG_SHIP_MAX_KB",
+    "LOG_FILE", "LOG_RING_LINES", "LOG_MAX_MB", "LOG_BACKUPS",
+)
+
+
+def _suspicious_vars() -> list[str]:
+    """
+    Переменные окружения, похожие на наши, но названные не так.
+
+    Смотрим на всё, что начинается с LOG_ или содержит GITHUB, и вычитаем
+    известные. Опечатка в ИМЕНИ переменной иначе неотличима от её отсутствия.
+    """
+    out = []
+    for name in os.environ:
+        upper = name.upper()
+        if upper in _KNOWN_VARS:
+            continue
+        if upper.startswith("LOG") or "GITHUB" in upper or "GITUB" in upper:
+            out.append(name)
+    return sorted(out)
+
+
 def status() -> str:
-    """Одной строкой — что настроено. Токен наружу не показываем никогда."""
-    if not TOKEN and not REPO:
-        return "выгрузка лога на GitHub не настроена"
-    if not TOKEN:
-        return f"репозиторий {REPO} задан, но нет LOG_GITHUB_TOKEN"
-    if not REPO:
-        return "токен задан, но нет LOG_GITHUB_REPO (нужен вид owner/repo)"
-    return f"{REPO}, ветка {BRANCH}, файл {PATH}, раз в {INTERVAL_MINUTES:g} мин"
+    """
+    Что именно видно из настроек. Токен наружу не показываем никогда — только
+    факт наличия и длину: этого хватает, чтобы отличить «не задан» от
+    «задан, но обрезан при копировании», и не хватает, чтобы им воспользоваться.
+    """
+    if TOKEN and REPO:
+        return f"{REPO}, ветка {BRANCH}, файл {PATH}, раз в {INTERVAL_MINUTES:g} мин"
+
+    parts = [
+        f"• LOG_GITHUB_REPO — {'«' + REPO + '»' if REPO else 'НЕ ЗАДАН'}",
+        f"• LOG_GITHUB_TOKEN — {'задан, ' + str(len(TOKEN)) + ' символов' if TOKEN else 'НЕ ЗАДАН'}",
+    ]
+    text = "Выгрузка на GitHub не работает, вот что вижу:\n" + "\n".join(parts)
+
+    odd = _suspicious_vars()
+    if odd:
+        text += (
+            "\n\nПохожие переменные с другими именами — возможно, опечатка:\n"
+            + "\n".join(f"• {n}" for n in odd)
+        )
+    text += (
+        "\n\nИмена читаются ровно так, посимвольно: LOG_GITHUB_REPO и "
+        "LOG_GITHUB_TOKEN. После правки Render перезапустит сервис сам."
+    )
+    return text
 
 
 def file_url() -> str:

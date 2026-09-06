@@ -6001,15 +6001,17 @@ async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if args and args[0] in ("github", "гитхаб", "гит", "выгрузи", "push"):
         if not logship.enabled():
+            # Печатаем именно status(): он говорит, КАКАЯ из двух переменных
+            # не видна и не подобралась ли похожая с опечаткой в имени. Общая
+            # фраза «не настроена» на этот вопрос не отвечает, а он и есть
+            # единственный интересный.
             await update.message.reply_text(
-                "Выгрузка на GitHub не настроена.\n\n"
-                "Нужны две переменные окружения на Render:\n"
-                "• <code>LOG_GITHUB_REPO</code> — вида owner/repo, "
-                "ПРИВАТНЫЙ репозиторий\n"
-                "• <code>LOG_GITHUB_TOKEN</code> — fine-grained токен с правом "
-                "Contents: Read and write на этот репозиторий\n\n"
-                "Ключ присылать сюда не надо — он задаётся только на Render.",
-                parse_mode="HTML",
+                f"{logship.status()}\n\n"
+                f"Репозиторий обязан быть ПРИВАТНЫМ: в логе id чата, весь "
+                f"вотчлист, хосты прокси и трейсбеки, а история git хранит все "
+                f"версии.\n"
+                f"Токену нужно право Contents: Read and write именно на него.\n"
+                f"Ключ присылать сюда не надо — он задаётся только на Render."
             )
             return
         try:
