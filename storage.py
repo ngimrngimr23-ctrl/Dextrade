@@ -620,8 +620,21 @@ async def get_steam_prices_batch(names: list[str]) -> dict[str, dict]:
     return out
 
 
-async def set_steam_price(name: str, price: float, volume: int | None) -> None:
-    entry = {"price": price, "volume": volume, "updated_at": time.time()}
+async def set_steam_price(
+    name: str, price: float, volume: int | None, median: float | None = None,
+) -> None:
+    """
+    price — самая низкая ЗАЯВКА в стакане (сколько заплатишь прямо сейчас).
+    median — медиана СОСТОЯВШИХСЯ продаж за сутки (почём реально уходило).
+
+    Медиану храним отдельно и не путаем с ценой: это разные величины, и
+    сравнивать их между собой нельзя. Заявка систематически ниже медианы
+    сделок на ширину стакана — замер на двадцати предметах дал отношение 1.13
+    (см. RATIO_EXPLAINABLE_BIAS в bot.py). Пока медианы здесь не было,
+    /dips сравнивал заявку со средней за 30 дней и выдавал эти 13% спреда за
+    просадку — на каждом предмете, даром.
+    """
+    entry = {"price": price, "volume": volume, "median": median, "updated_at": time.time()}
     # Неполную запись держим коротко — см. STEAM_PRICE_NO_VOLUME_TTL_SECONDS.
     ttl = (
         STEAM_PRICE_TTL_SECONDS if volume is not None

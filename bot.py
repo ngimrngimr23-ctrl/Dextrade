@@ -4610,6 +4610,14 @@ DIPS_DEFAULT_DROP = float(os.environ.get("DIPS_DEFAULT_DROP", "25"))
 # у /markets: живых запросов к Steam мало, тратить их надо на верхушку.
 DIPS_VERIFY_LIMIT = int(os.environ.get("DIPS_VERIFY_LIMIT", "25"))
 
+# Насколько старой может быть цена, чтобы считаться живой.
+#
+# Кэш цен Steam живёт двенадцать часов (STEAM_PRICE_TTL_SECONDS) — для цен
+# наклеек и прикидок это нормально, а здесь нет: команда отвечает на вопрос
+# «дёшево ли ПРЯМО СЕЙЧАС», и полусуточная запись на него не отвечает. Хуже
+# того, она печаталась жирным как «сейчас», то есть прямо утверждала неправду.
+DIPS_MAX_QUOTE_AGE = float(os.environ.get("DIPS_MAX_QUOTE_AGE_MIN", "30")) * 60
+
 
 async def _apply_dips_args(chat_id: int, args) -> dict:
     """
@@ -4772,7 +4780,9 @@ async def _dips_scan_body(send, chat_id: int, saved: dict, *, quiet: bool = Fals
     # день, а не цена сейчас: обвал трёхчасовой давности она показывает
     # разбавленным. Живой запрос отвечает, есть ли просадка ПРЯМО СЕЙЧАС.
     top = found[:DIPS_VERIFY_LIMIT]
-    live_prices = await _live_prices_for(chat_id, [d.market_hash_name for d in top])
+    live_prices = await _live_prices_for(
+        chat_id, [d.market_hash_name for d in top], max_age=DIPS_MAX_QUOTE_AGE,
+    )
 
     tracked, mature, best_days = price_history.coverage(records, HISTORY_MATURE_DAYS)
     if mature:
@@ -4802,10 +4812,13 @@ async def _dips_scan_body(send, chat_id: int, saved: dict, *, quiet: bool = Fals
     )
     lines = [
         f"📉 Просадки от месячной нормы — кандидатов {len(found)}\n"
-        f"<i>Живая цена против средней за 30 дней. Это НЕ арбитраж: разрыв "
-        f"во времени, а не между площадками — чтобы заработать, цена должна "
-        f"вернуться, и она может не вернуться. «Вернётся» — прибыль при "
-        f"возврате к норме за вычетом комиссии "
+        f"<i>Просадка считается по МЕДИАНЕ СДЕЛОК за сутки против средней за "
+        f"30 дней — это одна и та же величина, поэтому сравнение честное. "
+        f"«Купить» — низ стакана: он всегда ниже медианы на ширину спреда, и "
+        f"выдавать эту разницу за скидку нельзя.\n"
+        f"Это НЕ арбитраж: разрыв во времени, а не между площадками — чтобы "
+        f"заработать, цена должна вернуться, и она может не вернуться. "
+        f"«Вернётся» — прибыль при возврате к норме за вычетом комиссии "
         f"~{(1 - STEAM_FEE_MULTIPLIER) * 100:.0f}%.\n{liquidity_note}\n"
         f"{history_note}</i>"
     ]
@@ -4814,10 +4827,11 @@ async def _dips_scan_body(send, chat_id: int, saved: dict, *, quiet: bool = Fals
     # Средняя годится, чтобы понять, куда смотреть, но не чтобы покупать:
     # предмет мог полдня стоять на минимуме и к вечеру подорожать, а средняя
     # всё равно покажет «на минимуме».
-    verified = []      # (dip, цена сейчас, просадка сейчас, объём/нед, на минимуме)
+    verified = []      # (dip, заявка, медиана сделок, просадка, объём/нед, на минимуме)
     evaporated = 0     # просадка закрылась к моменту проверки
     illiquid = 0       # продаётся реже порога
     unverified = 0     # живой цены нет — подтвердить нечем
+    no_median = 0      # заявка есть, медианы сделок нет — судить не по чему
     for dip in top:
         quote = live_prices.get(dip.market_hash_name)
 
@@ -4831,11 +4845,18 @@ async def _dips_scan_body(send, chat_id: int, saved: dict, *, quiet: bool = Fals
             if min_week_volume:
                 unverified += 1
                 continue
-            verified.append((dip, dip.today, dip.drop_pct, None, False))
+            verified.append((dip, dip.today, dip.today, dip.drop_pct, None, False))
             continue
 
-        price_now = quote.price
-        drop_pct = dip.drop_pct_at(price_now)
+        # Просадку меряем МЕДИАНОЙ СДЕЛОК, а не заявкой. Окна прайс-листа —
+        # средние состоявшихся продаж, и сравнивать с ними низ стакана значит
+        # выдавать ширину стакана за скидку: ~13% даром на каждом предмете
+        # (см. LiveQuote). Заявка остаётся ценой покупки, но не мерой дешевизны.
+        if quote.median is None:
+            no_median += 1
+            continue
+
+        drop_pct = dip.drop_pct_at(quote.median)
         if drop_pct < min_drop:
             evaporated += 1
             continue
@@ -4846,7 +4867,14 @@ async def _dips_scan_body(send, chat_id: int, saved: dict, *, quiet: bool = Fals
                 illiquid += 1
                 continue
 
-        verified.append((dip, price_now, drop_pct, per_week, dip.is_at_low(price_now)))
+        # «На минимуме» — тоже по медиане: накопленная история собрана из окон
+        # прайс-листа, то есть из той же линейки сделок. Сравнивать её с
+        # заявкой означало бы получить «на 13% ниже минимума» на предмете,
+        # цена которого не двигалась вовсе.
+        verified.append((
+            dip, quote.ask, quote.median, drop_pct, per_week,
+            dip.is_at_low(quote.median),
+        ))
 
     if not verified:
         if not quiet:
@@ -4855,6 +4883,8 @@ async def _dips_scan_body(send, chat_id: int, saved: dict, *, quiet: bool = Fals
                 why.append(f"просадка уже закрылась — {evaporated}")
             if illiquid:
                 why.append(f"продаётся реже {min_week_volume:g} шт/нед — {illiquid}")
+            if no_median:
+                why.append(f"нет медианы сделок, сравнивать не с чем — {no_median}")
             if unverified:
                 why.append(f"Steam не ответил, подтвердить нечем — {unverified}")
             await send(
@@ -4865,13 +4895,13 @@ async def _dips_scan_body(send, chat_id: int, saved: dict, *, quiet: bool = Fals
 
     # Сортировка — ТОЛЬКО здесь, когда живые цены уже известны. Сначала те,
     # кто стоит на своём минимуме прямо сейчас: спрашивали именно про них.
-    verified.sort(key=lambda v: (v[4], v[2]), reverse=True)
+    verified.sort(key=lambda v: (v[5], v[3]), reverse=True)
     shown = [v[0] for v in verified[:15]]
 
     log.info(
         "dips: кандидатов %d, проверено %d, показано %d. Отсев живой проверкой: "
-        "просадка закрылась %d, неликвид %d, не подтверждено %d",
-        len(found), len(top), len(shown), evaporated, illiquid, unverified,
+        "просадка закрылась %d, неликвид %d, без медианы %d, не подтверждено %d",
+        len(found), len(top), len(shown), evaporated, illiquid, no_median, unverified,
     )
 
     # Дедуп ДО сборки текста: он решает не только «слать или молчать», но и
@@ -4879,8 +4909,7 @@ async def _dips_scan_body(send, chat_id: int, saved: dict, *, quiet: bool = Fals
     # собиралось из всех находок, и одна новая просадка тянула за собой
     # повторную отправку остальных четырнадцати.
     if quiet:
-        keys = [_dip_key(name, price) for name, price in
-                ((v[0].market_hash_name, v[1]) for v in verified[:15])]
+        keys = [_dip_key(v[0].market_hash_name, v[2]) for v in verified[:15]]
         fresh = await filter_new_offers(chat_id, keys)
         if not any(fresh):
             log.info("dips: все просадки уже присылались, молчу")
@@ -4889,16 +4918,19 @@ async def _dips_scan_body(send, chat_id: int, saved: dict, *, quiet: bool = Fals
         verified = [v for v, is_new in zip(verified[:15], fresh) if is_new]
         shown = [v[0] for v in verified]
 
-    for dip, price_now, drop_pct, per_week, at_low in verified[:15]:
-        gain = dip.recovery_gain_pct(price_now, STEAM_FEE_MULTIPLIER)
-        now = (
-            f"<b>сейчас ${price_now:.2f}</b>" if per_week is not None or min_week_volume
-            else f"сутки ${price_now:.2f} <i>(оценка)</i>"
-        )
+    for dip, ask, median, drop_pct, per_week, at_low in verified[:15]:
+        # Покупаем по ЗАЯВКЕ — это реальная цена входа. Продаём по месячной
+        # норме за вычетом комиссии. Обе величины названы в строке явно,
+        # чтобы разницу между ними было видно, а не приходилось угадывать.
+        gain = dip.recovery_gain_pct(ask, STEAM_FEE_MULTIPLIER)
+        if per_week is None and not min_week_volume:
+            head_price = f"сутки ${median:.2f} <i>(оценка)</i>"
+        else:
+            head_price = f"купить ${ask:.2f} | продавали ${median:.2f}"
 
         extra = ""
         if dip.low:
-            vs_low = dip.below_low_pct(price_now)
+            vs_low = dip.below_low_pct(median)
             where = (
                 f"на {vs_low:.0f}% ниже него" if vs_low >= 0.1
                 else f"на {-vs_low:.0f}% выше него" if vs_low <= -0.1
@@ -4913,7 +4945,7 @@ async def _dips_scan_body(send, chat_id: int, saved: dict, *, quiet: bool = Fals
 
         lines.append(
             f"{'🔻 ' if at_low else ''}<code>{html_module.escape(dip.market_hash_name)}</code>\n"
-            f"  {now} | неделя ${dip.week:.2f} | месяц ${dip.month:.2f}{extra}\n"
+            f"  {head_price} | неделя ${dip.week:.2f} | месяц ${dip.month:.2f}{extra}\n"
             f"  дешевле нормы на {drop_pct:.0f}%, при возврате "
             f"{'+' if gain >= 0 else ''}{gain:.0f}% чистыми\n"
             f'  <a href="{dip.steam_url}">Открыть в Steam</a>'
@@ -4936,26 +4968,54 @@ async def _dips_scan_body(send, chat_id: int, saved: dict, *, quiet: bool = Fals
 
 class LiveQuote(NamedTuple):
     """
-    Живая цена и суточный объём — то, что priceoverview отдаёт одним ответом.
+    Ответ priceoverview целиком: заявка, медиана сделок, объём, возраст записи.
 
-    Объём здесь появился не просто так: он и раньше приходил в этом же ответе
-    и даже сохранялся в кэш через set_steam_price, но наружу не возвращался и
-    терялся. То есть фильтр ликвидности для /dips стоил ровно ноль
-    дополнительных запросов — данные уже были на руках.
+    ДВЕ ЦЕНЫ, И ПУТАТЬ ИХ НЕЛЬЗЯ — именно на этом /dips и врал.
+
+      ask (lowest_price) — самая низкая ЗАЯВКА в стакане: сколько заплатишь
+      прямо сейчас.
+
+      median (median_price) — медиана СОСТОЯВШИХСЯ продаж за сутки: почём
+      предмет реально уходил.
+
+    Заявка по построению ниже медианы сделок на ширину стакана. Замер
+    2026-08-28 на двадцати предметах дал медианное отношение 1.13 (см.
+    RATIO_EXPLAINABLE_BIAS). А окна прайс-листа (last_24h/7d/30d) — тоже
+    средние СДЕЛОК, то есть одна линейка с median и совсем другая с ask.
+
+    Пока /dips сравнивал ask со средней за 30 дней, он выдавал ширину стакана
+    за просадку: каждый предмет получал даром ~13% «скидки» ещё до всякого
+    движения цены. Живой пример из отчёта: «минимум за 8 дн. $3.72» при «цена
+    менялась в 0% дней» — то есть цена стояла на месте, — и рядом «сейчас
+    $3.22, дешевле нормы на 31%». Отношение 3.72/3.22 = 1.155, ровно
+    измеренный спред. Никакой просадки там не было.
 
     volume — ШТУК ЗА СУТКИ. Ноль означает «за сутки не продано ничего» (Steam
     просто не кладёт поле), None — «спросить не удалось». Разница
     принципиальная: ноль это худшая из возможных находок, а None — отсутствие
     сведений, и обходиться с ними одинаково нельзя.
+
+    age_seconds — возраст записи. Нужен, потому что кэш цен живёт 12 часов, а
+    слово «сейчас» в отчёте должно означать «сейчас».
     """
 
-    price: float
+    ask: float
+    median: float | None = None
     volume: int | None = None
+    age_seconds: float = 0.0
 
 
-async def _live_prices_for(chat_id: int, names: list[str]) -> dict[str, LiveQuote]:
+async def _live_prices_for(
+    chat_id: int, names: list[str], *, max_age: float | None = None,
+) -> dict[str, LiveQuote]:
     """
     Живая цена Steam по списку имён — сколько получится в рамках бюджета.
+
+    max_age — насколько старой может быть запись из кэша, чтобы сойти за
+    живую. None — брать любую, как было. Для /dips параметр обязателен: кэш
+    цен живёт 12 часов, а вопрос команды — «дёшево ли ПРЯМО СЕЙЧАС», и
+    полусуточная запись на него не отвечает. Записи старше max_age считаются
+    промахом и перезапрашиваются.
 
     Молча возвращает то, что удалось: при забаненном priceoverview это пустой
     словарь, и находки уйдут с пометкой «оценка». Отказываться от них целиком
@@ -4963,13 +5023,28 @@ async def _live_prices_for(chat_id: int, names: list[str]) -> dict[str, LiveQuot
     """
     if not names:
         return {}
+    now = time.time()
     cached = await get_steam_prices_batch(names)
-    out = {
-        n: LiveQuote(e["price"], e.get("volume"))
-        for n, e in cached.items() if e.get("price")
-    }
 
-    misses = [n for n in names if n not in cached][:STEAM_LIVE_BUDGET]
+    out: dict[str, LiveQuote] = {}
+    stale = 0
+    for name, entry in cached.items():
+        if not entry.get("price"):
+            continue
+        age = now - entry.get("updated_at", 0)
+        if max_age is not None and age > max_age:
+            stale += 1
+            continue
+        out[name] = LiveQuote(
+            entry["price"], entry.get("median"), entry.get("volume"), age,
+        )
+
+    misses = [n for n in names if n not in out][:STEAM_LIVE_BUDGET]
+    if stale:
+        log.info(
+            "живые цены: %d записей старше %.0f мин — перезапрашиваю",
+            stale, (max_age or 0) / 60,
+        )
     if not misses:
         return out
 
@@ -4982,8 +5057,8 @@ async def _live_prices_for(chat_id: int, names: list[str]) -> dict[str, LiveQuot
             except Exception:
                 return name, None
             if live and live.lowest:
-                await set_steam_price(name, live.lowest, live.volume)
-                return name, LiveQuote(live.lowest, live.volume)
+                await set_steam_price(name, live.lowest, live.volume, live.median)
+                return name, LiveQuote(live.lowest, live.median, live.volume, 0.0)
             return name, None
 
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
