@@ -257,6 +257,72 @@ class ProxyPool:
     def mark_alive(self, proxy: str) -> None:
         self.dead.pop(proxy, None)
 
+    def hosts(self) -> set[str]:
+        """Разные точки входа в пуле — «хост:порт» без логина и пароля."""
+        out = set()
+        for url in self.proxies:
+            try:
+                parsed = urlsplit(url)
+                if parsed.hostname:
+                    out.add(f"{parsed.hostname}:{parsed.port}")
+            except Exception:
+                continue
+        return out
+
+    def single_gateway(self) -> bool:
+        """
+        Весь пул — это один шлюз под разными логинами?
+
+        Так устроены сессионные прокси: адрес один, а IP на выходе выбирается
+        токеном внутри ЛОГИНА (…session-xxxx…). Для нас это выглядит как
+        сорок семь независимых адресов, но дверь у них одна и учётная запись
+        одна. Значит и отказ у них общий: если шлюз ответил 403, он ответит
+        так же всем сорока семи, и перебирать их бессмысленно.
+
+        Проверено на живом логе: 47 адресов, а хост во всех записях один —
+        proxy.flameproxies.com:8989. Бот при этом честно докладывал «37
+        свободных из 47», и это вводило в заблуждение: свободных в его
+        бухгалтерии, а работающих — ноль.
+        """
+        return len(self.proxies) > 1 and len(self.hosts()) == 1
+
+    def _same_host(self, proxy: str) -> list[str]:
+        try:
+            parsed = urlsplit(proxy)
+            key = f"{parsed.hostname}:{parsed.port}"
+        except Exception:
+            return [proxy]
+        out = []
+        for url in self.proxies:
+            try:
+                other = urlsplit(url)
+                if f"{other.hostname}:{other.port}" == key:
+                    out.append(url)
+            except Exception:
+                continue
+        return out or [proxy]
+
+    def mark_gateway_refused(self, proxy: str, seconds: float, reason: str = "") -> int:
+        """
+        Отказал не адрес, а шлюз: откладываем ВСЕ логины на том же хосте.
+
+        Возвращает, сколько адресов отложено. Нужно, потому что иначе код
+        перебирает десяток логинов на одной и той же отказавшей двери, тратит
+        на это время и место в логе, а результат заранее известен.
+        """
+        same = self._same_host(proxy)
+        for url in same:
+            self._cooldowns[url] = max(
+                self._cooldowns.get(url, 0.0), time.time() + seconds
+            )
+        log.warning(
+            "%s: шлюз %s отказал (%s) — отложены все %d логин(ов) на нём. "
+            "Свободно ещё %d из %d",
+            self.name, mask(proxy), reason or "отказ", len(same),
+            len(self.available()), len(self.proxies),
+        )
+        return len(same)
+
     def enabled(self) -> bool:
         return bool(self.proxies)
 
@@ -331,6 +397,14 @@ class ProxyPool:
                 f"не Steam). Обычные причины: кончился трафик, превышен лимит одновременных "
                 f"сессий, истекла sticky-сессия, целевой хост не разрешён тарифом или "
                 f"сменились логин/пароль. Проверь личный кабинет и /proxycheck"
+            )
+        if self.single_gateway():
+            # Без этой оговорки «37 свободных из 47» читается как «есть ещё
+            # 37 рабочих запасных», хотя запасных нет: дверь одна.
+            return (
+                f"{self.describe()} — но все {len(self.proxies)} логинов ведут на ОДИН "
+                f"шлюз {next(iter(self.hosts()))}, это не независимые адреса. "
+                f"Отказ шлюза общий для всех, перебирать их нечего"
             )
         return self.describe()
 

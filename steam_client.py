@@ -841,7 +841,23 @@ async def fetch_all_listings(
                     # 403 — это отказ авторизации самого прокси-сервиса
                     # (просрочка/бан аккаунта), а не разовая сетевая заминка.
                     # Повторные попытки на этот же адрес ничего не изменят.
-                    STEAM_POOL.mark_refused(route, LISTINGS_PROXY_COOLDOWN, f"HTTP 403: {e}")
+                    #
+                    # А если весь пул — это один шлюз под разными логинами
+                    # (сессионные прокси: IP выбирается токеном внутри логина),
+                    # то не изменят и попытки на СОСЕДНИХ адресах: дверь одна,
+                    # учётная запись одна, отказ общий. Проверено на живом
+                    # логе — 47 адресов, хост во всех один. Раньше бот честно
+                    # перебирал десяток логинов на этой двери, тратил минуты и
+                    # писал «37 свободных из 47», что читалось как «есть ещё
+                    # рабочие запасные». Их не было.
+                    if STEAM_POOL.single_gateway():
+                        STEAM_POOL.mark_gateway_refused(
+                            route, LISTINGS_PROXY_COOLDOWN, f"HTTP 403: {scrub(str(e))}"
+                        )
+                    else:
+                        STEAM_POOL.mark_refused(
+                            route, LISTINGS_PROXY_COOLDOWN, f"HTTP 403: {scrub(str(e))}"
+                        )
                 else:
                     STEAM_POOL.mark_exhausted(route, LISTINGS_PROXY_COOLDOWN, f"ошибка соединения: {e}")
             note_retry("транспорт")
