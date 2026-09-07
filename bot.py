@@ -2308,6 +2308,12 @@ async def _rotation_settings(chat_id: int, hot_names: set) -> tuple[int, int | N
 
 # Что именно прогонять. Один явный параметр вместо набора флагов: режимов три,
 # и от них зависит и состав плана, и двигать ли курсор круга.
+# Сколько предметов брать в один автопрогон. Ноль/пусто — без ограничения
+# (прежнее поведение). Ручные /scan и /scanall не трогает: там человек сам
+# попросил весь список и вправе получить его целиком вместе с 429.
+WATCH_MAX_ITEMS = int(os.environ.get("WATCH_MAX_ITEMS", "0")) or scan_plan.DEFAULT_MAX_ITEMS_PER_CYCLE
+
+
 SCAN_CYCLE = "cycle"  # автопрогон: приоритетные + кусок остальных, курсор двигается
 SCAN_ALL = "all"      # /scanall: весь список, курсор не трогаем
 SCAN_HOT = "hot"      # /scan: только приоритетные, курсор не трогаем
@@ -2377,7 +2383,14 @@ async def _run_watchlist_scan(
         plan = [entry for entry in plan if entry[0] in hot_names]
     elif mode == SCAN_CYCLE:
         cursor, cold_per_cycle = await _rotation_settings(chat_id, hot_names)
-        plan, next_cursor = scan_plan.split_cycle(plan, hot_names, cursor, cold_per_cycle)
+        # Бюджет адреса. Steam пропускает с одного IP около сотни запросов за
+        # окно, а предмет — это один запрос: живой лог показывал обрыв ровно
+        # на сотом предмете, раз за разом. Упереться в потолок дорого — 429 не
+        # просто рвёт прогон, он ставит кулдаун с удвоением, — поэтому лучше
+        # честно взять меньше и докрутить остаток следующим циклом.
+        plan, next_cursor = scan_plan.split_cycle(
+            plan, hot_names, cursor, cold_per_cycle, max_items=WATCH_MAX_ITEMS,
+        )
         if len(plan) != full_size:
             log.info(
                 "watchlist: chat_id=%s цикл — %d из %d предметов "

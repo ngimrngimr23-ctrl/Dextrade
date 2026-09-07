@@ -37,8 +37,22 @@ from __future__ import annotations
 DEFAULT_COLD_PER_CYCLE = 60
 
 
+# Сколько предметов Steam пропускает с одного адреса, прежде чем ответить 429.
+#
+# Число не выдумано: живой лог показывает, что прогон падает РОВНО на сотом
+# предмете, каждый раз. Один предмет — это один запрос к /render/
+# (DEFAULT_MAX_LISTINGS=100 подобран так, чтобы хватало одной страницы),
+# значит потолок адреса — около сотни запросов на окно.
+#
+# Берём с запасом: упереться в потолок дорого. 429 не просто обрывает прогон,
+# он ставит кулдаун с удвоением и портит следующие попытки, так что десяток
+# предметов в запас окупается многократно.
+DEFAULT_MAX_ITEMS_PER_CYCLE = 90
+
+
 def split_cycle(
     plan: list, hot_names: set, cursor: int, cold_per_cycle: int | None,
+    max_items: int | None = None,
 ) -> tuple[list, int]:
     """
     Разделить план прогона на «этот цикл» и «в следующий раз».
@@ -55,12 +69,22 @@ def split_cycle(
     завёл приоритетный список, ничего меняться не должно.
     """
     if not hot_names or not cold_per_cycle or cold_per_cycle <= 0:
-        return list(plan), 0
+        return _fit_budget(list(plan), cursor, max_items)
 
     hot = [entry for entry in plan if entry[0] in hot_names]
     cold = [entry for entry in plan if entry[0] not in hot_names]
 
-    if not cold:
+    # Бюджет адреса важнее приоритетов: если приоритетных больше, чем Steam
+    # пропускает за окно, «каждый цикл все горячие» невыполнимо в принципе —
+    # прогон просто умрёт на сотом. Тогда крутим окно и по ним тоже.
+    if max_items is not None and len(hot) >= max_items:
+        return _fit_budget(hot, cursor, max_items)
+
+    room = None if max_items is None else max_items - len(hot)
+    if room is not None and cold_per_cycle > room:
+        cold_per_cycle = max(room, 0)
+
+    if not cold or not cold_per_cycle:
         return hot, 0
     if cold_per_cycle >= len(cold):
         return hot + cold, 0
@@ -74,6 +98,23 @@ def split_cycle(
         # прочих просто из-за своего места в нём.
         take += cold[:cold_per_cycle - len(take)]
     return hot + take, (start + cold_per_cycle) % len(cold)
+
+
+def _fit_budget(plan: list, cursor: int, max_items: int | None) -> tuple[list, int]:
+    """
+    Урезать план до бюджета адреса, прокручивая окно по кругу.
+
+    Курсор общий с ротацией «остальных»: заводить второй ради того же самого
+    движения по кругу незачем, а путать их — верный способ получить предмет,
+    который не проверяется никогда.
+    """
+    if max_items is None or len(plan) <= max_items:
+        return plan, 0
+    start = cursor % len(plan)
+    window = plan[start:start + max_items]
+    if len(window) < max_items:
+        window += plan[:max_items - len(window)]
+    return window, (start + max_items) % len(plan)
 
 
 def describe_cycle(
