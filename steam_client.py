@@ -53,6 +53,11 @@ import aiohttp
 
 from http_session import get_session
 from proxy_pool import ProxyPool, mask as mask_proxy
+# Текст исключений отсюда уходит прямо в Telegram, а в него попадает адрес
+# прокси ЦЕЛИКОМ — вместе с паролем, он лежит в URL. Ровно так пароль один раз
+# и уехал в переписку. Чистка логов этот путь не покрывала: она стоит на
+# обработчиках логирования, а сообщение шло мимо них.
+from scan_errors import scrub
 import yarl
 
 log = logging.getLogger("steam_bot.steam_client")
@@ -373,7 +378,9 @@ async def reset_cooldown(scope: str) -> float:
     return remaining
 
 
-async def note_steam_429(scope: str = "listings", headers: dict | None = None) -> float:
+async def note_steam_429(
+    scope: str = "listings", headers: dict | None = None, *, escalate: bool = True,
+) -> float:
     """
     Зафиксировать 429 в указанной области. Возвращает длину кулдауна для неё.
     headers — заголовки ответа Steam, попадают в диагностический слепок.
@@ -405,9 +412,16 @@ async def note_steam_429(scope: str = "listings", headers: dict | None = None) -
     # эскалацией бессмысленно.
     #
     # Кулдаун при этом ставится в любом случае — гасится только РОСТ.
+    # escalate=False — когда до Steam мы вообще не дошли и он ничего не
+    # отвечал. Так бывает, если запрос не пропустил ПРОКСИ-СЕРВИС (403 на
+    # CONNECT): пауза нужна, а наращивать счётчик не за что — это ровно та же
+    # ошибка, что описана выше про чужой бан, только источник другой. Без
+    # этого флага каждая попытка прогона при сломанном прокси-аккаунте
+    # увеличивала счётчик, и кулдаун за несколько заходов уезжал в потолок:
+    # человек ждал часами, а пауза росла быстрее, чем он ждал.
     since_last = time.time() - state["last_429_at"]
     burst = state["last_429_at"] > 0 and since_last < ESCALATION_DEBOUNCE_SECONDS
-    if not burst:
+    if not burst and escalate:
         state["consecutive_429"] += 1
     seconds = min(COOLDOWN_AFTER_429_SECONDS * (2 ** (state["consecutive_429"] - 1)), COOLDOWN_MAX_SECONDS)
     log.warning(
@@ -842,12 +856,24 @@ async def fetch_all_listings(
                 route = next_route
                 continue
 
-            seconds = await note_steam_429(scope="listings", headers={})
+            # Сюда попадаем, когда запрос не пропустил ПРОКСИ-СЕРВИС. Steam
+            # при этом не отвечал вовсе, поэтому escalate=False: пауза нужна
+            # (лезть напрямую нельзя — на прокси мы ушли как раз из-за его
+            # бана), но наращивать счётчик его 429 не за что. Раньше он рос, и
+            # при сломанном прокси-аккаунте кулдаун за несколько заходов
+            # доезжал до шести часов — отсюда и «жду полдня, а всё равно не
+            # сканирует».
+            seconds = await note_steam_429(scope="listings", headers={}, escalate=False)
             raise SteamRateLimited(
-                f"Прокси не пропускают запрос: {STEAM_POOL.failure_hint()}.\n"
-                f"Последний ответ: {e}\n"
-                f"Запросы к Steam приостановлены на {seconds / 60:.0f} мин, чтобы не "
-                f"долбить прямой адрес и не продлевать его бан."
+                f"Запрос не пропустил прокси-сервис (не Steam): "
+                f"{scrub(str(e))}\n"
+                f"Пул: {STEAM_POOL.failure_hint()}.\n"
+                f"Это отказ на стороне провайдера прокси — обычные причины: "
+                f"кончился трафик, превышен лимит одновременных сессий, истекла "
+                f"сессия или сменились логин/пароль. Проверь /proxycheck и личный "
+                f"кабинет.\n"
+                f"Пауза {seconds / 60:.0f} мин: прямой адрес сейчас под баном "
+                f"Steam, и лезть на него — только продлевать бан."
             )
 
         # Дальше — та же логика, что раньше жила под "async with session.get(...)

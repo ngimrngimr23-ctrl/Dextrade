@@ -2485,9 +2485,13 @@ async def _run_watchlist_scan(
         if rate_limit_hit:
             market_hash_name, e = rate_limit_hit[0]
             log.warning("watchlist: прогон chat_id=%s остановлен из-за рейт-лимита: %s", chat_id, e)
+            # scrub на самой отправке — вторым рубежом. Текст уже чистит
+            # steam_client, но сюда приходит ЛЮБОЕ исключение SteamRateLimited,
+            # в том числе из мест, куда чистку однажды забудут добавить. Один
+            # пароль от прокси так уже уехал в переписку.
             await bot.send_message(
                 chat_id=chat_id,
-                text=f"⏸ Автоскан остановлен на «{market_hash_name}»: {e}",
+                text=scan_errors.scrub(f"⏸ Автоскан остановлен на «{market_hash_name}»: {e}"),
             )
         return WatchlistScanReport(
             found_any=found_any, items=stats.items, profile=stats, wall=elapsed,
