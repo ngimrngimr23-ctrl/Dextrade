@@ -33,6 +33,7 @@ import collections
 import io
 import logging
 import logging.handlers
+import envcfg
 import os
 from pathlib import Path
 
@@ -41,11 +42,11 @@ import scan_errors
 # Сколько строк держать в памяти. Пять тысяч — это примерно один полный прогон
 # вотчлиста со всей диагностикой, то есть ровно тот объём, который нужен, чтобы
 # разобрать «что случилось в прошлый раз».
-RING_LINES = int(os.environ.get("LOG_RING_LINES", "5000"))
+RING_LINES = envcfg.env_int("LOG_RING_LINES", 5000)
 
 LOG_PATH = Path(os.environ.get("LOG_FILE", Path(__file__).parent / "dextrade.log"))
-MAX_BYTES = int(os.environ.get("LOG_MAX_MB", "8")) * 1024 * 1024
-BACKUPS = int(os.environ.get("LOG_BACKUPS", "1"))
+MAX_BYTES = envcfg.env_int("LOG_MAX_MB", 8) * 1024 * 1024
+BACKUPS = envcfg.env_int("LOG_BACKUPS", 1)
 
 FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 DATEFMT = "%Y-%m-%d %H:%M:%S"

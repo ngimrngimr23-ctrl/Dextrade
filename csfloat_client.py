@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import envcfg
 import os
 import time
 from dataclasses import dataclass, field
@@ -93,7 +94,7 @@ MIN_REQUEST_INTERVAL = 1.5
 # Один — потому что квота у CSFloat считается по КЛЮЧУ, а не по адресу, а на
 # множество адресов с одного ключа он ругается напрямую: 2026-08-27 в теле 429
 # пришло "You've been making too many requests from too many IPs".
-CSFLOAT_MAX_ADDRESSES = int(os.environ.get("CSFLOAT_MAX_ADDRESSES", "1"))
+CSFLOAT_MAX_ADDRESSES = envcfg.env_int("CSFLOAT_MAX_ADDRESSES", 1)
 
 # Пауза между ЛЮБЫМИ двумя запросами, независимо от адреса.
 #

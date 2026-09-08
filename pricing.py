@@ -25,6 +25,7 @@
 import asyncio
 import json
 import logging
+import envcfg
 import os
 import re
 import time
@@ -500,12 +501,12 @@ async def get_csgotrader_prices(
 #
 # Полминуты достаточно: это защита от того, чтобы долбить в одну секунду, а не
 # наказание. Если у провайдера адреса закреплённые, значение стоит поднять.
-STEAM_PROXY_COOLDOWN_SECONDS = int(os.environ.get("STEAM_PROXY_COOLDOWN_SECONDS", "30"))
+STEAM_PROXY_COOLDOWN_SECONDS = envcfg.env_int("STEAM_PROXY_COOLDOWN_SECONDS", 30)
 
 # Сколько адресов перебрать, прежде чем сдаться по одному предмету. При
 # полусотне прокси перебирать все ради одной цены расточительно — дешевле
 # оставить предмет следующему прогону, кэш всё равно накапливается.
-STEAM_RETRY_CAP = int(os.environ.get("STEAM_RETRY_CAP", "4"))
+STEAM_RETRY_CAP = envcfg.env_int("STEAM_RETRY_CAP", 4)
 
 # Сколько проверок цены вести одновременно — НЕЗАВИСИМО от размера пула прокси.
 #
@@ -518,7 +519,7 @@ STEAM_RETRY_CAP = int(os.environ.get("STEAM_RETRY_CAP", "4"))
 #
 # Больше адресов здесь не помогает вообще: лимит на этом эндпоинте, судя по
 # поведению, не только поадресный. Поэтому потолок фиксированный и маленький.
-PRICE_CONCURRENCY = int(os.environ.get("PRICE_CONCURRENCY", "2"))
+PRICE_CONCURRENCY = envcfg.env_int("PRICE_CONCURRENCY", 2)
 
 # Пауза между запросами цены — ГЛОБАЛЬНАЯ, одна очередь на весь процесс.
 #
@@ -526,7 +527,7 @@ PRICE_CONCURRENCY = int(os.environ.get("PRICE_CONCURRENCY", "2"))
 # поадресный, и N адресов честно дают N полос. Для priceoverview так не
 # работает — см. выше. Поэтому здесь одна общая очередь и своя, более длинная
 # пауза, не зависящая от MIN_REQUEST_INTERVAL листингов.
-PRICE_REQUEST_INTERVAL = float(os.environ.get("PRICE_REQUEST_INTERVAL", "6.0"))
+PRICE_REQUEST_INTERVAL = envcfg.env_float("PRICE_REQUEST_INTERVAL", 6.0)
 
 # Брать ли цену из листингов (/render/), когда priceoverview отказал.
 #

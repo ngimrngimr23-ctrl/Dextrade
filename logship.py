@@ -37,6 +37,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import envcfg
 import os
 
 import aiohttp
@@ -71,7 +72,7 @@ TOKEN = os.environ.get("LOG_GITHUB_TOKEN", "").strip()
 REPO = _normalize_repo(os.environ.get("LOG_GITHUB_REPO", ""))  # owner/repo
 BRANCH = os.environ.get("LOG_GITHUB_BRANCH", "main").strip()
 PATH = os.environ.get("LOG_GITHUB_PATH", "dextrade.log").strip()
-INTERVAL_MINUTES = float(os.environ.get("LOG_SHIP_MINUTES", "30"))
+INTERVAL_MINUTES = envcfg.env_float("LOG_SHIP_MINUTES", 30)
 ALLOW_PUBLIC = os.environ.get("LOG_GITHUB_ALLOW_PUBLIC", "").strip() in ("1", "true", "yes", "да")
 
 # Потолок НАКОПЛЕННОГО файла на GitHub. По достижении режем с начала: файл
@@ -84,12 +85,12 @@ ALLOW_PUBLIC = os.environ.get("LOG_GITHUB_ALLOW_PUBLIC", "").strip() in ("1", "t
 # Имя своё, не LOG_MAX_MB: та переменная задаёт размер ЛОКАЛЬНОГО файла
 # (logsetup), и одно имя на две разные величины однажды сведёт их вместе
 # в самый неподходящий момент.
-MAX_BYTES = int(os.environ.get("LOG_GITHUB_MAX_MB", "10")) * 1024 * 1024
+MAX_BYTES = envcfg.env_int("LOG_GITHUB_MAX_MB", 10) * 1024 * 1024
 
 # Не чаще одного коммита в столько секунд, даже если строки идут потоком.
 # Выгрузка теперь по событию, и без этой паузы шумный прогон дал бы коммит на
 # каждую строку.
-MIN_GAP_SECONDS = float(os.environ.get("LOG_SHIP_MIN_GAP", "60"))
+MIN_GAP_SECONDS = envcfg.env_float("LOG_SHIP_MIN_GAP", 60)
 
 # Хеш последней выгруженной версии: если ничего не изменилось, коммит не нужен.
 _last_digest: str | None = None

@@ -42,6 +42,7 @@ Cookie на steamcommunity.com (код воркера не в этом репо�
 
 import asyncio
 import logging
+import envcfg
 import os
 import re
 import time
@@ -88,12 +89,12 @@ MIN_REQUEST_INTERVAL = 4.0  # секунд между ЛЮБЫМИ двумя з
 # именно суммарная нагрузка за час доводит Steam до 429, а не промежуток между
 # двумя соседними запросами. Разовый всплеск на пару минут он переносит,
 # постоянный поток — нет.
-MANUAL_REQUEST_INTERVAL = float(os.environ.get("MANUAL_REQUEST_INTERVAL", "2.0"))
+MANUAL_REQUEST_INTERVAL = envcfg.env_float("MANUAL_REQUEST_INTERVAL", 2.0)
 COOLDOWN_AFTER_429_SECONDS = 30 * 60  # получили 429 -> не трогаем Steam столько времени
 # За сколько секунд подряд идущие 429 считаются ОДНИМ инцидентом и не наращивают
 # эскалацию (см. note_steam_429). Параллельные проверки цен успевают собрать
 # десяток отказов за секунды — это один залп, а не десять провинностей.
-ESCALATION_DEBOUNCE_SECONDS = float(os.environ.get("ESCALATION_DEBOUNCE_SECONDS", "120"))
+ESCALATION_DEBOUNCE_SECONDS = envcfg.env_float("ESCALATION_DEBOUNCE_SECONDS", 120)
 COOLDOWN_MAX_SECONDS = 6 * 60 * 60  # потолок при повторных 429 подряд (бан может быть длинным)
 
 STEAM_PROXY_URL = os.environ.get("STEAM_PROXY_URL", "").rstrip("/")
@@ -118,8 +119,8 @@ STEAM_POOL = ProxyPool(
 # сколько бы адресов ни добавили, на одном предмете пробовались ровно три, а
 # остальные простаивали. Потолок всё же нужен — перебирать полсотни адресов
 # ради одного предмета дороже, чем отложить предмет до следующего прогона.
-STEAM_RETRY_HARD_CAP = int(os.environ.get("STEAM_RETRY_HARD_CAP", "10"))
-STEAM_LISTINGS_RETRY = int(os.environ.get("STEAM_LISTINGS_RETRY", "0"))
+STEAM_RETRY_HARD_CAP = envcfg.env_int("STEAM_RETRY_HARD_CAP", 10)
+STEAM_LISTINGS_RETRY = envcfg.env_int("STEAM_LISTINGS_RETRY", 0)
 
 
 def listings_retry_budget() -> int:
@@ -132,7 +133,7 @@ def listings_retry_budget() -> int:
 # резидентные и ротируемые (проверено /proxycheck), поэтому длинный кулдаун
 # бьёт по своим — банится IP, а откладывается логин, за которым в следующий
 # раз будет уже другой адрес.
-LISTINGS_PROXY_COOLDOWN = int(os.environ.get("LISTINGS_PROXY_COOLDOWN", "60"))
+LISTINGS_PROXY_COOLDOWN = envcfg.env_int("LISTINGS_PROXY_COOLDOWN", 60)
 
 # Куки реальной Steam-сессии — все опциональны, бот работает и без них
 # (просто более анонимно и, судя по опыту, более подвержено рейт-лимитам).

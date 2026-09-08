@@ -45,6 +45,7 @@ import html as html_module
 import io
 import json
 import logging
+import envcfg
 import os
 import re
 import statistics
@@ -236,18 +237,18 @@ FLOAT_CHECK_TOP_N = 100
 # Четырёх полос хватает с запасом: на паузе в 2 секунды и ~3 секундах работы
 # на предмет очередь заполняется двумя-тремя, четвёртая — про запас на случай
 # медленного ответа Steam.
-SCAN_CONCURRENCY = int(os.environ.get("SCAN_CONCURRENCY", "4"))
+SCAN_CONCURRENCY = envcfg.env_int("SCAN_CONCURRENCY", 4)
 
 # /proxycheck: сколько адресов проверять одновременно и до скольких печатать
 # построчный список. Ограничения нужны только для больших пулов — само
 # количество прокси ничем не ограничено.
-PROXYCHECK_CONCURRENCY = int(os.environ.get("PROXYCHECK_CONCURRENCY", "10"))
-PROXYCHECK_DETAIL_LIMIT = int(os.environ.get("PROXYCHECK_DETAIL_LIMIT", "20"))
+PROXYCHECK_CONCURRENCY = envcfg.env_int("PROXYCHECK_CONCURRENCY", 10)
+PROXYCHECK_DETAIL_LIMIT = envcfg.env_int("PROXYCHECK_DETAIL_LIMIT", 20)
 
 # /floatcheck: с какой разницы медиан считать, что за флоат реально доплачивают.
 # Ниже этого — шум выборки: на проде AWP | Black Nile (FN) с флоатом 0.00585
 # стоил на 0.8% дороже обычного, и называть это наценкой было бы враньём.
-FLOATCHECK_MEANINGFUL_PREMIUM_PCT = float(os.environ.get("FLOATCHECK_MEANINGFUL_PREMIUM_PCT", "10"))
+FLOATCHECK_MEANINGFUL_PREMIUM_PCT = envcfg.env_float("FLOATCHECK_MEANINGFUL_PREMIUM_PCT", 10)
 
 # Ожидание выбора варианта после неоднозначного поиска по названию (несколько
 # степеней износа и т.п.) — chat_id -> {"results": [...], "min_value":..., "max_markup":...}
@@ -285,7 +286,7 @@ ARB_JOB_PREFIX = "arb_scan_"
 # Интервал автоскана. Считается от объёма прогона и бюджета прокси — см.
 # ARB_TARGET_LISTINGS. При 10 000 лотов и 7 адресах меньше ~9 минут ставить
 # нельзя: квота кончится на середине часа.
-ARB_INTERVAL_MINUTES = float(os.environ.get("ARB_INTERVAL_MINUTES", "10"))
+ARB_INTERVAL_MINUTES = envcfg.env_float("ARB_INTERVAL_MINUTES", 10)
 # Сколько лотов просматривать за один прогон.
 #
 # 10 000 — это 200 запросов (потолок эндпоинта 50 лотов на страницу). Столько
@@ -297,7 +298,7 @@ ARB_INTERVAL_MINUTES = float(os.environ.get("ARB_INTERVAL_MINUTES", "10"))
 # каждый адрес в пуле. При 10 000 лотов и 7 адресах помещается 7 прогонов в
 # час, то есть интервал не может быть меньше ~9 минут; при 5 минутах квота
 # кончится на середине часа и остаток времени бот будет молчать.
-ARB_TARGET_LISTINGS = int(os.environ.get("ARB_TARGET_LISTINGS", "1500"))
+ARB_TARGET_LISTINGS = envcfg.env_int("ARB_TARGET_LISTINGS", 1500)
 
 # Окно прайс-листа для ВТОРОГО мнения о цене. Только суточное, без отката на
 # более старые: недельная и тем более месячная цена подтверждает не сегодняшнюю
@@ -344,10 +345,10 @@ ARB_SOURCE_GAP_PCT = 25.0
 # Потолок всё равно нужен, потому что priceoverview отвечает по одному
 # предмету, а Steam банит за темп. Восемьдесят при шести адресах — это меньше
 # минуты, при одном адресе около пяти.
-ARB_VERIFY_LIMIT = int(os.environ.get("ARB_VERIFY_LIMIT", "80"))
+ARB_VERIFY_LIMIT = envcfg.env_int("ARB_VERIFY_LIMIT", 80)
 
 # Сколько находок с площадок проверять живой ценой Steam за раз.
-MARKETS_VERIFY_LIMIT = int(os.environ.get("MARKETS_VERIFY_LIMIT", "25"))
+MARKETS_VERIFY_LIMIT = envcfg.env_int("MARKETS_VERIFY_LIMIT", 25)
 
 # Потолок ЖИВЫХ запросов к Steam за один прогон — общий для обоих каналов.
 #
@@ -359,15 +360,15 @@ MARKETS_VERIFY_LIMIT = int(os.environ.get("MARKETS_VERIFY_LIMIT", "25"))
 # Восемь запросов на прогон — это около 50 в час на весь бот, что Steam
 # переносит спокойно. Остальное берётся из кэша, а он наполняется постепенно:
 # кандидаты от прогона к прогону в основном одни и те же.
-STEAM_LIVE_BUDGET = int(os.environ.get("STEAM_LIVE_BUDGET", "8"))
+STEAM_LIVE_BUDGET = envcfg.env_int("STEAM_LIVE_BUDGET", 8)
 
 # Минимум продаж в Steam за сутки, чтобы находка считалась реализуемой.
 # Без этого «выгода» бумажная: предмет, который не продаётся, не перепродать
 # ни за какую цену. Объёма продаж в прайс-листах нет вовсе — только у Steam.
-MARKETS_MIN_VOLUME = int(os.environ.get("MARKETS_MIN_VOLUME", "5"))
+MARKETS_MIN_VOLUME = envcfg.env_int("MARKETS_MIN_VOLUME", 5)
 
 # Порог спреда по умолчанию, пока пользователь не задал свой через /setmarkets.
-MARKETS_DEFAULT_DISCOUNT = float(os.environ.get("MARKETS_DEFAULT_DISCOUNT", "20"))
+MARKETS_DEFAULT_DISCOUNT = envcfg.env_float("MARKETS_DEFAULT_DISCOUNT", 20)
 
 # Пропускать ли StatTrak-предметы в сканах вотчлиста (/scanall и автоскан).
 # Отключается переменной окружения без правки кода: SKIP_STATTRAK=0.
@@ -1463,7 +1464,7 @@ def _chunk_lines(lines: list[str], limit: int = 3800, sep: str = "\n") -> list[s
 # не найти и которые перекрывают всю переписку. Файл открывается одним нажатием,
 # ищется поиском и не засоряет чат. Порог поставлен там, где список перестаёт
 # помещаться в один экран телефона.
-LIST_AS_FILE_FROM = int(os.environ.get("LIST_AS_FILE_FROM", "30"))
+LIST_AS_FILE_FROM = envcfg.env_int("LIST_AS_FILE_FROM", 30)
 
 _FILE_WORDS = {"файл", "file", "txt", "выгрузи", "выгрузка", "экспорт"}
 
@@ -2325,7 +2326,7 @@ async def _rotation_settings(chat_id: int, hot_names: set) -> tuple[int, int | N
 # Сколько предметов брать в один автопрогон. Ноль/пусто — без ограничения
 # (прежнее поведение). Ручные /scan и /scanall не трогает: там человек сам
 # попросил весь список и вправе получить его целиком вместе с 429.
-WATCH_MAX_ITEMS = int(os.environ.get("WATCH_MAX_ITEMS", "0")) or scan_plan.DEFAULT_MAX_ITEMS_PER_CYCLE
+WATCH_MAX_ITEMS = envcfg.env_int("WATCH_MAX_ITEMS", 0) or scan_plan.DEFAULT_MAX_ITEMS_PER_CYCLE
 
 
 SCAN_CYCLE = "cycle"  # автопрогон: приоритетные + кусок остальных, курсор двигается
@@ -3155,10 +3156,10 @@ async def arb_scan_job(context: ContextTypes.DEFAULT_TYPE):
 INVENTORY_JOB_PREFIX = "inventory_scan_"
 # Раз в час. Чаще смысла нет: прайс-лист на стороне csgotrader обновляется
 # примерно раз в час, и более частая проверка сравнивала бы одни и те же числа.
-INVENTORY_INTERVAL_MINUTES = float(os.environ.get("INVENTORY_INTERVAL_MINUTES", "60"))
+INVENTORY_INTERVAL_MINUTES = envcfg.env_float("INVENTORY_INTERVAL_MINUTES", 60)
 # Предметы дешевле этого в отчёт не идут: рост на 30% от десяти центов — это
 # три цента, и такие строки только прячут настоящие движения.
-INVENTORY_MIN_PRICE = float(os.environ.get("INVENTORY_MIN_PRICE", "0.50"))
+INVENTORY_MIN_PRICE = envcfg.env_float("INVENTORY_MIN_PRICE", 0.50)
 # Какое окно прайс-листа считать текущей ценой. Сутки — самое свежее, что есть.
 INVENTORY_PRICE_WINDOW = "last_24h"
 
@@ -4570,11 +4571,11 @@ HISTORY_JOB_NAME = "price_history_snapshot"
 
 # Как часто снимать срез цен. Раз в сутки: окна прайс-листа всё равно суточные,
 # чаще снимать нечего.
-HISTORY_INTERVAL_HOURS = float(os.environ.get("HISTORY_INTERVAL_HOURS", "24"))
+HISTORY_INTERVAL_HOURS = envcfg.env_float("HISTORY_INTERVAL_HOURS", 24)
 
 # Сколько дней наблюдений нужно, чтобы минимуму можно было верить. Меньше
 # недели — это не минимум, а просто самая низкая из трёх случайных цен.
-HISTORY_MATURE_DAYS = int(os.environ.get("HISTORY_MATURE_DAYS", "7"))
+HISTORY_MATURE_DAYS = envcfg.env_int("HISTORY_MATURE_DAYS", 7)
 
 
 async def _take_price_snapshot(*, force: bool = False) -> str:
@@ -4640,11 +4641,11 @@ DIPS_JOB_PREFIX = "dips_scan_"
 # Порог просадки по умолчанию. Ниже 20% смысла нет: комиссия Steam ~13%, и
 # чтобы купить-подождать-продать хотя бы в ноль, цена должна вернуться
 # примерно на 15%. Просадка в 10% — это не находка, а работа за комиссию.
-DIPS_DEFAULT_DROP = float(os.environ.get("DIPS_DEFAULT_DROP", "25"))
+DIPS_DEFAULT_DROP = envcfg.env_float("DIPS_DEFAULT_DROP", 25)
 
 # Сколько просадок проверять живой ценой. Тот же бюджет и та же причина, что
 # у /markets: живых запросов к Steam мало, тратить их надо на верхушку.
-DIPS_VERIFY_LIMIT = int(os.environ.get("DIPS_VERIFY_LIMIT", "25"))
+DIPS_VERIFY_LIMIT = envcfg.env_int("DIPS_VERIFY_LIMIT", 25)
 
 # Насколько старой может быть цена, чтобы считаться живой.
 #
@@ -4652,7 +4653,7 @@ DIPS_VERIFY_LIMIT = int(os.environ.get("DIPS_VERIFY_LIMIT", "25"))
 # наклеек и прикидок это нормально, а здесь нет: команда отвечает на вопрос
 # «дёшево ли ПРЯМО СЕЙЧАС», и полусуточная запись на него не отвечает. Хуже
 # того, она печаталась жирным как «сейчас», то есть прямо утверждала неправду.
-DIPS_MAX_QUOTE_AGE = float(os.environ.get("DIPS_MAX_QUOTE_AGE_MIN", "30")) * 60
+DIPS_MAX_QUOTE_AGE = envcfg.env_float("DIPS_MAX_QUOTE_AGE_MIN", 30) * 60
 
 
 async def _apply_dips_args(chat_id: int, args) -> dict:
@@ -7075,7 +7076,7 @@ async def _apply_setting(chat_id: int, key: str, value, context) -> str:
 # систематическое (а отношение 2.3-2.7 держалось на 1290 предметах подряд —
 # рынки так не расходятся, их разногласия случайны), постоянный множитель
 # виден уже на десятке точек, а случайный разброс на них же рассыпается.
-PRICECHECK_SAMPLE = int(os.environ.get("PRICECHECK_SAMPLE", "20"))
+PRICECHECK_SAMPLE = envcfg.env_int("PRICECHECK_SAMPLE", 20)
 
 
 # Насколько медиана может отойти от единицы, оставаясь объяснимой.
@@ -8331,7 +8332,7 @@ def _start_health_server():
     апдейтами Telegram (и наоборот). Для health-check это означало бы ложное
     "сервис не отвечает".
     """
-    port = int(os.environ.get("PORT", 8080))
+    port = envcfg.env_int("PORT", 8080)
     server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     log.info("health-check сервер слушает порт %d", port)
