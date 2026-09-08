@@ -184,6 +184,20 @@ from csfloat_client import CSFloatError, CSFloatRateLimited
 logsetup.setup(logging.INFO)
 log = logging.getLogger("steam_bot")
 
+# Какая версия кода реально запущена. Render кладёт коммит в RENDER_GIT_COMMIT.
+#
+# Без этой строки «задеплоилось или нет» приходится выяснять окольно — по тому,
+# печатает ли бот новый текст сообщения. Именно так и вышло 2026-09-08: коммит
+# лежал в main, процесс перезапустился через минуту после пуша, а работал всё
+# равно старый код, и понять это удалось только по фразе в чате. Одна строка в
+# логе отвечает на вопрос сразу.
+DEPLOYED_COMMIT = os.environ.get("RENDER_GIT_COMMIT", "")[:7] or "неизвестно (не Render?)"
+DEPLOYED_BRANCH = os.environ.get("RENDER_GIT_BRANCH", "")
+
+
+def deployed_version() -> str:
+    return DEPLOYED_COMMIT + (f" ({DEPLOYED_BRANCH})" if DEPLOYED_BRANCH else "")
+
 # httpx на INFO печатает полный URL каждого запроса к Telegram, а токен бота —
 # часть этого URL. То есть весь лог Render, включая любой кусок, отправленный
 # в переписку или в тикет, содержит рабочий токен. Полезного в этих строках
@@ -6410,7 +6424,14 @@ async def _status_lines(chat_id: int, jq) -> list[str]:
     fn_from, f_lo, f_hi, bs_to = await get_float_ranges(chat_id)
     f_markup = await get_float_markup(chat_id)
 
-    lines = ["📊 <b>Состояние</b>", ""]
+    # Версия первой строкой: вопрос «а новая правка вообще доехала?» возникает
+    # раньше всех прочих, а ответ на него до сих пор приходилось добывать
+    # косвенно — по тому, изменился ли текст какого-нибудь сообщения.
+    lines = [
+        "📊 <b>Состояние</b>",
+        f"<i>версия: {html_module.escape(deployed_version())}</i>",
+        "",
+    ]
 
     # --- Списки и автоскан -------------------------------------------------
     lines.append("<b>Списки</b>")
@@ -8314,6 +8335,7 @@ def _start_health_server():
     server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     log.info("health-check сервер слушает порт %d", port)
+    log.info("версия кода: %s", deployed_version())
 
 
 # Telegram принимает секрет только из этих символов, 1-256 длиной. Несоблюдение
