@@ -74,10 +74,22 @@ PATH = os.environ.get("LOG_GITHUB_PATH", "dextrade.log").strip()
 INTERVAL_MINUTES = float(os.environ.get("LOG_SHIP_MINUTES", "30"))
 ALLOW_PUBLIC = os.environ.get("LOG_GITHUB_ALLOW_PUBLIC", "").strip() in ("1", "true", "yes", "да")
 
-# Потолок выгрузки. Не про лимит GitHub (там мегабайты), а про здравый смысл:
-# каждая выгрузка это коммит, и репозиторий с историей многомегабайтных
-# текстов становится неудобным очень быстро.
-MAX_BYTES = int(os.environ.get("LOG_SHIP_MAX_KB", "512")) * 1024
+# Потолок НАКОПЛЕННОГО файла на GitHub. По достижении режем с начала: файл
+# накапливается через редеплои (диск Render эфемерен, а удалённый файл — нет),
+# и без потолка он рос бы бесконечно.
+#
+# Режем именно с начала, а не стираем целиком: «очистить» на десятом мегабайте
+# означало бы выбросить и свежие строки тоже, ровно в тот момент, когда их
+# больше всего.
+# Имя своё, не LOG_MAX_MB: та переменная задаёт размер ЛОКАЛЬНОГО файла
+# (logsetup), и одно имя на две разные величины однажды сведёт их вместе
+# в самый неподходящий момент.
+MAX_BYTES = int(os.environ.get("LOG_GITHUB_MAX_MB", "10")) * 1024 * 1024
+
+# Не чаще одного коммита в столько секунд, даже если строки идут потоком.
+# Выгрузка теперь по событию, и без этой паузы шумный прогон дал бы коммит на
+# каждую строку.
+MIN_GAP_SECONDS = float(os.environ.get("LOG_SHIP_MIN_GAP", "60"))
 
 # Хеш последней выгруженной версии: если ничего не изменилось, коммит не нужен.
 _last_digest: str | None = None
@@ -93,7 +105,7 @@ def enabled() -> bool:
 _KNOWN_VARS = (
     "LOG_GITHUB_TOKEN", "LOG_GITHUB_REPO", "LOG_GITHUB_BRANCH",
     "LOG_GITHUB_PATH", "LOG_GITHUB_ALLOW_PUBLIC",
-    "LOG_SHIP_MINUTES", "LOG_SHIP_MAX_KB",
+    "LOG_SHIP_MINUTES", "LOG_SHIP_MAX_KB", "LOG_GITHUB_MAX_MB", "LOG_SHIP_MIN_GAP",
     "LOG_FILE", "LOG_RING_LINES", "LOG_MAX_MB", "LOG_BACKUPS",
 )
 
@@ -267,6 +279,76 @@ async def _current_sha(session: aiohttp.ClientSession) -> str | None:
             raise LogShipError(f"GitHub ответил {resp.status} при чтении {PATH}.")
         data = await resp.json()
         return data.get("sha")
+
+
+async def _current_content(session: aiohttp.ClientSession) -> bytes:
+    """
+    Что сейчас лежит в удалённом файле.
+
+    Просим сырое содержимое (Accept: …raw) намеренно: JSON-ответ Contents API
+    отдаёт base64 только для файлов меньше мегабайта, а накопленный лог этот
+    порог перейдёт на второй же день. С raw ограничение — сто мегабайт.
+    """
+    headers = {**_headers(), "Accept": "application/vnd.github.raw"}
+    async with session.get(
+        f"{API}/repos/{REPO}/contents/{PATH}", headers=headers, params={"ref": BRANCH}
+    ) as resp:
+        if resp.status == 404:
+            return b""
+        if resp.status != 200:
+            raise LogShipError(f"GitHub ответил {resp.status} при чтении {PATH}.")
+        return await resp.read()
+
+
+async def append(new_text: str, *, note: str = "") -> str:
+    """
+    Дописать новые строки к накопленному файлу на GitHub.
+
+    Почему дописываем, а не перезаписываем. Диск Render эфемерен: при каждом
+    редеплое локальный лог начинается с нуля, и перезапись затирала бы всё
+    предыдущее — как раз то, что нужнее всего, когда разбираешь «а что было
+    до перезапуска». Удалённый файл переживает редеплои и служит архивом.
+
+    Возвращает человеческий отчёт.
+    """
+    if not enabled():
+        raise LogShipError(status())
+    if not new_text.strip():
+        return "новых строк нет — коммит не нужен"
+
+    async with aiohttp.ClientSession() as session:
+        await check(session)
+        sha = await _current_sha(session)
+        current = await _current_content(session) if sha else b""
+
+        merged = current + new_text.encode("utf-8")
+        trimmed = False
+        if len(merged) > MAX_BYTES:
+            merged = "…(начало обрезано, потолок {} МБ)…\n".format(
+                MAX_BYTES // (1024 * 1024)
+            ).encode("utf-8") + merged[-MAX_BYTES:]
+            trimmed = True
+
+        body = {
+            "message": f"лог бота{': ' + note if note else ''}",
+            "content": base64.b64encode(merged).decode("ascii"),
+            "branch": BRANCH,
+        }
+        if sha:
+            body["sha"] = sha
+
+        async with session.put(
+            f"{API}/repos/{REPO}/contents/{PATH}", headers=_headers(), json=body
+        ) as resp:
+            if resp.status not in (200, 201):
+                text = (await resp.text())[:300]
+                raise LogShipError(f"GitHub ответил {resp.status} при записи: {text}")
+
+    return (
+        f"дописано {len(new_text.encode('utf-8')) / 1024:.1f} КБ, "
+        f"в файле {len(merged) / 1024 / 1024:.2f} МБ"
+        + (" (начало обрезано по потолку)" if trimmed else "")
+    )
 
 
 async def ship(payload: bytes, *, note: str = "") -> str:

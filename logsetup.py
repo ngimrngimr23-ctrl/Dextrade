@@ -83,8 +83,42 @@ class RingHandler(logging.Handler):
         return data if lines is None else data[-lines:]
 
 
+class DirtyHandler(logging.Handler):
+    """
+    Поднимает флаг «появились новые строки». На нём держится выгрузка по
+    событию вместо выгрузки по таймеру.
+
+    ЗАПИСИ САМОЙ ВЫГРУЗКИ ИГНОРИРУЮТСЯ, и это не мелочь, а условие работы.
+    Выгрузка пишет в лог «лог выгружен …» — то есть меняет файл. Если бы эта
+    строка тоже поднимала флаг, получился бы вечный двигатель: выгрузили ->
+    записали об этом -> файл изменился -> выгрузили снова, и так до конца
+    времён с периодом в одну паузу.
+    """
+
+    IGNORED_PREFIX = "steam_bot.logship"
+
+    def __init__(self):
+        super().__init__()
+        self.dirty = False
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.name.startswith(self.IGNORED_PREFIX):
+            return
+        self.dirty = True
+
+    def take(self) -> bool:
+        """Прочитать и сбросить флаг разом — чтобы не потерять запись, пришедшую между."""
+        was, self.dirty = self.dirty, False
+        return was
+
+
 _ring: RingHandler | None = None
 _file_handler: logging.handlers.RotatingFileHandler | None = None
+_dirty: DirtyHandler | None = None
+
+# Сколько байт локального файла уже уехало на GitHub. Нужно, чтобы дописывать
+# только новое, а не слать файл целиком каждый раз.
+_shipped_offset = 0
 
 
 def setup(level: int = logging.INFO) -> None:
@@ -112,6 +146,10 @@ def setup(level: int = logging.INFO) -> None:
     _ring.setFormatter(formatter)
     root.addHandler(_ring)
 
+    global _dirty
+    _dirty = DirtyHandler()
+    root.addHandler(_dirty)
+
     try:
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         _file_handler = logging.handlers.RotatingFileHandler(
@@ -130,6 +168,42 @@ def setup(level: int = logging.INFO) -> None:
 
 def available() -> bool:
     return _ring is not None
+
+
+def has_new_records() -> bool:
+    """Появились ли строки с прошлой проверки. Флаг сбрасывается чтением."""
+    return _dirty.take() if _dirty is not None else False
+
+
+def unshipped() -> str:
+    """
+    Строки, которых ещё нет в выгруженном файле.
+
+    Отдаём хвост локального файла после _shipped_offset. Если файл стал
+    короче отметки, значит его подрезала ротация или процесс перезапустился с
+    чистым диском — начинаем читать сначала, иначе потеряли бы всё новое.
+    """
+    global _shipped_offset
+    if _file_handler is None:
+        return "\n".join(_ring.tail()) + "\n" if _ring and _ring.buffer else ""
+
+    try:
+        size = LOG_PATH.stat().st_size
+        if size < _shipped_offset:
+            _shipped_offset = 0
+        if size == _shipped_offset:
+            return ""
+        with io.open(LOG_PATH, encoding="utf-8", errors="replace") as f:
+            f.seek(_shipped_offset)
+            return f.read()
+    except Exception:
+        return ""
+
+
+def mark_shipped() -> None:
+    """Запомнить, что локальный файл выгружен до текущей длины."""
+    global _shipped_offset
+    _shipped_offset = file_size()
 
 
 def file_size() -> int:

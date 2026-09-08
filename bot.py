@@ -6114,15 +6114,29 @@ LOG_SHIP_JOB_NAME = "logship"
 
 async def log_ship_job(context: ContextTypes.DEFAULT_TYPE):
     """
-    Периодическая выгрузка лога в репозиторий на GitHub.
+    Выгрузка лога ПО СОБЫТИЮ: проснулись, посмотрели, были ли новые строки.
+
+    Раньше выгрузка шла по таймеру и коммитила независимо от того, случилось
+    что-нибудь или нет. Теперь просыпаемся часто, но пишем только когда есть
+    что писать — тихий бот не оставляет в репозитории ни одного коммита, а
+    шумный доносит новости в пределах минуты.
+
+    Пауза между пробуждениями и есть верхняя граница задержки. Меньше минуты
+    ставить незачем: каждая выгрузка — коммит, а строки всё равно копятся.
 
     Сбой выгрузки НЕ должен ничего ронять и не должен спамить в чат: это
-    вспомогательная функция, и её поломка не повод мешать работе бота. Всё
-    уходит в лог — тот самый, который не выгрузился, но он есть в /logs.
+    вспомогательная функция, и её поломка не повод мешать работе бота.
     """
     try:
-        note = await logship.ship(logsetup.dump(), note="автовыгрузка")
-        log.info("logship: %s", note)
+        if logsetup.has_new_records():
+            new_text = logsetup.unshipped()
+            if new_text.strip():
+                note = await logship.append(new_text, note="новые строки")
+                # Отмечаем только после успешной записи: упади она сейчас,
+                # эти строки должны уехать со следующей попыткой, а не
+                # пропасть навсегда.
+                logsetup.mark_shipped()
+                log.info("logship: %s", note)
     except logship.LogShipError as e:
         log.warning("logship: %s", e)
     except Exception:
@@ -6130,7 +6144,7 @@ async def log_ship_job(context: ContextTypes.DEFAULT_TYPE):
     finally:
         context.job_queue.run_once(
             log_ship_job,
-            when=logship.INTERVAL_MINUTES * 60,
+            when=logship.MIN_GAP_SECONDS,
             name=LOG_SHIP_JOB_NAME,
         )
 
