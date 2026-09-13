@@ -2598,11 +2598,28 @@ async def _run_watchlist_scan(
                 delta = {k: v for k, v in delta.items() if v}
                 if delta:
                     best = after.get("best_markup")
+                    limits = analyzer.offer_limits()
                     log.info(
-                        "watchlist: стикерный отбор — %s. Лучшая наценка за прогон: %s",
+                        "watchlist: стикерный отбор — %s. Лучшая наценка за прогон: %s. "
+                        "Пороги: %s",
                         ", ".join(f"{k} {v:.0f}" for k, v in delta.items()),
                         f"{best:.0f}%" if best is not None else "—",
+                        ", ".join(
+                            f"{k} {v:g}" for k, v in limits.items() if v is not None
+                        ) or "не заданы",
                     )
+                    # Самый частый исход и самый неочевидный: всё работает, а
+                    # порог отстоит от рынка на считанные проценты. Пока это
+                    # приходилось высчитывать в уме, «ничего не нашлось»
+                    # читалось как поломка.
+                    ceiling = limits.get("наценка до %")
+                    if best is not None and ceiling and best <= ceiling * 2:
+                        log.info(
+                            "watchlist: до находок не хватило %.0f п.п. — лучший лот "
+                            "просил %.0f%% наценки при пороге %g%%. Это настройка, "
+                            "а не поломка",
+                            best - ceiling, best, ceiling,
+                        )
             if got["listings"] > 200 and not got["with_stickers"]:
                 log.warning(
                     "watchlist: из %d разобранных лотов НИ ОДНОГО со стикерами. "

@@ -77,6 +77,15 @@ def _max_streak(stickers: list[str]) -> int:
 # совсем. Прогон отчитывался «проверено 142 предмета», разбор рапортовал 6864
 # понятых лота и 2343 со стикерами, а находок ноль, и почему — неизвестно.
 _offer_drops: dict[str, float] = {}
+# Пороги, с которыми отбор шёл в последний раз. Без них разбивка не читается:
+# «лучшая наценка 6%» ничего не значит, пока не сказано, что порог 5% — и
+# именно этого числа не хватило, чтобы понять, строг порог или рынок пуст.
+_offer_limits: dict[str, float | None] = {}
+
+
+def offer_limits() -> dict:
+    """Пороги последнего отбора — для той же сводки, что и offer_drops()."""
+    return dict(_offer_limits)
 
 
 def offer_drops() -> dict[str, float]:
@@ -110,6 +119,16 @@ def find_offers(
     """
     listing_floats = listing_floats or {}
     floor_price = _floor_price(listings)
+    _offer_limits.update(
+        {
+            "набор от $": min_stickers_value,
+            "наценка до %": max_markup_pct,
+            "наценка для стрика до %": streak_max_markup_pct,
+            "набор тяжелее скина в": min_sticker_ratio,
+            "лот от $": min_price,
+            "лот до $": max_price,
+        }
+    )
 
     offers = []
     for listing in listings:
