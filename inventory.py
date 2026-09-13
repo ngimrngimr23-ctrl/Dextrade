@@ -190,6 +190,18 @@ async def fetch_inventory(steamid: str) -> list[InventoryItem]:
                         )
                         route = next_route
                         continue
+                    # Кулдаун области — только когда кончился ПУЛ, а не когда
+                    # кончился бюджет попыток на этой странице. См. подробный
+                    # разбор в steam_client.fetch_all_listings: бюджет упирается
+                    # в STEAM_RETRY_HARD_CAP, а адресов в пуле бывает вчетверо
+                    # больше, и наказывать за это всю область не за что.
+                    free = STEAM_POOL.available()
+                    if free:
+                        raise SteamRateLimited(
+                            f"Steam ответил 429 на всех маршрутах, отведённых этой "
+                            f"странице инвентаря. Свободные адреса ещё есть ({free}), "
+                            f"поэтому область на кулдаун не отправляю — попробуй ещё раз."
+                        )
                     seconds = await note_steam_429(scope="inventory", headers=dict(resp.headers))
                     raise SteamRateLimited(
                         f"Steam ответил 429 на инвентарь и свободных прокси не осталось "
