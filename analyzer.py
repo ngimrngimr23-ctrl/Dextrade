@@ -272,6 +272,8 @@ class ArbOffer:
     steam_sales_recent: bool | None = None
     # Сошлись ли два независимых источника цены. См. CSFloatListing.
     steam_price_confirmed: bool | None = None
+    # Оценка источника до приведения к линейке. См. CSFloatListing.
+    steam_price_raw: float | None = None
 
     def __post_init__(self):
         if self.stickers is None:
@@ -439,6 +441,7 @@ def find_arbitrage_offers(
                 steam_price_second_opinion=l.steam_price_windows,
                 steam_sales_recent=l.steam_sales_recent,
                 steam_price_confirmed=l.steam_price_confirmed,
+                steam_price_raw=l.steam_price_raw,
             )
         )
 

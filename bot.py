@@ -47,6 +47,7 @@ import io
 import json
 import logging
 import envcfg
+import price_ruler
 import os
 import re
 import statistics
@@ -330,6 +331,26 @@ ARB_SORT_BY = os.environ.get("ARB_SORT_BY", "most_recent")
 # Сколько страниц выдачи «по скидке» добирать сверх широкого скана. См.
 # _add_top_discount_page — там же основание, почему одна, а не сортировка целиком.
 ARB_DISCOUNT_PAGES = envcfg.env_int("ARB_DISCOUNT_PAGES", 1)
+
+# На сколько процентных пунктов ослабить порог на этапе ОТБОРА кандидатов.
+#
+# Порог у пользователя один, но применяется он дважды: к оценке (кого вообще
+# рассматривать) и к живой цене Steam (кого слать). Ко второму претензий нет —
+# там настоящее число. А первое даже после приведения к общей линейке остаётся
+# оценкой с разбросом: замеры 2026-09-13 дали перекос от 1.00 до 1.46 при
+# медиане 1.16, то есть по отдельному предмету поправка может как недотянуть,
+# так и перетянуть.
+#
+# Если применять к оценке тот же порог, перетянутые кандидаты выпадают ДО
+# проверки и шанса оправдаться не получают. На тех же пятнадцати замерах так
+# терялся единственный по-настоящему годный лот: Nomad Knife с оценочными
+# 35.6% при пороге 35% после поправки становился 25.3% и не доживал до
+# проверки — хотя живая цена дала бы 35.7%.
+#
+# Поэтому отбор идёт с запасом, а решает по-прежнему проверка. Цена запаса
+# невелика: лишние кандидаты не рассылаются, они лишь встают в очередь, из
+# которой живые запросы забирают восемь штук по достоверности.
+ARB_PREFILTER_MARGIN_PCT = envcfg.env_float("ARB_PREFILTER_MARGIN_PCT", 10.0)
 
 # Максимальное расхождение между прайс-листом csgotrader и собственной
 # справочной ценой CSFloat (reference.base_price), при котором цене ещё можно
@@ -2783,10 +2804,16 @@ async def _verify_against_steam(offers, min_discount_pct: float) -> tuple[list, 
     if not offers:
         return offers, empty
     if not STEAM_POOL.enabled() and steam_cooldown_remaining(scope="pricing") > 0:
+        # Проверить нечем, значит запас отбора отработать некому — применяем
+        # настоящий порог руками. Иначе ослабление отбора протекло бы в чат:
+        # кандидат с оценочными 26% при пороге 35% ушёл бы находкой.
+        kept = [o for o in offers if o.discount_pct >= min_discount_pct]
         log.warning(
-            "arb: Steam на кулдауне и прокси нет — цены оставлены непроверенными"
+            "arb: Steam на кулдауне и прокси нет — %d из %d оставлены "
+            "непроверенными, остальные ниже порога",
+            len(kept), len(offers),
         )
-        return offers, dict(empty, unchecked=len(offers))
+        return kept, dict(empty, unchecked=len(kept), rechecked_below=len(offers) - len(kept))
 
     # Очередь строится заново, а не берётся в порядке отбора: отбор ранжирует
     # по оценке, а проверять надо по достоверности. См. _verification_rank.
@@ -2870,6 +2897,9 @@ async def _verify_against_steam(offers, min_discount_pct: float) -> tuple[list, 
                     steam_failed += 1
                 continue
 
+            # Замер перекоса делаем ДО перезаписи и по сырому значению —
+            # иначе коэффициент сойдётся к единице и отменит сам себя.
+            price_ruler.note(o.steam_price_window, o.steam_price_raw, live.lowest)
             was, was_pct = o.steam_price, o.discount_pct
             o.steam_price = live.lowest
             o.steam_price_window = "живая цена Steam"
@@ -3047,11 +3077,21 @@ async def _fill_steam_prices(listings) -> int:
         # запасной источник там, где предмета нет в прайс-листе (а нет его у
         # заметной доли лотов).
         if listed is not None:
-            l.steam_price = listed
+            # Сырое значение остаётся при лоте: по нему потом замеряется сам
+            # перекос. А в отбор идёт уже приведённое к линейке низа стакана —
+            # той самой, которой меряет проверка. См. price_ruler.
+            l.steam_price_raw = listed
+            l.steam_price = price_ruler.as_lowest_ask(listed, ARB_PRICE_WINDOW)
             l.steam_price_window = ARB_PRICE_WINDOW
             l.steam_price_spread_pct = found.recent_spread_pct
             from_pricelist += 1
 
+            # Расхождение источников считается по СЫРЫМ числам, без поправки
+            # на линейку. Не потому что так точнее, а потому что
+            # ARB_SOURCE_GAP_PCT калиброван именно на них: менять линейку и
+            # порог согласия одной правкой значит потерять возможность понять,
+            # что из двух сработало. К тому же поправка в 13% на фоне типичного
+            # расхождения в 100-150% ничего здесь не решает.
             if l.reference_price and l.reference_price > 0:
                 gap = abs(listed - l.reference_price) / l.reference_price * 100
                 if gap <= ARB_SOURCE_GAP_PCT:
@@ -3072,8 +3112,11 @@ async def _fill_steam_prices(listings) -> int:
         # Предмета нет в прайс-листе — берём справку CSFloat, иначе потеряли бы
         # заметную часть рынка вовсе.
         if l.reference_price and l.reference_price > 0:
-            l.steam_price = l.reference_price
-            l.steam_price_window = "справка CSFloat"
+            l.steam_price_raw = l.reference_price
+            l.steam_price = price_ruler.as_lowest_ask(
+                l.reference_price, price_ruler.CSFLOAT_REFERENCE
+            )
+            l.steam_price_window = price_ruler.CSFLOAT_REFERENCE
             l.steam_price_windows = "в прайс-листе предмета нет — цена по оценке CSFloat"
             from_reference += 1
 
@@ -3176,7 +3219,9 @@ async def _run_arb_scan(bot, chat_id: int) -> ArbRun | None:
         await _fill_steam_prices(listings)
         offers = find_arbitrage_offers(
             listings,
-            min_discount_pct=settings["min_discount"],
+            # С запасом: решает проверка живой ценой, а не оценка. См.
+            # ARB_PREFILTER_MARGIN_PCT.
+            min_discount_pct=max(0.0, settings["min_discount"] - ARB_PREFILTER_MARGIN_PCT),
             min_price=settings["min_price"],
             max_price=settings["max_price"],
             min_steam_volume=settings["min_volume"],
@@ -3242,6 +3287,10 @@ async def _run_arb_scan(bot, chat_id: int) -> ArbRun | None:
         return ArbRun(sent=len(new_offers), candidates=candidates, **stats)
     finally:
         _arb_running.discard(chat_id)
+        # Замеры линейки копятся только здесь, поэтому и сохраняются здесь же —
+        # на всех путях выхода, включая отказ Steam посреди прогона.
+        await price_ruler.save()
+        log.info("arb: %s", price_ruler.describe())
 
 
 async def arb_scan_job(context: ContextTypes.DEFAULT_TYPE):
@@ -6136,6 +6185,7 @@ async def _arb_reset(update):
     budget = csfloat_client.budget_description()
     if budget:
         lines.append(f"Квота в прошлый замер: {budget}")
+    lines.append(price_ruler.describe().capitalize())
     lines.append("")
     lines.append("Проверить прямо сейчас: /arbnow")
     await update.message.reply_text("\n".join(lines))
@@ -8257,6 +8307,7 @@ async def _on_startup(app: Application):
     # процесса и тут же пробовал снова, продлевая реальный бан.
     await load_persisted_cooldown()
     await csfloat_client.load_persisted_cooldown()
+    await price_ruler.load()
     # Прокси, добавленные через /proxyadd, живут в хранилище — без этого они
     # пропадали бы при каждом редеплое, а Render передеплоивает часто.
     try:

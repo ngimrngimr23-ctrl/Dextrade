@@ -1123,6 +1123,37 @@ async def mark_offer_sent(
 # ---------------------------------------------------------------------------
 
 STEAM_COOLDOWN_KEY_PREFIX = "steam_cooldown:"
+LOCAL_PRICE_RULER_PATH = Path(__file__).parent / "price_ruler_local.json"
+PRICE_RULER_KEY = "price_ruler"
+
+
+async def get_price_ruler() -> dict:
+    """{источник: [отношения оценки к реальной цене]} — см. price_ruler.py."""
+    if REDIS_ENABLED:
+        try:
+            raw = await _redis_cmd("GET", PRICE_RULER_KEY)
+            return json.loads(raw) if raw else {}
+        except Exception:
+            pass
+    if LOCAL_PRICE_RULER_PATH.exists():
+        try:
+            return json.loads(LOCAL_PRICE_RULER_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+async def set_price_ruler(samples: dict) -> None:
+    value = json.dumps(samples, ensure_ascii=False)
+    if REDIS_ENABLED:
+        try:
+            await _redis_cmd("SET", PRICE_RULER_KEY, value)
+            return
+        except Exception:
+            pass
+    LOCAL_PRICE_RULER_PATH.write_text(value, encoding="utf-8")
+
+
 LOCAL_STEAM_COOLDOWN_PATH = Path(__file__).parent / "steam_cooldown_local.json"
 
 

@@ -12,6 +12,7 @@ chat_defaults_local.json
 watchlist_local.json
 sent_offers_local.json
 steam_cooldown_local.json
+price_ruler_local.json
 
 # Кэши, которые бот скачивает/собирает сам при работе
 sticker_catalog_cache.json
