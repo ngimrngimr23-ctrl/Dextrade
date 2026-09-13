@@ -2527,14 +2527,52 @@ async def _run_watchlist_scan(
         used_lanes = sum(
             1 for lane, n in lanes_after.items() if n > lanes_before.get(lane, 0)
         )
+        requests_made = sum(
+            n - lanes_before.get(lane, 0) for lane, n in lanes_after.items()
+        )
+        gap = request_interval if request_interval is not None else MIN_REQUEST_INTERVAL
+        rate = requests_made / elapsed * 60 if elapsed > 0 else 0.0
+
         log.info(
-            "watchlist: chat_id=%s прогон за %.1f с — предметов %d (ошибок %d), полос %d, пауза %.1f с. "
+            "watchlist: chat_id=%s прогон за %.1f с — предметов %d (ошибок %d), "
+            "воркеров %d, полос троттлинга %d, пауза %.1f с -> ВЫШЛО %.0f запросов в минуту. "
             "Суммарно по фазам (идут внахлёст): Steam %.1f с (из них троттлинг %.1f с), "
             "отбор+Upstash %.1f с, Telegram %.1f с",
-            chat_id, elapsed, stats.items, stats.failed, workers,
-            request_interval if request_interval is not None else MIN_REQUEST_INTERVAL,
+            chat_id, elapsed, stats.items, stats.failed, workers, used_lanes, gap, rate,
             stats.steam, throttle_wait, stats.compute, stats.send,
         )
+
+        # Настоящий темп против того, на который рассчитывали.
+        #
+        # Отчёт годами печатал в графе «полос» число ВОРКЕРОВ, хотя рядом
+        # вычислялось (и выбрасывалось) число реально работавших полос
+        # троттлинга. Разница не косметическая: пауза держится ПО ПОЛОСЕ, а
+        # полоса — это адрес из пула. Пока адресов было девять, «пауза 4 с»
+        # означала потолок 2.2 запроса в секунду и в отчёте честно виднелся
+        # троттлинг. Стоило добавить логинов до сорока семи — потолок стал
+        # 11.7 запроса в секунду, тормоз перестал срабатывать вовсе
+        # («троттлинг 0.0 с»), и прогон ускорился вдвое сам по себе. Со стороны
+        # это выглядело как необъяснимое ускорение, потому что число, по
+        # которому это можно было понять, в лог не попадало.
+        #
+        # Важно, что пул — это ОДИН шлюз под разными логинами (см.
+        # ProxyPool.single_gateway). Даёт ли он на каждый логин свой исходящий
+        # адрес — вопрос к /proxycheck, и от ответа зависит, сорок семь у нас
+        # бюджетов или один, поделённый на сорок семь.
+        planned = used_lanes * 60 / gap if gap > 0 else float("inf")
+        if rate > planned * 1.5 and requests_made > 20:
+            log.warning(
+                "watchlist: темп %.0f запросов в минуту заметно выше расчётного %.0f "
+                "(полос %d, пауза %.1f с) — тормоз не сработал, проверь настройку",
+                rate, planned, used_lanes, gap,
+            )
+        elif used_lanes > 1:
+            log.info(
+                "watchlist: потолок темпа сейчас %.0f запросов в минуту "
+                "(%d полос при паузе %.1f с). Если за логинами один адрес, "
+                "весь этот темп видит он один — проверить: /proxycheck",
+                planned, used_lanes, gap,
+            )
 
         if rate_limit_hit:
             market_hash_name, e = rate_limit_hit[0]
