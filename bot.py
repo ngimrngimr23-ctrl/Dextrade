@@ -90,6 +90,7 @@ from steam_client import (
     parse_sample as steam_parse_sample,
     request_totals as steam_request_totals,
     retry_totals as steam_retry_totals,
+    KNOWN_SCOPES as STEAM_SCOPES,
     reset_cooldown as steam_reset_cooldown,
 )
 from csgo_api import search_items as search_csgo_items
@@ -922,7 +923,7 @@ async def _scan_hot(update, context, chat_id: int, def_min: float, def_max: floa
     if cooldown > 0:
         await update.message.reply_text(
             f"Steam на кулдауне после 429 — ещё {cooldown / 60:.0f} мин. "
-            f"Попробуй после этого."
+            f"Попробуй после этого.\n{COOLDOWN_HINT}"
         )
         return
 
@@ -3806,7 +3807,7 @@ async def watchresume(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += (
             f"\n\n⚠️ Но Steam сейчас на кулдауне после 429, и свободных прокси нет — "
             f"первые {cooldown / 60:.0f} мин прогоны будут пропускаться.\n"
-            f"Состояние пула: {STEAM_POOL.describe()}"
+            f"Состояние пула: {STEAM_POOL.describe()}\n{COOLDOWN_HINT}"
         )
     elif steam_cooldown_remaining() > 0:
         # Кулдаун есть, но он не мешает: прямой адрес переждёт, а запросы
@@ -6286,6 +6287,80 @@ async def _arb_reset(update):
     await update.message.reply_text("\n".join(lines))
 
 
+# Как область кулдауна называется для человека. В коде это "listings" и
+# "pricing", и в сообщении такое ничего не объясняет: надо, чтобы по названию
+# было понятно, ЧТО именно перестало работать.
+_SCOPE_NAMES = {
+    "listings": "листинги — вотчлист, /scan, /scanall",
+    "pricing": "цены — арбитраж, /dips, /markets",
+    "inventory": "инвентарь — /inv",
+}
+
+# Приписка к сообщениям об отказе из-за кулдауна. Одной строкой и в одном
+# месте, чтобы не разъезжалась по десятку текстов.
+COOLDOWN_HINT = "Снять паузу вручную: /reset"
+
+
+async def reset_cooldowns(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /reset — снять все наши паузы после 429 и дать попробовать сразу.
+
+    Зачем отдельная команда. Пауза после 429 растёт вдвое с каждым разом и
+    упирается в шесть часов, живёт в Upstash и переживает передеплой. Снять её
+    можно было только через /setarb сброс — то есть через команду настройки
+    АРБИТРАЖА, — и она трогала лишь две области из трёх. Человек, которому бот
+    только что ответил «Steam на кулдауне — ещё 16 мин», об этом способе
+    догадаться не мог: в самом сообщении о нём не было ни слова.
+
+    Честная оговорка вынесена в ответ команды, а не спрятана в докстринг:
+    снимается НАША пауза, а не бан у Steam. Чужой бан снять нельзя, и если он
+    ещё держится, следующий запрос его продлит, а пауза встанет заново и вдвое
+    длиннее. Команда полезна там, где причина уже устранена — сменились прокси,
+    прошло время, поправлен запрос, — а не как способ «отключить лимиты».
+    """
+    lines = ["🔓 Снимаю паузы после 429."]
+    cleared = 0
+
+    for scope in STEAM_SCOPES:
+        was = await steam_reset_cooldown(scope)
+        name = _SCOPE_NAMES.get(scope, scope)
+        if was > 0:
+            cleared += 1
+            lines.append(f"• Steam, {name}: было {was / 60:.0f} мин — снято")
+        else:
+            lines.append(f"• Steam, {name}: паузы и не было")
+
+    if csfloat_client.csfloat_enabled():
+        cf = csfloat_client.cooldown_remaining()
+        await csfloat_client.reset_cooldown()
+        if cf > 0:
+            cleared += 1
+            lines.append(f"• CSFloat: было {cf / 60:.0f} мин — снято")
+        else:
+            lines.append("• CSFloat: паузы и не было")
+
+    lines.append("")
+    if cleared:
+        lines.append(
+            "⚠️ Снята НАША пауза, а не бан у Steam — чужой бан снять нельзя. "
+            "Если он ещё держится, следующий запрос получит 429 и продлит его, "
+            "а пауза встанет заново и вдвое длиннее."
+        )
+    else:
+        lines.append("Снимать было нечего — всё и так свободно.")
+
+    if STEAM_POOL.enabled():
+        lines.append(f"Прокси для Steam: {STEAM_POOL.describe()}")
+    budget = csfloat_client.budget_description()
+    if budget:
+        # Сброс паузы квоты не добавляет: если окно CSFloat выбрано, /arbnow
+        # упрётся в тот же 429 через секунду.
+        lines.append(f"Квота CSFloat в прошлый замер: {budget}")
+    lines.append("")
+    lines.append("Проверить: /scan, /scanall, /arbnow")
+    await update.message.reply_text("\n".join(lines))
+
+
 _PROFILE_WORDS = {"профиль", "profile", "замер", "-p"}
 
 
@@ -6329,7 +6404,8 @@ async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(
             f"Steam на кулдауне после 429 (это временный бан IP, который продлевается от новых "
-            f"попыток) — ещё {cooldown / 60:.0f} мин. Попробуй после этого."
+            f"попыток) — ещё {cooldown / 60:.0f} мин. Попробуй после этого.\n"
+            f"{COOLDOWN_HINT}"
         )
         return
 
@@ -6812,7 +6888,10 @@ async def _status_lines(chat_id: int, jq) -> list[str]:
     lines.append("<b>Доступ к площадкам</b>")
     for scope, label in (("listings", "Steam, листинги"), ("pricing", "Steam, цены стикеров")):
         cd = steam_cooldown_remaining(scope)
-        lines.append(f"  {label}: " + (f"⏸ кулдаун ещё {_fmt_mins(cd)}" if cd > 0 else "✅ свободен"))
+        lines.append(
+            f"  {label}: "
+            + (f"⏸ кулдаун ещё {_fmt_mins(cd)} (/reset)" if cd > 0 else "✅ свободен")
+        )
     cf = csfloat_client.cooldown_remaining()
     if not csfloat_client.csfloat_enabled():
         lines.append("  CSFloat: ⚠️ нет ключа (CSFLOAT_API_KEY)")
@@ -8272,6 +8351,14 @@ COMMANDS: tuple[Command, ...] = (
         "/setarb сброс — снять кулдаун CSFloat\n"
         "/setarb off — выключить\n"
         "Остальные пороги арбитража — /start → Пороги → Арбитраж.",
+    ),
+    Command(
+        "reset", reset_cooldowns, "Снять паузу после 429",
+        "Снять кулдаун Steam и CSFloat",
+        "/reset — снять все паузы после 429: Steam (листинги, цены, инвентарь) и CSFloat.\n"
+        "Снимается НАША пауза, а не бан у Steam: если он ещё держится, следующий "
+        "запрос его продлит. Имеет смысл, когда причина уже устранена — сменились "
+        "прокси, прошло время, поправлен запрос.",
     ),
     # --- Площадки ----------------------------------------------------------
     Command(
