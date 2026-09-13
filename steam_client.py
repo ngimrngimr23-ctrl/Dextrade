@@ -424,10 +424,16 @@ async def note_steam_429(
     burst = state["last_429_at"] > 0 and since_last < ESCALATION_DEBOUNCE_SECONDS
     if not burst and escalate:
         state["consecutive_429"] += 1
-    seconds = min(COOLDOWN_AFTER_429_SECONDS * (2 ** (state["consecutive_429"] - 1)), COOLDOWN_MAX_SECONDS)
+    # max(1, ...) обязателен. Счётчик бывает нулевым — после ручного /reset или
+    # когда залп подряд идущих 429 подавил рост, — и тогда 2 ** (0 - 1) даёт
+    # одну вторую, то есть базовый кулдаун УПОЛОВИНИВАЛСЯ ровно в тот момент,
+    # когда бан у Steam точно есть. В логе 20:47:12 это выглядело как «вернул
+    # 429 (0-й подряд)» и пауза 15 минут вместо тридцати.
+    steps = max(1, state["consecutive_429"])
+    seconds = min(COOLDOWN_AFTER_429_SECONDS * (2 ** (steps - 1)), COOLDOWN_MAX_SECONDS)
     log.warning(
         "Steam (%s) вернул 429 (%s-й подряд%s) — кулдаун на %.0f мин для этой области",
-        scope, state["consecutive_429"],
+        scope, steps,
         f", залп: {since_last:.0f} с с прошлого, эскалацию не наращиваю" if burst else "",
         seconds / 60,
     )
@@ -822,6 +828,33 @@ async def fetch_all_listings(
             headers = {**headers, "Cookie": "bMarketOptOut=1"}
 
         await throttle_steam_request(scope="listings", lane=route or "", interval=request_interval)
+
+        # Пока мы стояли в очереди на паузу, СОСЕДНИЙ воркер мог получить 429 и
+        # поставить кулдаун. Проверка в начале fetch_all_listings этого уже не
+        # ловит: четыре воркера уходят в сеть одновременно, первый получает
+        # бан, а остальные три успели пройти проверку до него.
+        #
+        # В проде 20:47:12-20:47:24 это выглядело так: четыре 429 подряд по
+        # одному и тому же прямому адресу за двенадцать секунд. Каждый из них
+        # продлевал НАСТОЯЩИЙ бан у Steam и заново придерживал области pricing
+        # и inventory — то есть три запроса из четырёх были чистым вредом.
+        if route is None and steam_cooldown_remaining("listings") > 0 and attempts_left > 0:
+            alt = STEAM_POOL.next()
+            if alt:
+                attempts_left -= 1
+                route = alt
+                log.info(
+                    "fetch_all_listings: пока ждали паузу, прямой адрес забанили — "
+                    "ухожу на %s, не добивая его", mask_proxy(alt),
+                )
+                continue
+            steam_refused = True
+            raise SteamRateLimited(
+                f"Прямой адрес забанен соседним запросом, пока этот ждал паузу, "
+                f"а свободных прокси нет ({STEAM_POOL.describe()}). "
+                f"Повторно бить в забаненный адрес не буду — это продлевает бан."
+            )
+
         resp_ctx = session.get(final_url, params=params, headers=headers, proxy=route)
         try:
             resp = await resp_ctx.__aenter__()
