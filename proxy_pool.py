@@ -106,6 +106,8 @@ class ProxyPool:
         # note_gateway_refusal.
         self._gateway_strikes: set[str] = set()
         self.dead: dict[str, str] = {}
+        # Когда мёртвому адресу дать шанс снова. См. DEAD_RETRY_SECONDS.
+        self._dead_until: dict[str, float] = {}
         # Отказы подряд по каждому адресу — см. mark_refused/mark_ok.
         self._refusals: dict[str, int] = {}
         self._cursor = 0
@@ -214,6 +216,39 @@ class ProxyPool:
     # был вычеркнут до перезапуска процесса.
     REFUSALS_BEFORE_DEAD = 3
 
+    # Через сколько дать мёртвому адресу шанс снова.
+    #
+    # Раньше mark_dead была дверью в одну сторону: адрес исключался из
+    # available() и next(), а вернуть его мог только mark_ok — который
+    # вызывается после УСПЕШНОГО запроса через этот адрес. То есть воскреснуть
+    # он не мог никогда, потому что запросов ему больше не давали. До конца
+    # жизни процесса.
+    #
+    # На плавающем 403 это выедает пул на глазах: три отказа подряд — минус
+    # логин, и 2026-09-13 за пятнадцать минут пул усох с 96 до 86, а сообщение
+    # «0 свободных из 96» стало «0 свободных из 86». При такой скорости пул
+    # кончается за пару часов, и лечится это только передеплоем.
+    #
+    # Пятнадцать минут выбраны так, чтобы заминка провайдера успела пройти, но
+    # по-настоящему сломанный логин не мешал работать: он снова провалится,
+    # снова уйдёт в мёртвые и попробует ещё через пятнадцать минут.
+    DEAD_RETRY_SECONDS = envcfg.env_int("PROXY_DEAD_RETRY_SECONDS", 15 * 60)
+
+    def _revive_expired(self) -> None:
+        """Вернуть в строй адреса, отлежавшие свой срок в мёртвых."""
+        if not self._dead_until:
+            return
+        now = time.time()
+        for proxy, until in list(self._dead_until.items()):
+            if until <= now:
+                self._dead_until.pop(proxy, None)
+                if self.dead.pop(proxy, None) is not None:
+                    self._refusals.pop(proxy, None)
+                    log.info(
+                        "%s: адрес %s снова в строю — отлежал %d мин, даю ещё попытку",
+                        self.name, mask(proxy), self.DEAD_RETRY_SECONDS // 60,
+                    )
+
     def mark_refused(self, proxy: str, cooldown_seconds: float, reason: str = "") -> bool:
         """
         Прокси отказал в обслуживании (403/407 на CONNECT).
@@ -321,6 +356,7 @@ class ProxyPool:
             return
         self._refusals.pop(proxy, None)
         self.dead.pop(proxy, None)
+        self._dead_until.pop(proxy, None)
         self._gateway_strikes.clear()
 
     def mark_dead(self, proxy: str, reason: str = "") -> None:
@@ -330,6 +366,7 @@ class ProxyPool:
         а тут «похоже, не работает совсем», и в /proxycheck это разные строки.
         """
         self.dead[proxy] = reason or "не отвечает"
+        self._dead_until[proxy] = time.time() + self.DEAD_RETRY_SECONDS
 
     def mark_alive(self, proxy: str) -> None:
         self.dead.pop(proxy, None)
@@ -414,6 +451,7 @@ class ProxyPool:
         # Раньше dead влиял только на текст /proxycheck, а next()/available()
         # его не читали вовсе — то есть "мёртвый" прокси всё равно продолжал
         # получать реальные запросы и заново проваливаться на каждом из них.
+        self._revive_expired()
         return [p for p in self.proxies if p not in self.dead and self.cooldown_remaining(p) <= 0]
 
     def all_exhausted(self) -> bool:
@@ -430,6 +468,7 @@ class ProxyPool:
         """
         if not self.proxies:
             return None
+        self._revive_expired()
         for _ in range(len(self.proxies)):
             proxy = self.proxies[self._cursor % len(self.proxies)]
             self._cursor += 1
