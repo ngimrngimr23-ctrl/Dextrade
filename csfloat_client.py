@@ -1136,6 +1136,52 @@ def _clip_bands(bands, min_price, max_price):
     return out or [(min_price, max_price)]
 
 
+# Докуда каждая полоса досмотрела в прошлый проход: created_at самого свежего
+# лота, который она видела. Ключ — границы полосы: при смене min_price/max_price
+# полосы перекраиваются, и чужая метка была бы прямым враньём.
+#
+# Живёт в памяти процесса, а не в Redis, и это осознанно. Потеря метки стоит
+# ровно один полный проход после рестарта, а поход в Redis обошёлся бы в
+# лишний round-trip на каждую полосу каждые десять минут. Редеплой и так
+# обнуляет кэши подороже этого.
+_BAND_WATERMARKS: dict[tuple, str] = {}
+
+
+def band_watermarks() -> dict:
+    """Докуда досмотрела каждая полоса. Только для /status и разбора логов."""
+    return dict(_BAND_WATERMARKS)
+
+
+class _BandRun:
+    """Состояние одной полосы в течение одного прогона."""
+
+    __slots__ = ("lo", "hi", "proxy", "cursor", "lots", "fresh", "fresh_last",
+                 "requests", "done", "reason")
+
+    def __init__(self, lo, hi, proxy):
+        self.lo, self.hi, self.proxy = lo, hi, proxy
+        self.cursor: str | None = None
+        self.lots: list[CSFloatListing] = []
+        self.fresh = 0            # сколько лотов новее прошлой метки
+        # Новизна последней страницы. По ней раздаётся бюджет: добирать надо
+        # там, где новое ещё не кончилось. На старте ставим потолок, чтобы
+        # первый круг получили все полосы без исключения.
+        self.fresh_last = MAX_LIMIT
+        self.requests = 0
+        self.done = False
+        self.reason = ""
+
+    @property
+    def key(self) -> tuple:
+        return (self.lo, self.hi)
+
+    @property
+    def label(self) -> str:
+        lo = f"{self.lo:g}" if self.lo is not None else "0"
+        hi = f"{self.hi:g}" if self.hi is not None else "∞"
+        return f"${lo}-{hi}"
+
+
 async def fetch_market_wide(
     *,
     target: int,
@@ -1151,13 +1197,35 @@ async def fetch_market_wide(
     закреплённый адрес из пула. Полосы идут одновременно, поэтому время прогона
     определяется самой длинной полосой, а не суммой всех запросов.
 
+    Глубина полос НЕ фиксированная, и это главное отличие от прежнего
+    поведения. Раньше каждой полосе выдавалось target/полос/50 страниц поровну,
+    независимо от того, есть ли там что смотреть. На практике это давало худшее
+    из обоих концов: в полосе $300+ за десять минут появляются единицы новых
+    лотов, а мы честно качали ей четыре страницы, то есть перекачивали одно и
+    то же по третьему разу; в полосе до $2 новое за те же десять минут не
+    влезало и в четыре страницы, и свежие лоты просто не доезжали. Примерно
+    половина запросов прогона уходила на повторную закачку.
+
+    Теперь запросы — общий бюджет на весь прогон. Полосы разбирают его по
+    кругу, и полоса выбывает из очереди, как только дошла до лотов, которые
+    видела в прошлый раз (см. _BAND_WATERMARKS). Освободившийся бюджет
+    достаётся тем, где новизна ещё не кончилась. Глубина настраивается сама
+    под то, как рынок шевелится на самом деле.
+
+    Бюджет раздаётся по кругу, а не «кто первый». Это сознательно: иначе весь
+    прогон утекал бы в полосу до $2, где стока всегда больше всех, а выгода с
+    лота — центы. Приоритет по новизне включается только когда бюджета не
+    хватает даже на один круг.
+
+    Отсечка по свежести работает только при sort_by="most_recent": при любой
+    другой сортировке порядок выдачи с временем не связан, и метка «докуда
+    досмотрели» смысла не имеет.
+
     Отказ одной полосы (кончилась квота на её адресе, ошибка сети) не отменяет
-    остальные: собираем что получилось и honest пишем в лог, сколько полос
-    отвалилось. Пустой результат лучше половинчатого молчания.
+    остальные: собираем что получилось и честно пишем в лог, какая полоса на
+    чём встала. Пустой результат лучше половинчатого молчания.
     """
     bands = _clip_bands(bands, min_price, max_price)
-    per_band = max(MAX_LIMIT, target // len(bands))
-    pages_per_band = max(1, -(-per_band // MAX_LIMIT))  # округление вверх
 
     proxies = CSFLOAT_POOL.proxies or [None]
     # Сколько РАЗНЫХ адресов показывать CSFloat за прогон.
@@ -1173,74 +1241,119 @@ async def fetch_market_wide(
     # throttle по ключу. Прокси нужен ровно для одного — обойти блокировку
     # датацентрового адреса Render. Для этого хватает одного.
     lane_addresses = proxies[:max(1, CSFLOAT_MAX_ADDRESSES)]
+
+    # Бюджет запросов на прогон. Нижняя граница — по странице на полосу: без
+    # неё при маленьком target часть полос не получила бы ни одного запроса и
+    # молча выпала бы из скана целиком.
+    budget = max(len(bands), -(-target // MAX_LIMIT))
+    by_recency = sort_by == "most_recent"
+
+    runs = [
+        _BandRun(lo, hi, lane_addresses[i % len(lane_addresses)])
+        for i, (lo, hi) in enumerate(bands)
+    ]
+
     log.info(
-        "csfloat: широкий скан — цель %d лотов, %d полос по %d страниц, "
-        "адресов в пуле %d, использую %d (больше не даёт квоты и злит антифрод)",
-        target, len(bands), pages_per_band, len(proxies), len(lane_addresses),
+        "csfloat: широкий скан — цель %d лотов, бюджет %d запрос(ов) на %d полос, "
+        "адресов в пуле %d, использую %d. Отсечка по свежести: %s",
+        target, budget, len(bands), len(proxies), len(lane_addresses),
+        "да" if by_recency else f"нет (сортировка {sort_by})",
     )
 
-    async def one_band(index: int, lo, hi, session):
-        proxy = lane_addresses[index % len(lane_addresses)]
-        collected: list[CSFloatListing] = []
-        cursor = None
-        for _ in range(pages_per_band):
-            try:
-                listings, cursor = await fetch_listings_page(
-                    session, cursor=cursor, sort_by=sort_by,
-                    min_price=lo, max_price=hi, proxy=proxy,
-                )
-            except (CSFloatRateLimited, CSFloatError) as e:
-                # Отдаём то, что успели набрать, а не теряем всё.
-                #
-                # Раньше исключение улетало наружу и полоса пропадала целиком.
-                # На проде это стоило дорого: одна полоса словила 429, следом
-                # общий кулдаун убил остальные пять, и прогон вернул НОЛЬ лотов
-                # при том, что семь запросов уже отработали и 350 лотов были на
-                # руках. За эти запросы бюджет уже списан — выбрасывать их
-                # результат бессмысленно вдвойне.
-                log.info(
-                    "csfloat: полоса $%s-%s оборвалась на %d лотах: %s",
-                    lo if lo is not None else "0", hi if hi is not None else "∞",
-                    len(collected), e,
-                )
-                break
-            collected.extend(listings)
-            if not cursor or not listings:
-                break
-        return collected
+    async def one_page(band: _BandRun, session) -> None:
+        watermark = _BAND_WATERMARKS.get(band.key) if by_recency else None
+        try:
+            listings, cursor = await fetch_listings_page(
+                session, cursor=band.cursor, sort_by=sort_by,
+                min_price=band.lo, max_price=band.hi, proxy=band.proxy,
+            )
+        except (CSFloatRateLimited, CSFloatError) as e:
+            # Отдаём то, что успели набрать, а не теряем всё.
+            #
+            # Раньше исключение улетало наружу и полоса пропадала целиком. На
+            # проде это стоило дорого: одна полоса словила 429, следом общий
+            # кулдаун убил остальные, и прогон вернул НОЛЬ лотов при том, что
+            # семь запросов уже отработали и 350 лотов были на руках. За эти
+            # запросы бюджет уже списан — выбрасывать их результат бессмысленно
+            # вдвойне.
+            band.done, band.reason = True, f"оборвалась ({e})"
+            return
+        except Exception as e:  # noqa: BLE001 — чужая полоса не должна страдать
+            log.warning("csfloat: полоса %s — непредвиденная ошибка: %r", band.label, e)
+            band.done, band.reason = True, f"сбой ({e!r})"
+            return
+
+        band.requests += 1
+        band.cursor = cursor
+        band.lots.extend(listings)
+
+        # Лот без created_at считаем новым: пропустить настоящую находку хуже,
+        # чем лишний раз её пересмотреть.
+        fresh = [
+            l for l in listings
+            if not watermark or not l.created_at or l.created_at > watermark
+        ]
+        band.fresh += len(fresh)
+        band.fresh_last = len(fresh)
+
+        if not listings:
+            band.done, band.reason = True, "пусто"
+        elif not cursor:
+            band.done, band.reason = True, "страницы кончились"
+        elif watermark and len(fresh) < len(listings):
+            band.done, band.reason = True, "дошла до просмотренного"
 
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=60),
         headers=_API_HEADERS,
     ) as session:
-        results = await asyncio.gather(
-            *(one_band(i, lo, hi, session) for i, (lo, hi) in enumerate(bands)),
-            return_exceptions=True,
-        )
+        spent = 0
+        while spent < budget:
+            active = [b for b in runs if not b.done]
+            if not active:
+                break
+            # Если бюджета на всех уже не хватает, круг достаётся тем полосам,
+            # у которых прошлая страница принесла больше нового.
+            active.sort(key=lambda b: b.fresh_last, reverse=True)
+            take = active[:budget - spent]
+            spent += len(take)
+            await asyncio.gather(*(one_page(b, session) for b in take))
 
     out: list[CSFloatListing] = []
-    failed = 0
-    for (lo, hi), result in zip(bands, results):
-        if isinstance(result, Exception):
-            failed += 1
-            log.warning(
-                "csfloat: полоса $%s-%s отвалилась: %s",
-                lo if lo is not None else "0", hi if hi is not None else "∞", result,
-            )
-        else:
-            out.extend(result)
+    for band in runs:
+        out.extend(band.lots)
 
     # Один и тот же лот может прийти из двух полос, если цена ровно на границе.
     unique: dict[str, CSFloatListing] = {}
     for listing in out:
         unique[listing.listing_id] = listing
 
+    # Метка на следующий прогон — самый свежий лот, который полоса видела.
+    #
+    # Двигаем её и тогда, когда полосу оборвал бюджет, а не отсечка. Между
+    # нашей остановкой и прошлой меткой при этом остаются непросмотренные лоты,
+    # и они пропадут навсегда — но это меньшее из двух зол. Недооценённый лот
+    # живёт минуты и его выкупают; пропущенные — это как раз самые старые из
+    # новых, то есть почти наверняка уже неактуальные. Не двигать метку значило
+    # бы на каждом прогоне заново пережёвывать этот протухший хвост вместо
+    # свежих поступлений. Полосы, обрезанные бюджетом, видно в логе ниже.
+    if by_recency:
+        for band in runs:
+            newest = max((l.created_at for l in band.lots if l.created_at), default=None)
+            if newest:
+                _BAND_WATERMARKS[band.key] = newest
+
+    per_band = "; ".join(
+        f"{b.label}: {b.requests}зап/{b.fresh}нов ({b.reason or 'обрезана бюджетом'})"
+        for b in runs
+    )
     downloaded, exact = take_downloaded_bytes()
     mb = downloaded / 1024 / 1024
     log.info(
-        "csfloat: широкий скан собрал %d лотов (%d уникальных), полос отвалилось %d. "
-        "Скачано %.1f МБ%s — это и есть расход трафика прокси за прогон",
-        len(out), len(unique), failed, mb, "" if exact else " (оценка сверху)",
+        "csfloat: широкий скан — %d запрос(ов) из %d, собрал %d лотов (%d уникальных), "
+        "из них новых %d. Скачано %.1f МБ%s. По полосам: %s",
+        spent, budget, len(out), len(unique), sum(b.fresh for b in runs),
+        mb, "" if exact else " (оценка сверху)", per_band,
     )
     return list(unique.values())
 
