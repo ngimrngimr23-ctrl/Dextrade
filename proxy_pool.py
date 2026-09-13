@@ -108,6 +108,10 @@ class ProxyPool:
         self.dead: dict[str, str] = {}
         # Когда мёртвому адресу дать шанс снова. См. DEAD_RETRY_SECONDS.
         self._dead_until: dict[str, float] = {}
+        # Почему адрес сейчас отложен: "отказ провайдера" (403 на CONNECT) или
+        # "Steam 429". Разные болезни с разным лечением, а в сообщении об
+        # отказе до сих пор виднелось только «свободных прокси нет».
+        self._sidelined_by: dict[str, str] = {}
         # Отказы подряд по каждому адресу — см. mark_refused/mark_ok.
         self._refusals: dict[str, int] = {}
         self._cursor = 0
@@ -476,11 +480,54 @@ class ProxyPool:
                 return proxy
         return None
 
+    # По каким словам в причине понимаем, что виноват провайдер, а не Steam.
+    _PROVIDER_MARKERS = ("403", "forbidden", "отказ прокси", "сетевой сбой", "proxy")
+
+    def _note_sideline_reason(self, proxy: str, reason: str) -> None:
+        low = (reason or "").lower()
+        if any(m in low for m in self._PROVIDER_MARKERS):
+            self._sidelined_by[proxy] = "провайдер"
+        elif "429" in low:
+            self._sidelined_by[proxy] = "steam"
+        else:
+            self._sidelined_by[proxy] = "прочее"
+
+    def sideline_summary(self) -> str:
+        """
+        Кто именно выбил адреса из строя — одной фразой.
+
+        Ради чего: 2026-09-13 бот полчаса писал «Steam ответил 429 … свободных
+        прокси нет», и это читалось как «нас забанил Steam». На деле за то же
+        время шлюз провайдера отдал 50 отказов подряд и НИ ОДНОГО успешного
+        ответа, а 429 от Steam был ровно один — по прямому адресу. Причина и
+        лечение совершенно разные, а по сообщению их было не различить.
+        """
+        busy = [p for p in self.proxies if self.cooldown_remaining(p) > 0 or p in self.dead]
+        if not busy:
+            return ""
+        tally: dict[str, int] = {}
+        for proxy in busy:
+            why = self._sidelined_by.get(proxy, "прочее")
+            tally[why] = tally.get(why, 0) + 1
+        by_provider = tally.get("провайдер", 0)
+        by_steam = tally.get("steam", 0)
+        if by_provider and by_provider >= by_steam * 2:
+            return (
+                f"выбиты они не Steam, а самим прокси-сервисом: {by_provider} из "
+                f"{len(busy)} отказал шлюз (403 Forbidden на CONNECT). "
+                f"Это сторона провайдера — кончился трафик, лимит сессий или "
+                f"истёк доступ"
+            )
+        if by_steam:
+            return f"из них {by_steam} выбил Steam своим 429"
+        return ""
+
     def mark_exhausted(self, proxy: str, seconds: float, reason: str = "") -> None:
         """Пометить адрес занятым на seconds секунд (обычно до сброса окна лимита)."""
         if not proxy:
             return
         self._cooldowns[proxy] = max(self._cooldowns.get(proxy, 0.0), time.time() + seconds)
+        self._note_sideline_reason(proxy, reason)
         log.warning(
             "%s: адрес %s отложен на %.0f мин%s. Свободно ещё %d из %d",
             self.name, mask(proxy), seconds / 60,
@@ -538,4 +585,7 @@ class ProxyPool:
             parts.append(f"ближайший освободится через {soonest / 60:.0f} мин")
         if self.problems:
             parts.append(f"{len(self.problems)} адрес(ов) с ошибкой в настройке")
+        blame = self.sideline_summary()
+        if blame:
+            parts.append(blame)
         return ", ".join(parts)
