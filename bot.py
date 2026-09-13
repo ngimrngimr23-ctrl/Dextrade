@@ -105,6 +105,7 @@ from pricing import (
     get_steam_market_price_retrying,
     STEAM_POOL,
 )
+import analyzer
 from analyzer import (
     find_offers, find_float_offers, find_arbitrage_offers,
     Offer, STREAK_THRESHOLD, STEAM_FEE_MULTIPLIER,
@@ -2463,6 +2464,7 @@ async def _run_watchlist_scan(
         retries_before = steam_retry_totals()
         lanes_before = steam_lane_totals()
         parse_before = steam_parse_totals()
+        drops_before = analyzer.offer_drops()
         take_lock_wait()  # обнуляем счётчик очереди на полосу перед прогоном
 
         queue: asyncio.Queue = asyncio.Queue()
@@ -2584,7 +2586,23 @@ async def _run_watchlist_scan(
                     "валюта. Образец: %s",
                     got["listings"], got["blocks"], steam_parse_sample(),
                 )
-            elif got["listings"] > 200 and not got["with_stickers"]:
+            else:
+                # Разбор в порядке — значит вопрос «почему пусто» переезжает на
+                # отбор, и ответ должен быть тут же, а не выясняться логами.
+                after = analyzer.offer_drops()
+                delta = {
+                    k: after[k] - drops_before.get(k, 0)
+                    for k in after if k != "best_markup"
+                }
+                delta = {k: v for k, v in delta.items() if v}
+                if delta:
+                    best = after.get("best_markup")
+                    log.info(
+                        "watchlist: стикерный отбор — %s. Лучшая наценка за прогон: %s",
+                        ", ".join(f"{k} {v:.0f}" for k, v in delta.items()),
+                        f"{best:.0f}%" if best is not None else "—",
+                    )
+            if got["listings"] > 200 and not got["with_stickers"]:
                 log.warning(
                     "watchlist: из %d разобранных лотов НИ ОДНОГО со стикерами. "
                     "Для стикерного арбитража это означает пустой прогон при живом "

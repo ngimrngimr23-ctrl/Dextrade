@@ -66,6 +66,28 @@ def _max_streak(stickers: list[str]) -> int:
     return best
 
 
+# Почему лоты не проходят стикерный отбор. Копится по всему прогону, потому что
+# find_offers зовётся на КАЖДЫЙ предмет: сто сорок отдельных строк в логе никто
+# читать не станет, а одна сводная отвечает ровно на тот вопрос, который
+# возникает при пустом прогоне.
+#
+# Такая разбивка давно есть у арбитражного отбора (find_arbitrage_offers) и там
+# не раз спасала: по ней сразу видно, строгий у нас порог или сломались данные.
+# Стикерному отбору — основному в этом боте — её не сделали, и он молчал
+# совсем. Прогон отчитывался «проверено 142 предмета», разбор рапортовал 6864
+# понятых лота и 2343 со стикерами, а находок ноль, и почему — неизвестно.
+_offer_drops: dict[str, float] = {}
+
+
+def offer_drops() -> dict[str, float]:
+    """Счётчики отсева стикерного отбора. best_markup — лучшая наценка за прогон."""
+    return dict(_offer_drops)
+
+
+def _drop(reason: str) -> None:
+    _offer_drops[reason] = _offer_drops.get(reason, 0) + 1
+
+
 def find_offers(
     listings: list[Listing],
     sticker_prices: dict[str, float],
@@ -91,15 +113,23 @@ def find_offers(
 
     offers = []
     for listing in listings:
+        _drop("всего лотов")
         if not listing.stickers:
+            _drop("без стикеров")
             continue
         if min_price is not None and listing.price < min_price:
+            _drop("лот дешевле порога")
             continue
         if max_price is not None and listing.price > max_price:
+            _drop("лот дороже порога")
             continue
 
         stickers_value = sum(sticker_prices.get(s, 0.0) for s in listing.stickers)
         if stickers_value < min_stickers_value:
+            # Отдельно считаем случай, когда цен на стикеры просто нет: это не
+            # «дешёвый набор», а дыра в прайс-листе, и лечится она совсем
+            # другим. Без разделения обе беды выглядели одинаково.
+            _drop("цен на стикеры нет" if stickers_value == 0 else "набор дешевле порога")
             continue
 
         # Наклейки должны перекрывать цену самого скина в min_sticker_ratio раз.
@@ -115,6 +145,7 @@ def find_offers(
         # сравнивать величину с ней же самой.
         if min_sticker_ratio is not None:
             if floor_price <= 0 or stickers_value < floor_price * min_sticker_ratio:
+                _drop("набор легче скина")
                 continue
 
         # насколько этот лот дороже голого скина — это и есть "цена, которую
@@ -134,7 +165,18 @@ def find_offers(
             else max_markup_pct
         )
 
-        if markup_pct <= effective_max_markup:
+        # Лучшая наценка за прогон — самое полезное число при пустом
+        # результате. Оно отвечает, насколько мы промахнулись: 8% при пороге
+        # 7% значит «порог чуть строг», а 340% — «рынка тут нет вовсе», и это
+        # разные выводы с разными действиями.
+        best = _offer_drops.get("best_markup")
+        if best is None or markup_pct < best:
+            _offer_drops["best_markup"] = markup_pct
+
+        if markup_pct > effective_max_markup:
+            _drop("наценка выше порога")
+        else:
+            _drop("прошло")
             offers.append(
                 Offer(
                     price=listing.price,
