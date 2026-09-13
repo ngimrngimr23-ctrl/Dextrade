@@ -2718,7 +2718,7 @@ def _format_arb_chunks(offers) -> list[str]:
     return _chunk_lines(lines, sep="\n\n")
 
 
-async def _verify_against_steam(offers, min_discount_pct: float) -> list:
+async def _verify_against_steam(offers, min_discount_pct: float) -> tuple[list, dict]:
     """
     Проверить кандидатов живой ценой Steam и пересчитать по ней.
 
@@ -2734,14 +2734,19 @@ async def _verify_against_steam(offers, min_discount_pct: float) -> list:
 
     Лот, который не подтвердился, выбрасывается: лучше промолчать, чем звать
     покупать по цене, которой нет.
+
+    Вторым значением возвращается разбивка отсева. Она нужна не для логов, а
+    для ответа в чат: «не нашлось» и «не смогли посмотреть» — это разные вещи,
+    и путать их нельзя (см. _arb_empty_reason).
     """
+    empty = {"unchecked": 0, "steam_failed": 0, "rechecked_below": 0}
     if not offers:
-        return offers
+        return offers, empty
     if not STEAM_POOL.enabled() and steam_cooldown_remaining(scope="pricing") > 0:
         log.warning(
             "arb: Steam на кулдауне и прокси нет — цены оставлены непроверенными"
         )
-        return offers
+        return offers, dict(empty, unchecked=len(offers))
 
     todo = offers[:ARB_VERIFY_LIMIT]
 
@@ -2771,7 +2776,9 @@ async def _verify_against_steam(offers, min_discount_pct: float) -> list:
     )
 
     verified = []
-    unchecked = 0
+    unchecked = 0        # всего не проверено
+    steam_failed = 0     # из них: запрос ушёл, а Steam не ответил
+    rechecked_below = 0  # проверены, но по живой цене скидки не оказалось
     semaphore = asyncio.Semaphore(lanes)
 
     class Cached:
@@ -2785,25 +2792,36 @@ async def _verify_against_steam(offers, min_discount_pct: float) -> list:
         # Бюджет проверяем ПЕРЕД кэшем: иначе неполная запись навсегда
         # закрывает предмету дорогу к живому запросу.
         if offer not in fresh_budget:
-            return offer, Cached(entry) if entry else None
+            return offer, Cached(entry) if entry else None, False
         async with semaphore:
             try:
                 live = await get_steam_market_price_retrying(session, offer.market_hash_name)
             except Exception:
                 log.info("arb: %s — Steam не ответил", offer.market_hash_name)
-                return offer, Cached(entry) if entry else None
+                return offer, Cached(entry) if entry else None, True
             if live and live.lowest:
                 await set_steam_price(offer.market_hash_name, live.lowest, live.volume)
-            return offer, live
+            return offer, live, True
 
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
         checked = await asyncio.gather(*(check(o, session) for o in todo))
-        for o, live in checked:
+        for o, live, attempted in checked:
 
             if live is None or not live.lowest:
                 # Не "не подтвердил", а "не проверяли": разница принципиальная,
                 # и раньше лог утверждал первое, когда на деле было второе.
+                #
+                # Внутри «не проверяли» тоже два разных случая, и их пришлось
+                # развести. На кандидата не хватило бюджета живых запросов —
+                # это норма, проверим в следующий прогон. Запрос ушёл, а Steam
+                # НЕ ОТВЕТИЛ — это отказ, и он означает, что проверять нечем
+                # вообще. 2026-09-13 бот пять прогонов подряд писал «ничего
+                # подходящего не нашлось», имея по 159 кандидатов и ноль
+                # успешных ответов Steam из сорока попыток: оба маршрута были
+                # закрыты, а счётчик был один и разницы не показывал.
                 unchecked += 1
+                if attempted:
+                    steam_failed += 1
                 continue
 
             was, was_pct = o.steam_price, o.discount_pct
@@ -2839,17 +2857,22 @@ async def _verify_against_steam(offers, min_discount_pct: float) -> list:
                     "arb: %s — после проверки скидка %.1f%% ниже порога %.0f%%, выбрасываю",
                     o.market_hash_name, o.discount_pct, min_discount_pct,
                 )
+                rechecked_below += 1
                 continue
             verified.append(o)
 
     if unchecked:
         log.info(
-            "arb: %d кандидат(ов) остались непроверенными (бюджет живых запросов %d) — "
-            "их проверим в следующих прогонах, кэш накапливается",
-            unchecked, STEAM_LIVE_BUDGET,
+            "arb: %d кандидат(ов) остались непроверенными (бюджет живых запросов %d), "
+            "из них %d — потому что Steam НЕ ОТВЕТИЛ на запрос",
+            unchecked, STEAM_LIVE_BUDGET, steam_failed,
         )
     verified.sort(key=lambda x: x.discount_pct, reverse=True)
-    return verified
+    return verified, {
+        "unchecked": unchecked,
+        "steam_failed": steam_failed,
+        "rechecked_below": rechecked_below,
+    }
 
 
 def _warn_if_over_budget() -> None:
@@ -3015,10 +3038,29 @@ async def _fill_steam_prices(listings) -> int:
     return from_reference + from_pricelist
 
 
-async def _run_arb_scan(bot, chat_id: int) -> int | None:
+class ArbRun(NamedTuple):
     """
-    Один прогон арбитража. Возвращает число отправленных находок, либо None,
-    если прогон не запускался (выключено / уже идёт / кулдаун).
+    Чем кончился прогон арбитража.
+
+    Раньше отсюда возвращалось одно число — сколько отправлено, — и /arbnow
+    на любой ноль отвечал «ничего подходящего не нашлось». За этим нулём
+    прячутся четыре совершенно разных исхода, и три из них означают не «рынок
+    пуст», а «мы не смогли посмотреть». Пока они были неразличимы, мёртвый
+    Steam выглядел как спокойный рынок.
+    """
+
+    sent: int = 0
+    candidates: int = 0        # прошли отбор до проверки живой ценой
+    unchecked: int = 0         # не проверены совсем
+    steam_failed: int = 0      # из них: Steam не ответил на запрос
+    rechecked_below: int = 0   # проверены, но живая цена скидку не подтвердила
+    duplicates: int = 0        # подтвердились, но уже присылались
+
+
+async def _run_arb_scan(bot, chat_id: int) -> ArbRun | None:
+    """
+    Один прогон арбитража. Возвращает итог прогона, либо None, если прогон не
+    запускался (выключено / уже идёт / кулдаун).
     """
     settings = await get_arb_settings(chat_id)
     if settings["min_discount"] is None:
@@ -3067,14 +3109,19 @@ async def _run_arb_scan(bot, chat_id: int) -> int | None:
                       if l.listing_id == o.listing_id), None) or "нет данных",
             )
         if not offers:
-            return 0
+            return ArbRun()
 
         # Тот же дедуп, что у вотчлиста: один и тот же лот не присылаем повторно
         # Третий источник: спрашиваем настоящую цену у Steam по кандидатам.
-        offers = await _verify_against_steam(offers, settings["min_discount"])
+        candidates = len(offers)
+        offers, stats = await _verify_against_steam(offers, settings["min_discount"])
         if not offers:
-            log.info("arb: chat_id=%s ни один кандидат не подтвердился ценой Steam", chat_id)
-            return 0
+            log.info(
+                "arb: chat_id=%s ни один кандидат не подтвердился ценой Steam. "
+                "Кандидатов %d, Steam не ответил на %d, после пересчёта ниже порога %d",
+                chat_id, candidates, stats["steam_failed"], stats["rechecked_below"],
+            )
+            return ArbRun(candidates=candidates, **stats)
 
         # Ключ дедупа — предмет и цена, а НЕ listing_id.
         #
@@ -3094,7 +3141,7 @@ async def _run_arb_scan(bot, chat_id: int) -> int | None:
                 "arb: chat_id=%s все %d находок уже присылали — молчу (дедуп %d ч)",
                 chat_id, len(offers), SENT_OFFER_TTL_SECONDS // 3600,
             )
-            return 0
+            return ArbRun(candidates=candidates, duplicates=len(offers), **stats)
 
         for chunk in _format_arb_chunks(new_offers):
             await bot.send_message(
@@ -3102,7 +3149,7 @@ async def _run_arb_scan(bot, chat_id: int) -> int | None:
             )
         for o in new_offers:
             await mark_offer_sent(chat_id, f"arb:{o.market_hash_name}:{o.csfloat_price:.2f}")
-        return len(new_offers)
+        return ArbRun(sent=len(new_offers), candidates=candidates, **stats)
     finally:
         _arb_running.discard(chat_id)
 
@@ -3944,6 +3991,57 @@ async def _proceed_floatcheck(update: Update, market_hash_name: str, my_float: f
         await update.message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
 
 
+def _arb_empty_reason(run: ArbRun) -> str:
+    """
+    Почему прогон ничего не прислал — своими словами, а не дежурной фразой.
+
+    Разбирался по случаю 2026-09-13: пять прогонов подряд отвечали «Готово,
+    ничего подходящего не нашлось», а в логе за это же время — по 159
+    кандидатов с лучшей скидкой под 70% и СОРОК неудачных попыток спросить
+    цену у Steam, ноль успешных. Оба маршрута были закрыты (прямой адрес в
+    кулдауне после 429, шлюз прокси отдавал 403), проверить было нечем, и
+    находки выбрасывались как неподтверждённые. Снаружи это ничем не
+    отличалось от спокойного рынка — и потому чинилось не то.
+
+    Порядок веток важен: сначала называем то, что сломано, и только потом то,
+    что просто не нашлось.
+    """
+    if not run.candidates:
+        return "Готово, ничего подходящего не нашлось."
+
+    if run.steam_failed:
+        return (
+            f"Кандидатов {run.candidates}, но проверить их не удалось: "
+            f"Steam не ответил ни на один из {run.steam_failed} запросов.\n\n"
+            "Непроверенное не шлю намеренно — оценка по прайс-листу расходится "
+            "с настоящей ценой Steam до двух раз, и «скидка 60%» после проверки "
+            "нередко оказывается четырьмя процентами.\n"
+            "Что со Steam: /status"
+        )
+
+    if run.duplicates:
+        return (
+            f"Подтвердилось {run.duplicates}, но все эти лоты уже присылал раньше "
+            f"(дедуп держит {SENT_OFFER_TTL_SECONDS // 3600} ч)."
+        )
+
+    if run.rechecked_below:
+        return (
+            f"Кандидатов {run.candidates}, но живая цена Steam не подтвердила "
+            f"скидку у {run.rechecked_below} из них — она была в оценке, а не в "
+            "реальности. Это нормальная работа проверки, а не сбой."
+        )
+
+    if run.unchecked:
+        return (
+            f"Кандидатов {run.candidates}, но живых запросов к Steam хватило не на "
+            f"всех: {run.unchecked} остались непроверенными. Кэш накапливается, "
+            "следующие прогоны их доберут."
+        )
+
+    return "Готово, ничего подходящего не нашлось."
+
+
 async def arbnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/arbnow — проверить арбитраж прямо сейчас, не дожидаясь расписания."""
     chat_id = update.effective_chat.id
@@ -3965,7 +4063,7 @@ async def arbnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Смотрю рынок CSFloat…")
     try:
-        sent = await _run_arb_scan(context.bot, chat_id)
+        run = await _run_arb_scan(context.bot, chat_id)
     except CSFloatRateLimited as e:
         if e.is_ip_block:
             await update.message.reply_text(
@@ -3980,8 +4078,12 @@ async def arbnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ {e}")
         return
 
-    if not sent:
-        await update.message.reply_text("Готово, ничего подходящего не нашлось.")
+    if run is None:
+        # Досюда доходим только гонкой: выключено/кулдаун/уже идёт проверяется
+        # выше. Молчать всё равно нельзя — команду дали, ответ должен быть.
+        await update.message.reply_text("Прогон не запустился: он уже идёт или Steam на кулдауне.")
+    elif not run.sent:
+        await update.message.reply_text(_arb_empty_reason(run))
 
 
 async def setinterval(update: Update, context: ContextTypes.DEFAULT_TYPE):
