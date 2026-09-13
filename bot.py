@@ -40,6 +40,7 @@ Telegram.
 
 import asyncio
 import datetime as dt
+from collections import Counter
 import hashlib
 import html as html_module
 import io
@@ -325,6 +326,10 @@ ARB_PRICE_WINDOW = "last_24h"
 # после выставления, когда его ещё можно купить. Скидку считаем сами (см.
 # _fill_steam_prices и find_arbitrage_offers), а не доверяем чужой сортировке.
 ARB_SORT_BY = os.environ.get("ARB_SORT_BY", "most_recent")
+
+# Сколько страниц выдачи «по скидке» добирать сверх широкого скана. См.
+# _add_top_discount_page — там же основание, почему одна, а не сортировка целиком.
+ARB_DISCOUNT_PAGES = envcfg.env_int("ARB_DISCOUNT_PAGES", 1)
 
 # Максимальное расхождение между прайс-листом csgotrader и собственной
 # справочной ценой CSFloat (reference.base_price), при котором цене ещё можно
@@ -2718,6 +2723,41 @@ def _format_arb_chunks(offers) -> list[str]:
     return _chunk_lines(lines, sep="\n\n")
 
 
+def _verification_rank(offer) -> tuple:
+    """
+    Порядок, в котором кандидаты идут на проверку живой ценой Steam.
+
+    Живых запросов восемь на прогон, кандидатов — полторы сотни. Значит вопрос
+    не «проверять ли», а «кого из ста пятидесяти».
+
+    Раньше очередь шла по оценочной скидке, по убыванию, — и это худший из
+    возможных порядков. Оценка и есть то самое, что мы собрались проверять:
+    чем она выше, тем вероятнее, что она просто сломана. Скидка 67% почти
+    всегда означает кривую справочную цену, а не находку века (см. историю
+    P2000 | Acid Etched в _fill_steam_prices). То есть восемь запросов уходили
+    ровно на восемь самых недостоверных чисел в списке.
+
+    Теперь сначала достоверность, потом деньги:
+
+    1. Сошлись ли два независимых источника — прайс-лист csgotrader и справка
+       CSFloat. Согласие сильнее любой скидки: оно означает, что проверять
+       действительно есть что.
+    2. Торгуется ли предмет в Steam. Продаж за неделю не было — перепродать
+       некому, и подтверждать нечего, каким бы дешёвым он ни выглядел.
+    3. Внутри группы — по АБСОЛЮТНОЙ прибыли, а не по процентам. 60% на
+       двухдолларовом лоте это доллар, 25% на двухсотдолларовом — полсотни.
+    """
+    if offer.steam_sales_recent is False:
+        tier = 3          # выйти обратно не выйдет
+    elif offer.steam_price_confirmed is True:
+        tier = 0          # оба источника сошлись
+    elif offer.steam_price_confirmed is None:
+        tier = 1          # второго мнения нет
+    else:
+        tier = 2          # источники разошлись — один из них врёт
+    return (tier, -(offer.net_after_fee or 0.0))
+
+
 async def _verify_against_steam(offers, min_discount_pct: float) -> tuple[list, dict]:
     """
     Проверить кандидатов живой ценой Steam и пересчитать по ней.
@@ -2748,7 +2788,9 @@ async def _verify_against_steam(offers, min_discount_pct: float) -> tuple[list, 
         )
         return offers, dict(empty, unchecked=len(offers))
 
-    todo = offers[:ARB_VERIFY_LIMIT]
+    # Очередь строится заново, а не берётся в порядке отбора: отбор ранжирует
+    # по оценке, а проверять надо по достоверности. См. _verification_rank.
+    todo = sorted(offers, key=_verification_rank)[:ARB_VERIFY_LIMIT]
 
     # Кэш и общий потолок живых запросов — те же, что у /markets, и по той же
     # причине: раньше этот скан выстреливал до 80 запросов каждые 10 минут,
@@ -2770,9 +2812,13 @@ async def _verify_against_steam(offers, min_discount_pct: float) -> tuple[list, 
     # пуле: этот эндпоинт режется жёстче всех, и 46 прокси означали 46
     # одновременных полос и 53 запроса в минуту (диагностика 2026-08-27).
     lanes = pricing.PRICE_CONCURRENCY
+    tiers = Counter(_verification_rank(o)[0] for o in fresh_budget)
     log.info(
-        "arb: %d кандидат(ов) из %d: в кэше %d, спрошу у Steam %d, полос %d",
+        "arb: %d кандидат(ов) из %d: в кэше %d, спрошу у Steam %d, полос %d. "
+        "Живые запросы уходят на: источники сошлись %d, второго мнения нет %d, "
+        "источники разошлись %d, не торгуется %d",
         len(todo), len(offers), len(cached), len(fresh_budget), lanes,
+        tiers[0], tiers[1], tiers[2], tiers[3],
     )
 
     verified = []
@@ -3010,9 +3056,11 @@ async def _fill_steam_prices(listings) -> int:
                 gap = abs(listed - l.reference_price) / l.reference_price * 100
                 if gap <= ARB_SOURCE_GAP_PCT:
                     confirmed += 1
+                    l.steam_price_confirmed = True
                     l.steam_price_windows = f"CSFloat подтверждает: ${l.reference_price:.2f}"
                 else:
                     disagree += 1
+                    l.steam_price_confirmed = False
                     l.steam_price_windows = (
                         f"CSFloat оценивает в ${l.reference_price:.2f} "
                         f"(расхождение {gap:.0f}%) — проверь перед покупкой"
@@ -3057,6 +3105,47 @@ class ArbRun(NamedTuple):
     duplicates: int = 0        # подтвердились, но уже присылались
 
 
+async def _add_top_discount_page(listings, settings):
+    """
+    Добрать страницу выдачи CSFloat, отсортированной по скидке к их справке.
+
+    Основной скан идёт по свежести, и это правильно: список «по скидке» почти
+    не обновляется, наверху там висят лоты со сломанным ориентиром — справочная
+    цена завышена, скидка бумажная (основание целиком в ARB_SORT_BY). Поэтому
+    сортировку целиком на неё не переводим и сейчас.
+
+    Но за час в том списке всё же меняется пять-шесть позиций, и вот они
+    настоящие: лот с реальной скидкой живёт минуты, потом его выкупают. Сейчас
+    мы их не видим вовсе — широкий скан по свежести ловит их только случайно.
+    Одна страница стоит один запрос из тридцати, а протухшие позиции всё равно
+    отсеет проверка живой ценой Steam. Цена ошибки здесь заведомо мала, цена
+    пропуска — нет.
+
+    Отказ добора не отменяет прогон: широкий скан уже отработал, и терять его
+    из-за необязательной страницы нельзя.
+    """
+    if ARB_DISCOUNT_PAGES <= 0:
+        return listings
+    try:
+        extra = await csfloat_client.fetch_market(
+            pages=ARB_DISCOUNT_PAGES,
+            sort_by="highest_discount",
+            min_price=settings["min_price"],
+            max_price=settings["max_price"],
+        )
+    except (CSFloatRateLimited, CSFloatError) as e:
+        log.info("arb: страницу «по скидке» добрать не удалось: %s", e)
+        return listings
+
+    known = {l.listing_id for l in listings}
+    fresh = [l for l in extra if l.listing_id not in known]
+    log.info(
+        "arb: добор «по скидке» — %d лот(ов), из них не попавших в широкий скан %d",
+        len(extra), len(fresh),
+    )
+    return listings + fresh
+
+
 async def _run_arb_scan(bot, chat_id: int) -> ArbRun | None:
     """
     Один прогон арбитража. Возвращает итог прогона, либо None, если прогон не
@@ -3083,6 +3172,7 @@ async def _run_arb_scan(bot, chat_id: int) -> ArbRun | None:
             min_price=settings["min_price"],
             max_price=settings["max_price"],
         )
+        listings = await _add_top_discount_page(listings, settings)
         await _fill_steam_prices(listings)
         offers = find_arbitrage_offers(
             listings,
