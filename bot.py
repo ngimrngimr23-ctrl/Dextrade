@@ -86,6 +86,8 @@ from steam_client import (
     take_throttle_wait,
     take_lock_wait,
     lane_totals as steam_lane_totals,
+    parse_totals as steam_parse_totals,
+    parse_sample as steam_parse_sample,
     request_totals as steam_request_totals,
     retry_totals as steam_retry_totals,
     reset_cooldown as steam_reset_cooldown,
@@ -2460,6 +2462,7 @@ async def _run_watchlist_scan(
         redis_before = redis_call_total()
         retries_before = steam_retry_totals()
         lanes_before = steam_lane_totals()
+        parse_before = steam_parse_totals()
         take_lock_wait()  # обнуляем счётчик очереди на полосу перед прогоном
 
         queue: asyncio.Queue = asyncio.Queue()
@@ -2559,6 +2562,42 @@ async def _run_watchlist_scan(
         # ProxyPool.single_gateway). Даёт ли он на каждый логин свой исходящий
         # адрес — вопрос к /proxycheck, и от ответа зависит, сорок семь у нас
         # бюджетов или один, поделённый на сорок семь.
+        # Что разбор вытащил из ответов. Раньше об этом в логе не было ни
+        # строчки, и «проверено 619 предметов, ничего не нашлось» одинаково
+        # выглядело и при живом рынке, и при сломанном разборе: ошибок ноль,
+        # находок ноль, объяснить нечем.
+        parse_after = steam_parse_totals()
+        got = {k: parse_after[k] - parse_before.get(k, 0) for k in parse_after}
+        if got["blocks"]:
+            log.info(
+                "watchlist: разбор — строк лотов в ответах %d, понято %d (%.0f%%), "
+                "из них со стикерами %d (%.0f%%)",
+                got["blocks"], got["listings"],
+                got["listings"] / got["blocks"] * 100,
+                got["with_stickers"],
+                got["with_stickers"] / got["listings"] * 100 if got["listings"] else 0.0,
+            )
+            if got["listings"] < got["blocks"] * 0.9:
+                log.warning(
+                    "watchlist: разбор понял только %d строк из %d — остальные выпали "
+                    "молча. Это не «рынок пустой», это сломанная разметка или чужая "
+                    "валюта. Образец: %s",
+                    got["listings"], got["blocks"], steam_parse_sample(),
+                )
+            elif got["listings"] > 200 and not got["with_stickers"]:
+                log.warning(
+                    "watchlist: из %d разобранных лотов НИ ОДНОГО со стикерами. "
+                    "Для стикерного арбитража это означает пустой прогон при живом "
+                    "рынке — проверь STICKER_RE против нынешней разметки Steam",
+                    got["listings"],
+                )
+        elif stats.items:
+            log.warning(
+                "watchlist: ответы пришли, а строк лотов в них разбор не увидел ни "
+                "одной на %d предметов — смотри предупреждение разбора выше",
+                stats.items,
+            )
+
         planned = used_lanes * 60 / gap if gap > 0 else float("inf")
         if rate > planned * 1.5 and requests_made > 20:
             log.warning(

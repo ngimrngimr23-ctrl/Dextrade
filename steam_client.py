@@ -1076,13 +1076,52 @@ async def fetch_all_listings(
     return listings
 
 
+# Что разбор увидел за прогон. Считаем здесь, потому что это единственное
+# место, где сырой HTML вообще существует.
+#
+# Зачем счётчики. Разбор устроен как «не совпало — молча пропускаем строку»
+# (continue ниже), и это правильно для одного битого лота. Но если Steam
+# поменяет разметку, ровно так же молча выпадут ВСЕ лоты: прогон отчитается
+# «проверено 619 предметов», ошибок не будет ни одной, находок тоже. Отличить
+# такое от спокойного рынка по логу было нельзя — ни одной строки о том,
+# сколько лотов разобрано, в нём не появлялось.
+_parse_totals = {"blocks": 0, "listings": 0, "with_stickers": 0, "empty_pages": 0}
+# Образец блока, который не удалось разобрать. Нужен один на процесс: по нему
+# видно НАСТОЯЩУЮ разметку Steam, а не наши догадки о ней.
+_parse_sample: str | None = None
+
+
+def parse_totals() -> dict[str, int]:
+    """Сколько строк листингов увидел разбор и сколько из них понял."""
+    return dict(_parse_totals)
+
+
+def parse_sample() -> str | None:
+    """Кусок строки листинга, которую разбор не понял. None — таких не было."""
+    return _parse_sample
+
+
 def _parse_listings_html(html: str) -> list[Listing]:
     """
     results_html — это HTML-фрагмент со всеми строками таблицы листингов.
     Режем по границам строк и вытаскиваем цену + стикеры каждой отдельно,
     чтобы стикеры одного лота не утекали в соседний.
     """
+    global _parse_sample
     blocks = re.split(r'class="market_listing_row market_recent_listing_row', html)[1:]
+    _parse_totals["blocks"] += len(blocks)
+    if html and not blocks:
+        # Ответ есть, а строк в нём разбор не видит: либо предмет и правда без
+        # лотов, либо изменился класс строки. Первое частое, второе смертельно,
+        # различаются они только по длине ответа.
+        _parse_totals["empty_pages"] += 1
+        if len(html) > 2000 and _parse_sample is None:
+            _parse_sample = scrub(html[:400])
+            log.warning(
+                "разбор листингов: в ответе %d символов, а ни одной строки лота не "
+                "найдено — похоже, Steam сменил разметку. Образец: %s",
+                len(html), _parse_sample,
+            )
     out = []
     for block in blocks:
         # обрезаем на случай хвостового мусора/следующего листинга
@@ -1095,6 +1134,18 @@ def _parse_listings_html(html: str) -> list[Listing]:
 
         price_m = PRICE_RE.search(b)
         if not price_m:
+            # Цену не нашли. Чаще всего это чужая валюта: PRICE_RE ищет доллар,
+            # а через резидентный прокси Steam иногда отдаёт цены в валюте
+            # выхода, несмотря на currency=1 в запросе. Тогда молча выпадает
+            # ВЕСЬ предмет, и снаружи это выглядит как «лотов нет».
+            if _parse_sample is None:
+                _parse_sample = scrub(b[:400])
+                log.warning(
+                    "разбор листингов: в строке лота нет цены в долларах. "
+                    "Если это повторяется — проверь, не отдаёт ли Steam чужую "
+                    "валюту. Образец: %s",
+                    _parse_sample,
+                )
             continue
         price = float(price_m.group(1).replace(",", ""))
 
@@ -1107,6 +1158,9 @@ def _parse_listings_html(html: str) -> list[Listing]:
         inspect_link = inspect_m.group(1) if inspect_m else None
 
         out.append(Listing(price=price, stickers=stickers, inspect_link=inspect_link))
+        if stickers:
+            _parse_totals["with_stickers"] += 1
 
+    _parse_totals["listings"] += len(out)
     return out
 
