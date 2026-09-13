@@ -856,14 +856,12 @@ async def fetch_all_listings(
                     # перебирал десяток логинов на этой двери, тратил минуты и
                     # писал «37 свободных из 47», что читалось как «есть ещё
                     # рабочие запасные». Их не было.
-                    if STEAM_POOL.single_gateway():
-                        STEAM_POOL.mark_gateway_refused(
-                            route, LISTINGS_PROXY_COOLDOWN, f"HTTP 403: {scrub(str(e))}"
-                        )
-                    else:
-                        STEAM_POOL.mark_refused(
-                            route, LISTINGS_PROXY_COOLDOWN, f"HTTP 403: {scrub(str(e))}"
-                        )
+                    # Откладываем ЭТОТ логин и идём к следующему. На весь пул
+                    # машем рукой только когда подряд отказали несколько
+                    # разных логинов — см. ProxyPool.note_gateway_refusal.
+                    STEAM_POOL.note_gateway_refusal(
+                        route, LISTINGS_PROXY_COOLDOWN, f"HTTP 403: {scrub(str(e))}"
+                    )
                 else:
                     STEAM_POOL.mark_exhausted(route, LISTINGS_PROXY_COOLDOWN, f"ошибка соединения: {e}")
             note_retry("транспорт")
