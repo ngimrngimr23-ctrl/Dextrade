@@ -2237,6 +2237,30 @@ def _offer_key(market_hash_name: str, offer: Offer) -> str:
 _ScanStats = scan_profile.ScanProfile
 
 
+# По каким сбоям имеет смысл повторить предмет в конце прогона.
+#
+# Список намеренно узкий и по СМЫСЛУ, а не по классу исключения: отказ прокси и
+# обрыв соединения — это заминка на стороне сети, она проходит сама. А «Steam
+# вернул не JSON» или «нет цены Steam» повторятся и во второй раз, и добор по
+# ним — просто сожжённые запросы.
+_TEMPORARY_MARKERS = (
+    "403",
+    "forbidden",
+    "прокси",
+    "payload is not completed",
+    "contentlength",
+    "server disconnected",
+    "connection reset",
+    "timeout",
+    "таймаут",
+)
+
+
+def _looks_temporary(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(marker in text for marker in _TEMPORARY_MARKERS)
+
+
 async def _watchlist_scan_item(
     bot, chat_id: int, market_hash_name: str, min_value: float, max_markup: float,
     *, check_stickers: bool = True, check_floats: bool = True,
@@ -2510,6 +2534,49 @@ async def _run_watchlist_scan(
         # запрос по следующему уже в пути.
         workers = min(SCAN_CONCURRENCY, len(plan))
         await asyncio.gather(*(worker() for _ in range(workers)))
+
+        # Второй заход по упавшим предметам.
+        #
+        # Отказ прокси больше не роняет прогон (037e968) — падает только
+        # предмет. Но терять его совсем незачем: отказ у провайдера плавающий,
+        # а каждый отказавший логин лежит всего минуту. К концу прогона они уже
+        # вернулись в строй, и повтор почти бесплатен: на проде 2026-09-14 так
+        # отваливались 24 предмета из 635, то есть добор стоит ~4% запросов.
+        #
+        # Берём только те сбои, которые ПОХОЖИ НА ВРЕМЕННЫЕ. Предмет, у
+        # которого Steam отдал не JSON или сломалось имя, провалится и во
+        # второй раз — это не заминка, а поломка, и повторять её значит жечь
+        # запросы впустую.
+        if not rate_limit_hit and stats.errors and STEAM_POOL.available():
+            retryable = [
+                (name, exc) for name, exc in stats.errors
+                if _looks_temporary(exc)
+            ]
+            if retryable:
+                log.info(
+                    "watchlist: добор — повторяю %d предмет(ов), упавших по временной "
+                    "причине (свободных логинов %d)",
+                    len(retryable), len(STEAM_POOL.available()),
+                )
+                # Снимаем их прошлые ошибки: если добор удастся, предмет не
+                # должен остаться в отчёте как сбойный.
+                failed_names = {name for name, _ in retryable}
+                stats.errors = [
+                    (name, exc) for name, exc in stats.errors
+                    if name not in failed_names
+                ]
+                stats.failed -= len(retryable)
+
+                by_name = {name: entry for entry in plan for name in (entry[0],)}
+                for name in failed_names:
+                    entry = by_name.get(name)
+                    if entry is not None:
+                        queue.put_nowait(entry)
+                await asyncio.gather(*(worker() for _ in range(min(workers, queue.qsize()))))
+                log.info(
+                    "watchlist: добор закончен — из %d повторённых снова упало %d",
+                    len(retryable), stats.failed,
+                )
 
         elapsed = time.perf_counter() - started
         throttle_wait = take_throttle_wait()
