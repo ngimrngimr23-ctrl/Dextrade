@@ -6926,6 +6926,26 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Цены ниже посчитаны по потолку прибыли, без оглядки на чужие ордера."
         )
 
+    # Объём продаж есть только у Steam priceoverview, а тот регулярно лежит под
+    # 429 — и тогда отказ «объём неизвестен» это новость про Steam, а не про
+    # предмет. Без этой строки человек читает её как «предмет неликвидный» и
+    # идёт крутить пороги, которые тут ни при чём.
+    no_volume = sum(1 for _, why in refused if why == buy_orders.UNKNOWN_VOLUME)
+    if no_volume:
+        wait = steam_cooldown_remaining(scope="pricing")
+        lines.append("")
+        note = (
+            f"⚠️ Объём продаж не пришёл у {no_volume} предмет(ов). Его отдаёт "
+            "только Steam priceoverview"
+        )
+        note += (
+            f", а он на кулдауне ещё {wait / 60:.0f} мин — проще подождать."
+            if wait > 0 else
+            " — в кэше остались записи без него, они обновятся сами."
+        )
+        lines.append(note + " Не ждать: <code>/setorders - 0 - -</code> "
+                     "выключит проверку ликвидности совсем.")
+
     if refused:
         lines.append("")
         lines.append(f"<b>Отказы ({len(refused)}):</b>")
