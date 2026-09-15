@@ -68,6 +68,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import envcfg
+from scan_errors import scrub
 import os
 import time
 from dataclasses import dataclass, field
@@ -775,6 +776,10 @@ def _build_request(path: str, params: dict[str, str]) -> tuple[str, dict[str, st
 # у CSFloat закрыт доступ из среды разработки, а из браузера телефона заголовок
 # Authorization выставить нельзя в принципе — ровно поэтому и пришёл тот
 # «authorization not set».
+# Сколько логинов перебрать на одну ручку, прежде чем признать её недоступной.
+# Шесть при половине отказывающих логинов дают шанс промаха около 1.5%.
+PROBE_ATTEMPTS = envcfg.env_int("CSFLOAT_PROBE_ATTEMPTS", 6)
+
 PROBE_PATHS = (
     ("/listings?limit=1", "рынок (документирована)"),
     ("/me", "профиль — принимается ли ключ вообще"),
@@ -796,19 +801,37 @@ async def probe() -> list[tuple[str, str, int | None, str]]:
         raise CSFloatError("CSFLOAT_API_KEY не задан")
 
     out: list[tuple[str, str, int | None, str]] = []
-    proxy = CSFLOAT_POOL.next() if CSFLOAT_POOL.enabled() else None
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         for path, why in PROBE_PATHS:
             url, params = _build_request(path, {})
-            try:
-                async with session.get(
-                    url, params=params, proxy=proxy,
-                    headers={**_API_HEADERS, "Authorization": CSFLOAT_API_KEY},
-                ) as resp:
-                    body = (await resp.text())[:200]
-                    out.append((path, why, resp.status, " ".join(body.split())))
-            except Exception as e:  # noqa: BLE001 — пробник не должен падать целиком
-                out.append((path, why, None, f"не дошло: {e}"))
+            last_error = "не пробовали"
+            status = None
+            body = ""
+
+            # Логин на каждую попытку берём СВОЙ. Первая версия брала один на
+            # все четыре ручки, он отдал 403 — и пробник отрапортовал, что
+            # недоступно вообще ничего, хотя не проверил ровным счётом ничего.
+            # Отказывает около половины логинов (замер /proxycheck: работают 49
+            # из 96), так что один — это подбрасывание монетки.
+            for _ in range(PROBE_ATTEMPTS):
+                proxy = CSFLOAT_POOL.next() if CSFLOAT_POOL.enabled() else None
+                try:
+                    async with session.get(
+                        url, params=params, proxy=proxy,
+                        headers={**_API_HEADERS, "Authorization": CSFLOAT_API_KEY},
+                    ) as resp:
+                        status = resp.status
+                        body = " ".join((await resp.text())[:200].split())
+                    break
+                except Exception as e:  # noqa: BLE001 — пробник не падает целиком
+                    last_error = scrub(str(e))
+                    if not CSFLOAT_POOL.enabled():
+                        break
+                    await asyncio.sleep(MIN_REQUEST_INTERVAL)
+
+            if status is None:
+                body = f"не дошло за {PROBE_ATTEMPTS} попыт(ок): {last_error}"
+            out.append((path, why, status, body))
             await asyncio.sleep(MIN_REQUEST_INTERVAL)
     return out
 
