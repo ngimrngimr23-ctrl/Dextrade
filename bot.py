@@ -6509,6 +6509,54 @@ async def reset_cooldowns(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def csfloatapi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /csfloatapi — что из API CSFloat доступно нашему ключу.
+
+    Зачем команда. В документации CSFloat описаны три ручки (список лотов, один
+    лот, выставить лот на продажу) — покупки среди них нет. Но на
+    /me/buy-orders сервер отвечает кодом 27 «authorization not set», а не 404,
+    то есть ручка есть, просто недокументированная. Пустит ли туда наш ключ,
+    можно узнать одним живым запросом — и сделать его больше некому: у CSFloat
+    закрыт доступ из среды разработки, а браузер телефона не умеет выставлять
+    заголовок Authorization.
+
+    Только чтение: GET и ничего кроме. Ордера не создаются, покупки не
+    совершаются, баланс не тратится.
+    """
+    await update.message.reply_text("Спрашиваю CSFloat, что доступно ключу…")
+    try:
+        results = await csfloat_client.probe()
+    except CSFloatError as e:
+        await update.message.reply_text(f"⚠️ {e}")
+        return
+
+    lines = [f"<b>Ключ:</b> {csfloat_client.key_fingerprint()}", ""]
+    for path, why, status, body in results:
+        if status is None:
+            mark = "⚠️"
+        elif status == 200:
+            mark = "✅"
+        elif status in (401, 403):
+            mark = "🔒"
+        elif status == 404:
+            mark = "❌"
+        else:
+            mark = "❔"
+        lines.append(f"{mark} <code>{html_module.escape(path)}</code> — {why}")
+        lines.append(f"   HTTP {status if status is not None else '—'}: "
+                     f"{html_module.escape(body[:160])}")
+    lines.append("")
+    lines.append(
+        "✅ — ключа хватает. 🔒 — ручка есть, но нужен другой способ входа "
+        "(скорее всего куки сессии). ❌ — ручки нет вовсе."
+    )
+    await update.message.reply_text(
+        scan_errors.scrub("\n".join(lines)), parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
 _PROFILE_WORDS = {"профиль", "profile", "замер", "-p"}
 
 
@@ -8499,6 +8547,14 @@ COMMANDS: tuple[Command, ...] = (
         "/setarb сброс — снять кулдаун CSFloat\n"
         "/setarb off — выключить\n"
         "Остальные пороги арбитража — /start → Пороги → Арбитраж.",
+    ),
+    Command(
+        "csfloatapi", csfloatapi, "Что доступно ключу CSFloat",
+        "Проверить, какие ручки API открыты",
+        "/csfloatapi — дёрнуть ручки CSFloat нашим ключом и показать, что ответил "
+        "сервер. Нужно, чтобы понять, можно ли ставить ордера на покупку: в "
+        "документации такой ручки нет, но сервер на неё отвечает.\n"
+        "Только чтение — ничего не покупает и не создаёт.",
     ),
     Command(
         "reset", reset_cooldowns, "Снять паузу после 429",

@@ -761,6 +761,58 @@ def _build_request(path: str, params: dict[str, str]) -> tuple[str, dict[str, st
     return f"{CSFLOAT_PROXY_URL}/proxy", {"url": str(target)}
 
 
+# Ручки, по которым проверяем, что доступно нашему ключу.
+#
+# Документация CSFloat (официальный репозиторий csfloat/docs — там ровно два
+# файла, source/index.html.md и includes/_errors.md) описывает три эндпоинта:
+# GET /listings, GET /listings/<id> и POST /listings. Ордеров на покупку в ней
+# нет вовсе.
+#
+# Но на /me/buy-orders сервер отвечает не 404, а осмысленным
+# {"code":27,"message":"authorization not set"} — значит ручка существует и
+# просто не увидела заголовка. Документация на вопрос «пустит ли туда наш
+# ключ» не отвечает; отвечает только живой запрос. А сделать его больше некому:
+# у CSFloat закрыт доступ из среды разработки, а из браузера телефона заголовок
+# Authorization выставить нельзя в принципе — ровно поэтому и пришёл тот
+# «authorization not set».
+PROBE_PATHS = (
+    ("/listings?limit=1", "рынок (документирована)"),
+    ("/me", "профиль — принимается ли ключ вообще"),
+    ("/me/buy-orders", "ордера на покупку — НЕ документирована"),
+    ("/me/offers-timeline", "история сделок — НЕ документирована"),
+)
+
+
+async def probe() -> list[tuple[str, str, int | None, str]]:
+    """
+    Дёрнуть ручки из PROBE_PATHS ключом и вернуть, что ответил сервер.
+
+    ТОЛЬКО GET и только чтение. Ничего не создаёт, не покупает и не тратит: на
+    счету деньги, и пробник — не то место, где стоит рисковать.
+
+    Возвращает [(путь, зачем, HTTP-код или None, начало ответа)].
+    """
+    if not csfloat_enabled():
+        raise CSFloatError("CSFLOAT_API_KEY не задан")
+
+    out: list[tuple[str, str, int | None, str]] = []
+    proxy = CSFLOAT_POOL.next() if CSFLOAT_POOL.enabled() else None
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        for path, why in PROBE_PATHS:
+            url, params = _build_request(path, {})
+            try:
+                async with session.get(
+                    url, params=params, proxy=proxy,
+                    headers={**_API_HEADERS, "Authorization": CSFLOAT_API_KEY},
+                ) as resp:
+                    body = (await resp.text())[:200]
+                    out.append((path, why, resp.status, " ".join(body.split())))
+            except Exception as e:  # noqa: BLE001 — пробник не должен падать целиком
+                out.append((path, why, None, f"не дошло: {e}"))
+            await asyncio.sleep(MIN_REQUEST_INTERVAL)
+    return out
+
+
 class _ProxyTransient(Exception):
     """
     Сетевой сбой на конкретном адресе: оборвалось соединение, таймаут, отказ
