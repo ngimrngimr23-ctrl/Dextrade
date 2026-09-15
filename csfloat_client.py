@@ -879,6 +879,51 @@ _TRANSIENT_PROXY_ERRORS = (
 PROXY_TRANSIENT_COOLDOWN_SECONDS = 60
 
 
+# Прямой адрес Render как ЗАПАСНОЙ маршрут широкого скана.
+#
+# У /listings он второсортный, и это измерено: с прямого адреса CSFloat
+# отвечает 429 «Please disable your VPN or try a different network» — адреса
+# дата-центров он считает VPN. Но второсортный маршрут лучше, чем никакого:
+# 2026-09-15 шлюз прокси отказывал на КАЖДОМ из 96 логинов подряд, и скан не
+# уходил вообще никуда — команда просто молчала.
+#
+# Два правила, без которых этот маршрут вредит больше, чем помогает:
+#   1. он ПОСЛЕДНИЙ в очереди. Сначала весь пул, и только когда свободных
+#      адресов не осталось — прямой. Обратный порядок сжёг бы репутацию
+#      прямого адреса на ровном месте (у авторизованных ручек /me и
+#      /me/buy-orders порядок как раз обратный — там прямой работает, а
+#      прокси нет, см. commit 6fbb7a0);
+#   2. его 429 НЕ ставит общий кулдаун на ключ. Кулдаун у нас один на ключ,
+#      и отказ прямому адресу глушил бы заодно авторизованные ручки, которые
+#      именно прямым адресом и живут. Вместо этого запоминаем «прямой сейчас
+#      закрыт» отдельно и не трогаем его DIRECT_BLOCK_SECONDS.
+DIRECT_BLOCK_SECONDS = envcfg.env_int("CSFLOAT_DIRECT_BLOCK_SECONDS", 900)
+_direct_blocked_until = 0.0
+
+
+def direct_available() -> bool:
+    """Можно ли прямо сейчас пробовать прямой адрес для /listings."""
+    return time.time() >= _direct_blocked_until
+
+
+def _block_direct(why: str) -> None:
+    global _direct_blocked_until
+    _direct_blocked_until = time.time() + DIRECT_BLOCK_SECONDS
+    log.warning(
+        "csfloat: прямой адрес закрыт на %d мин (%s)",
+        DIRECT_BLOCK_SECONDS // 60, scrub(why),
+    )
+
+
+class _DirectRefused(Exception):
+    """
+    CSFloat отказал ИМЕННО прямому адресу (429 не по квоте).
+
+    Отдельный класс, чтобы этот отказ не превращался в общий кулдаун ключа:
+    прокси-маршруты и авторизованные ручки после него по-прежнему рабочие.
+    """
+
+
 class _QuotaRetry(Exception):
     """
     Внутренний сигнал «429 по квоте, но кулдаун ещё не ставили».
@@ -896,12 +941,19 @@ class _QuotaRetry(Exception):
 
 async def _request_listings(
     session: aiohttp.ClientSession, url: str, request_params: dict[str, str],
-    proxy: str | None = None,
+    proxy: str | None = None, *, shared_cooldown: bool = True,
 ):
-    """Один запрос за страницей лотов. Возвращает разобранный JSON."""
+    """
+    Один запрос за страницей лотов. Возвращает разобранный JSON.
+
+    shared_cooldown=False — «это запасной прямой маршрут»: его 429 остаётся
+    его личной бедой и не останавливает остальные (см. _DirectRefused).
+    """
     await _throttle_all(proxy)
     try:
-        return await _do_request(session, url, request_params, proxy)
+        return await _do_request(
+            session, url, request_params, proxy, shared_cooldown=shared_cooldown
+        )
     except aiohttp.ClientHttpProxyError as e:
         # 407 и подобное от самого прокси: логин/пароль или тариф, а не CSFloat.
         #
@@ -934,7 +986,7 @@ async def _request_listings(
 
 async def _do_request(
     session: aiohttp.ClientSession, url: str, request_params: dict[str, str],
-    proxy: str | None = None,
+    proxy: str | None = None, *, shared_cooldown: bool = True,
 ):
     async with session.get(
         url,
@@ -951,6 +1003,11 @@ async def _do_request(
             headers = dict(resp.headers)
             if _is_quota_429(headers, body):
                 raise _QuotaRetry(headers, body)
+            if not shared_cooldown:
+                # Запасной прямой маршрут. Его отказ закрывает только его —
+                # общий кулдаун ключа тут поставить нельзя, иначе заодно
+                # встанут авторизованные ручки, которые прямым и работают.
+                raise _DirectRefused(body[:200] or f"HTTP {resp.status}")
             # Бан по репутации адреса или антибот — повторять бессмысленно,
             # кулдаун ставим сразу.
             seconds, is_ip_block = await _note_429(
@@ -1078,28 +1135,66 @@ async def fetch_listings_page(
     # воркер с его переменным исходящим адресом).
     max_attempts = max(len(CSFLOAT_POOL), QUOTA_429_RETRIES + 1)
     attempt = 0
+
+    # Прямой адрес — последний патрон. Тратим его один раз за страницу и
+    # только когда пул кончился или весь перебор провалился; см. комментарий
+    # у DIRECT_BLOCK_SECONDS про то, почему он именно последний.
+    direct_left = CSFLOAT_POOL.enabled() and direct_available()
+    going_direct = False
+    force_direct = False
+
     while True:
         # Полоса широкого скана закрепляет за собой адрес (см. fetch_market_wide):
         # тогда пауза между запросами держится по этому адресу, и полосы идут
         # параллельно. На повторах после 429 берём уже любой свободный.
-        if proxy and attempt == 0:
+        if force_direct:
+            proxy, force_direct = None, False
+        elif proxy and attempt == 0:
             pass
         else:
             proxy = CSFLOAT_POOL.next() if CSFLOAT_POOL.enabled() else None
-        if CSFLOAT_POOL.enabled() and proxy is None:
-            # Все адреса на кулдауне — ждать нечего, дальше решает вызывающий.
-            raise CSFloatRateLimited(
-                f"Все прокси на кулдауне по квоте CSFloat ({CSFLOAT_POOL.describe()})."
+
+        going_direct = CSFLOAT_POOL.enabled() and proxy is None
+        if going_direct:
+            if not direct_left:
+                # Пул пуст, прямой уже потрачен или закрыт — всё, что можно
+                # было попробовать, попробовано. Дальше решает вызывающий.
+                raise CSFloatRateLimited(
+                    f"Все прокси на кулдауне по квоте CSFloat "
+                    f"({CSFLOAT_POOL.describe()}), прямой адрес тоже не прошёл."
+                )
+            direct_left = False
+            log.info(
+                "csfloat: прокси не дали пройти (%s) — пробую прямым адресом",
+                CSFLOAT_POOL.describe(),
             )
+
         try:
-            data = await _request_listings(session, url, request_params, proxy)
+            data = await _request_listings(
+                session, url, request_params, proxy,
+                shared_cooldown=not going_direct,
+            )
             break
+        except _DirectRefused as refused:
+            # Прямой адрес отказал. Ключ при этом цел, пул тоже — просто этот
+            # маршрут закрыт, и повторять его ближайшие минуты бессмысленно.
+            _block_direct(str(refused))
+            raise CSFloatRateLimited(
+                f"Прокси не пропускают запрос ({CSFLOAT_POOL.describe()}), "
+                f"а прямому адресу CSFloat ответил отказом: {scrub(str(refused))}"
+            ) from None
         except _ProxyTransient as broke:
             attempt += 1
             CSFLOAT_POOL.mark_exhausted(
                 proxy, PROXY_TRANSIENT_COOLDOWN_SECONDS, f"сетевой сбой ({broke})"
             )
             if attempt >= max_attempts:
+                if direct_left:
+                    # Перебор кончился, но прямой ещё не пробовали. Именно в
+                    # эту дыру всё и проваливалось: пул из 96 логинов сгорал
+                    # за 96 попыток, и до прямого очередь не доходила никогда.
+                    force_direct = True
+                    continue
                 raise CSFloatError(
                     f"Прокси не пропускают запрос: {CSFLOAT_POOL.failure_hint()}.\n"
                     f"Последний ответ: {broke}"
@@ -1117,6 +1212,9 @@ async def fetch_listings_page(
                 CSFLOAT_POOL.mark_exhausted(proxy, reset_in, "квота CSFloat исчерпана")
 
             if attempt >= max_attempts:
+                if direct_left:
+                    force_direct = True
+                    continue
                 seconds, is_ip_block = await _note_429(
                     _header(retry.headers, "Retry-After"), retry.headers, retry.body
                 )
@@ -1425,8 +1523,9 @@ async def fetch_market_wide(
 
     log.info(
         "csfloat: широкий скан — цель %d лотов, бюджет %d запрос(ов) на %d полос, "
-        "адресов в пуле %d, использую %d. Отсечка по свежести: %s",
+        "адресов в пуле %d, использую %d, прямой адрес %s. Отсечка по свежести: %s",
         target, budget, len(bands), len(proxies), len(lane_addresses),
+        "в запасе" if direct_available() else "закрыт",
         "да" if by_recency else f"нет (сортировка {sort_by})",
     )
 

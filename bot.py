@@ -6519,6 +6519,21 @@ async def reset_cooldowns(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # выбирает арбитраж. Десяток хватает, чтобы увидеть картину, и не ломает скан.
 ORDERS_PROBE_LIMIT = envcfg.env_int("ORDERS_PROBE_LIMIT", 10)
 
+# Сколько лотов тянуть широким сканом ради ордеров и сколько секунд на это дать.
+#
+# Оба числа — следствие одного прогона. /orders запускал полный скан на 1500
+# лотов (30 страниц), а fetch_listings_page на каждую страницу перебирает ВЕСЬ
+# пул: при мёртвом шлюзе это до 96 отказов на страницу. Команда уходила в
+# перебор на минуты и со стороны выглядела молчащей — в логе видно «сухой
+# прогон начат», потом сотни строк «адрес отложен на 1 мин» и ничего больше.
+#
+# Ордерам полный скан и не нужен: кандидатов мы всё равно режем до
+# ORDERS_PROBE_LIMIT штук. Триста лотов — это шесть страниц, и они приходят за
+# секунды. Таймаут поверх страхует от любой другой причины медлительности:
+# команда обязана ответить, даже если сеть висит.
+ORDERS_ARB_TARGET = envcfg.env_int("ORDERS_ARB_TARGET", 300)
+ORDERS_ARB_TIMEOUT = envcfg.env_float("ORDERS_ARB_TIMEOUT", 45.0)
+
 
 class _OrderCandidate(NamedTuple):
     """Предмет, на который стоило бы поставить ордер. Цены в центах."""
@@ -6547,16 +6562,15 @@ async def _order_candidates_from_arb(chat_id: int) -> list[_OrderCandidate]:
             f"CSFloat на кулдауне ещё {cooldown / 60:.0f} мин — широкий скан "
             "пропускаю, кандидаты будут только из просадок"
         )
-    pool = csfloat_client.CSFLOAT_POOL
-    if pool.enabled() and not pool.available():
-        raise CSFloatError(
-            f"все прокси CSFloat недоступны ({pool.describe()}) — широкий скан "
-            "пропускаю, кандидаты будут только из просадок"
-        )
+
+    # Пул НЕ проверяем: раньше здесь стоял отказ «все прокси недоступны», и он
+    # не помогал (отказы приходят по одному, на старте пул выглядит полным), а
+    # теперь ещё и мешал бы. Если прокси не пропускают, широкий скан уходит
+    # прямым адресом сам — см. fetch_listings_page.
 
     settings = await get_arb_settings(chat_id)
     listings = await csfloat_client.fetch_market_wide(
-        target=ARB_TARGET_LISTINGS, sort_by=ARB_SORT_BY,
+        target=ORDERS_ARB_TARGET, sort_by=ARB_SORT_BY,
         min_price=settings["min_price"], max_price=settings["max_price"],
     )
     await _fill_steam_prices(listings)
@@ -6768,8 +6782,21 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     from_arb = from_dips = 0
     try:
-        candidates = await _order_candidates_from_arb(chat_id)
+        # Таймаут обязателен. Без него команда зависит от того, как быстро
+        # отвечает чужой прокси-сервис, а он может не отвечать вовсе — и тогда
+        # человек видит только первое сообщение и тишину.
+        candidates = await asyncio.wait_for(
+            _order_candidates_from_arb(chat_id), timeout=ORDERS_ARB_TIMEOUT
+        )
         from_arb = len(candidates)
+    except asyncio.TimeoutError:
+        log.info("orders: широкий скан не уложился в %.0f с — беру только просадки",
+                 ORDERS_ARB_TIMEOUT)
+        await update.message.reply_text(
+            f"⚠️ Широкий скан не ответил за {ORDERS_ARB_TIMEOUT:.0f} с "
+            "(прокси CSFloat не отвечает) — беру кандидатов только из просадок."
+        )
+        candidates = []
     except (CSFloatRateLimited, CSFloatError) as e:
         log.info("orders: арбитраж пропущен — %s", scan_errors.scrub(str(e)))
         await update.message.reply_text(f"⚠️ {scan_errors.scrub(str(e))}")
