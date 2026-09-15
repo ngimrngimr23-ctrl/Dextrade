@@ -6532,7 +6532,7 @@ async def csfloatapi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     lines = [f"<b>Ключ:</b> {csfloat_client.key_fingerprint()}", ""]
-    for path, why, status, body in results:
+    for path, why, status, body, route in results:
         if status is None:
             mark = "⚠️"
         elif status == 200:
@@ -6544,8 +6544,8 @@ async def csfloatapi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             mark = "❔"
         lines.append(f"{mark} <code>{html_module.escape(path)}</code> — {why}")
-        lines.append(f"   HTTP {status if status is not None else '—'}: "
-                     f"{html_module.escape(body[:160])}")
+        lines.append(f"   HTTP {status if status is not None else '—'} "
+                     f"({route}): {html_module.escape(body[:160])}")
     lines.append("")
     lines.append(
         "✅ — ключа хватает. 🔒 — ручка есть, но нужен другой способ входа "

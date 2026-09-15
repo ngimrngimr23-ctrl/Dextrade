@@ -795,26 +795,37 @@ async def probe() -> list[tuple[str, str, int | None, str]]:
     ТОЛЬКО GET и только чтение. Ничего не создаёт, не покупает и не тратит: на
     счету деньги, и пробник — не то место, где стоит рисковать.
 
-    Возвращает [(путь, зачем, HTTP-код или None, начало ответа)].
+    Возвращает [(путь, зачем, HTTP-код или None, начало ответа, каким маршрутом)].
     """
     if not csfloat_enabled():
         raise CSFloatError("CSFLOAT_API_KEY не задан")
 
-    out: list[tuple[str, str, int | None, str]] = []
+    out: list[tuple[str, str, int | None, str, str]] = []
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         for path, why in PROBE_PATHS:
             url, params = _build_request(path, {})
+
+            # Маршруты по порядку: сначала логины из пула (каждая попытка —
+            # СВОЙ логин), в конце обязательно прямой адрес.
+            #
+            # Прямой нужен не для галочки. Первая версия ходила только через
+            # пул, а он лежал целиком — 802 отказа шлюза за прогон, — и все
+            # четыре ручки отчитались «не дошло», не проверив ничего. При этом
+            # прокси для CSFloat заводился под СТАРЫЙ адрес Render, который
+            # блокировали как датацентровый; адрес нового сервиса другой, и
+            # вполне может пройти напрямую. Заодно это отличает «лежит прокси»
+            # от «CSFloat нас не пускает»: ответ CSFloat про VPN выглядит
+            # совсем иначе, чем 403 от шлюза.
+            routes: list[tuple[str | None, str]] = []
+            if CSFLOAT_POOL.enabled():
+                routes = [(CSFLOAT_POOL.next(), "прокси") for _ in range(PROBE_ATTEMPTS)]
+            routes.append((None, "прямой адрес"))
+
             last_error = "не пробовали"
             status = None
             body = ""
-
-            # Логин на каждую попытку берём СВОЙ. Первая версия брала один на
-            # все четыре ручки, он отдал 403 — и пробник отрапортовал, что
-            # недоступно вообще ничего, хотя не проверил ровным счётом ничего.
-            # Отказывает около половины логинов (замер /proxycheck: работают 49
-            # из 96), так что один — это подбрасывание монетки.
-            for _ in range(PROBE_ATTEMPTS):
-                proxy = CSFLOAT_POOL.next() if CSFLOAT_POOL.enabled() else None
+            route_used = "—"
+            for proxy, label in routes:
                 try:
                     async with session.get(
                         url, params=params, proxy=proxy,
@@ -822,16 +833,18 @@ async def probe() -> list[tuple[str, str, int | None, str]]:
                     ) as resp:
                         status = resp.status
                         body = " ".join((await resp.text())[:200].split())
+                        route_used = label
                     break
                 except Exception as e:  # noqa: BLE001 — пробник не падает целиком
                     last_error = scrub(str(e))
-                    if not CSFLOAT_POOL.enabled():
-                        break
                     await asyncio.sleep(MIN_REQUEST_INTERVAL)
 
             if status is None:
-                body = f"не дошло за {PROBE_ATTEMPTS} попыт(ок): {last_error}"
-            out.append((path, why, status, body))
+                body = (
+                    f"не дошло ни через прокси ({PROBE_ATTEMPTS} попыт.), "
+                    f"ни напрямую: {last_error}"
+                )
+            out.append((path, why, status, body, route_used))
             await asyncio.sleep(MIN_REQUEST_INTERVAL)
     return out
 
