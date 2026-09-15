@@ -6838,23 +6838,48 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     plans: list[tuple[_OrderCandidate, buy_orders.OrderPlan]] = []
     refused: list[tuple[str, str]] = []
+    # Предметы, у которых стакан прочитать не вышло. Ордер по ним считается —
+    # просто без оглядки на чужие. В отчёте это обязано отличаться от «стакан
+    # пуст»: пустой стакан значит «перебивать некого», непрочитанный — «не
+    # знаю, кого перебивать», и это разные новости.
+    blind: dict[str, str] = {}
+    # Маршрут до CSFloat либо есть, либо его нет.
+    #
+    # Раньше это выяснялось заново на КАЖДОМ предмете, и при закрытом маршруте
+    # прогон 2026-09-15 выдал восемь одинаковых абзацев отказа на пол-экрана,
+    # потратив на них по восемь попыток каждый. Одного ответа достаточно:
+    # если дверь закрыта, она закрыта для всех десяти предметов.
+    route_down: str | None = None
+
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
         for cand in ranked:
             listing_id = cand.listing_id
-            if listing_id is None:
+            if listing_id is None and route_down is None:
                 try:
                     lots, _ = await csfloat_client.fetch_listings_page(
                         session, limit=1, market_hash_name=cand.market_hash_name,
                     )
                 except (CSFloatRateLimited, CSFloatError) as e:
-                    refused.append((cand.market_hash_name, f"лот не найден: {e}"))
-                    continue
-                if not lots:
-                    refused.append((cand.market_hash_name, "на CSFloat лотов нет"))
-                    continue
-                listing_id = lots[0].listing_id
+                    route_down = scan_errors.reason(e)
+                    log.info(
+                        "orders: CSFloat не отвечает (%s) — дальше считаю без стаканов",
+                        route_down,
+                    )
+                else:
+                    if lots:
+                        listing_id = lots[0].listing_id
+                    else:
+                        blind[cand.market_hash_name] = "на CSFloat лотов нет"
 
-            rivals = await csfloat_client.buy_orders_for(session, listing_id)
+            if listing_id is None:
+                # Стакан недоступен, но план от него не зависит: потолок цены
+                # считается от цены Steam и порога прибыли, а чужие ордера
+                # нужны лишь чтобы встать на цент выше верхнего. Нет их —
+                # ставим по потолку, это самый выгодный из возможных ордеров.
+                blind.setdefault(cand.market_hash_name, "стакан не прочитан")
+                rivals = None
+            else:
+                rivals = await csfloat_client.buy_orders_for(session, listing_id)
             # Объём у нас суточный (окно last_24h прайс-листа), а порог
             # недельный — переводим тем же способом, что и /dips.
             weekly = (
@@ -6878,8 +6903,10 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["<b>Сухой прогон ордеров</b> — ничего не поставлено", ""]
     if plans:
         for cand, plan in sorted(plans, key=lambda x: -x[1].profit_pct):
-            rival = (f"перебиваем ${plan.rival_cents / 100:.2f}"
-                     if plan.rival_cents is not None else "стакан пуст")
+            if plan.rival_cents is not None:
+                rival = f"перебиваем ${plan.rival_cents / 100:.2f}"
+            else:
+                rival = blind.get(plan.market_hash_name, "стакан пуст")
             lines.append(
                 f"• <code>{html_module.escape(plan.market_hash_name)}</code> "
                 f"({cand.source})"
@@ -6892,17 +6919,32 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         lines.append("Ни одного ордера не поставил бы.")
 
+    if route_down:
+        lines.append("")
+        lines.append(
+            f"⚠️ Стаканы не прочитаны: {html_module.escape(route_down)}. "
+            "Цены ниже посчитаны по потолку прибыли, без оглядки на чужие ордера."
+        )
+
     if refused:
         lines.append("")
         lines.append(f"<b>Отказы ({len(refused)}):</b>")
-        for name, why in refused[:6]:
-            lines.append(f"• {html_module.escape(name)} — {html_module.escape(why)}")
-        if len(refused) > 6:
-            lines.append(f"…и ещё {len(refused) - 6}")
+        # По одной причине, а не по одному предмету: при закрытом маршруте все
+        # отказы одинаковые, и восемь копий одного абзаца — это не отчёт.
+        by_reason: dict[str, list[str]] = {}
+        for name, why in refused:
+            by_reason.setdefault(why, []).append(name)
+        for why, names in sorted(by_reason.items(), key=lambda kv: -len(kv[1])):
+            shown = ", ".join(names[:3])
+            if len(names) > 3:
+                shown += f" …и ещё {len(names) - 3}"
+            lines.append(f"• {html_module.escape(why)} — {len(names)} шт.")
+            lines.append(f"  {html_module.escape(shown)}")
 
     log.info(
-        "orders: chat_id=%s итог — планов %d, отказов %d",
-        chat_id, len(plans), len(refused),
+        "orders: chat_id=%s итог — планов %d, отказов %d, без стакана %d%s",
+        chat_id, len(plans), len(refused), len(blind),
+        f", маршрут закрыт: {route_down}" if route_down else "",
     )
     lines.append("")
     lines.append(
