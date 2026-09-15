@@ -39,6 +39,7 @@ import hashlib
 import logging
 import envcfg
 import os
+import time
 
 import aiohttp
 
@@ -90,7 +91,16 @@ MAX_BYTES = envcfg.env_int("LOG_GITHUB_MAX_MB", 10) * 1024 * 1024
 # Не чаще одного коммита в столько секунд, даже если строки идут потоком.
 # Выгрузка теперь по событию, и без этой паузы шумный прогон дал бы коммит на
 # каждую строку.
-MIN_GAP_SECONDS = envcfg.env_float("LOG_SHIP_MIN_GAP", 60)
+# Пауза между отгрузками. Поднята с 60 до 300 секунд вместе с переходом на
+# отдельные файлы: при пяти минутах кусок весит ~50 КБ, а запросов к GitHub
+# уходит в пять раз меньше. Задержка появления логов в репозитории на пять
+# минут никого не стоит — читаем мы их всё равно после события.
+MIN_GAP_SECONDS = envcfg.env_float("LOG_SHIP_MIN_GAP", 300)
+
+# Куда складывать куски лога. Один файл на отгрузку — см. append().
+CHUNK_DIR = os.environ.get("LOG_GITHUB_CHUNK_DIR", "logs").strip().strip("/")
+# Счётчик отгрузок за жизнь процесса — только чтобы имена не совпадали.
+_chunk_counter = 0
 
 # Хеш последней выгруженной версии: если ничего не изменилось, коммит не нужен.
 _last_digest: str | None = None
@@ -303,12 +313,24 @@ async def _current_content(session: aiohttp.ClientSession) -> bytes:
 
 async def append(new_text: str, *, note: str = "") -> str:
     """
-    Дописать новые строки к накопленному файлу на GitHub.
+    Выгрузить новые строки ОТДЕЛЬНЫМ файлом: logs/<дата>/<время>.log
 
-    Почему дописываем, а не перезаписываем. Диск Render эфемерен: при каждом
-    редеплое локальный лог начинается с нуля, и перезапись затирала бы всё
-    предыдущее — как раз то, что нужнее всего, когда разбираешь «а что было
-    до перезапуска». Удалённый файл переживает редеплои и служит архивом.
+    Так было не всегда, и прежняя схема обошлась дорого. Строки дописывались в
+    один общий файл, а Contents API дописывать не умеет: чтобы добавить хвост,
+    надо СКАЧАТЬ файл целиком и залить его обратно целиком. При потолке в 1 МБ
+    и отгрузке раз в минуту это давало 2 МБ трафика ради десяти килобайт
+    новых строк — 2.9 ГБ в сутки. Бесплатные 5 ГБ Render сгорали за двое суток,
+    и сервис вставал (разобрано 2026-09-15 по счётчику «дописано 10.7 КБ, в
+    файле 1.00 МБ» раз в минуту).
+
+    Отдельный файл снимает чтение и повторную заливку разом: уходит ровно
+    столько, сколько появилось новых строк. При пятиминутной паузе это ~50 КБ
+    на отгрузку, около 14 МБ в сутки вместо 2.9 ГБ — в двести раз меньше.
+
+    Архив при этом не страдает, а становится удобнее: имена сортируются
+    хронологически, редеплой ничего не затирает (каждый кусок самостоятелен),
+    и обрезать «начало по потолку» больше не нужно — раньше старые строки
+    терялись именно из-за общего файла.
 
     Возвращает человеческий отчёт.
     """
@@ -317,38 +339,47 @@ async def append(new_text: str, *, note: str = "") -> str:
     if not new_text.strip():
         return "новых строк нет — коммит не нужен"
 
+    payload = new_text.encode("utf-8")
+    trimmed = False
+    if len(payload) > MAX_BYTES:
+        # Разовый выброс (скажем, трейсбек на сто тысяч строк) не должен
+        # улетать целиком: режем, но говорим об этом.
+        payload = payload[-MAX_BYTES:]
+        trimmed = True
+
+    # Хвост-счётчик, а не миллисекунды. Две отгрузки в одну секунду дали бы
+    # одинаковый путь, а Contents API без sha на существующий файл отвечает
+    # 422. Миллисекунд для этого мало: ручной /logs github рядом с плановой
+    # отгрузкой укладывается и в одну миллисекунду (поймано тестом). Счётчик
+    # процесса уникален по построению, а сортировку имён не ломает — секунда в
+    # имени стоит раньше него.
+    global _chunk_counter
+    _chunk_counter += 1
+    stamp = time.gmtime()
+    path = "{}/{}/{}-{:04d}.log".format(
+        CHUNK_DIR,
+        time.strftime("%Y-%m-%d", stamp),
+        time.strftime("%H-%M-%S", stamp),
+        _chunk_counter % 10000,
+    )
+
     async with aiohttp.ClientSession() as session:
         await check(session)
-        sha = await _current_sha(session)
-        current = await _current_content(session) if sha else b""
-
-        merged = current + new_text.encode("utf-8")
-        trimmed = False
-        if len(merged) > MAX_BYTES:
-            merged = "…(начало обрезано, потолок {} МБ)…\n".format(
-                MAX_BYTES // (1024 * 1024)
-            ).encode("utf-8") + merged[-MAX_BYTES:]
-            trimmed = True
-
         body = {
             "message": f"лог бота{': ' + note if note else ''}",
-            "content": base64.b64encode(merged).decode("ascii"),
+            "content": base64.b64encode(payload).decode("ascii"),
             "branch": BRANCH,
         }
-        if sha:
-            body["sha"] = sha
-
         async with session.put(
-            f"{API}/repos/{REPO}/contents/{PATH}", headers=_headers(), json=body
+            f"{API}/repos/{REPO}/contents/{path}", headers=_headers(), json=body
         ) as resp:
             if resp.status not in (200, 201):
                 text = (await resp.text())[:300]
                 raise LogShipError(f"GitHub ответил {resp.status} при записи: {text}")
 
     return (
-        f"дописано {len(new_text.encode('utf-8')) / 1024:.1f} КБ, "
-        f"в файле {len(merged) / 1024 / 1024:.2f} МБ"
-        + (" (начало обрезано по потолку)" if trimmed else "")
+        f"выгружено {len(payload) / 1024:.1f} КБ в {path}"
+        + (f" (обрезано до потолка {MAX_BYTES // 1024} КБ)" if trimmed else "")
     )
 
 
