@@ -730,6 +730,42 @@ async def set_dips_setting(chat_id: int, key: str, value) -> None:
     await _save_chat_settings(chat_id, settings)
 
 
+async def get_order_settings(chat_id: int) -> dict:
+    """
+    Настройки ордеров на покупку CSFloat.
+
+    min_profit — целевая прибыль после комиссии Steam, %
+    min_week_volume — минимум продаж в Steam, ШТУК В НЕДЕЛЮ
+    min_price / max_price — диапазон цены предмета, $
+
+    Ликвидность именно недельная, а не суточная: в /dips она такая же, и
+    держать в двух командах разные единицы — верный способ однажды сравнить
+    одно с другим. Внутрь планировщика число уезжает как есть.
+
+    max_price работает ещё и потолком на один ордер: дороже верхней границы
+    диапазона бот не предложит при всём желании.
+
+    None в любом поле — не задано, действует умолчание из buy_orders.
+    """
+    s = await _get_chat_settings(chat_id)
+    return {
+        "min_profit": s.get("ord_min_profit"),
+        "min_week_volume": s.get("ord_min_week_volume"),
+        "min_price": s.get("ord_min_price"),
+        "max_price": s.get("ord_max_price"),
+    }
+
+
+async def set_order_setting(chat_id: int, key: str, value) -> None:
+    """key — одно из: min_profit, min_week_volume, min_price, max_price."""
+    allowed = {"min_profit", "min_week_volume", "min_price", "max_price"}
+    if key not in allowed:
+        raise ValueError(f"неизвестная настройка ордеров: {key}")
+    settings = await _get_chat_settings(chat_id)
+    settings[f"ord_{key}"] = value
+    await _save_chat_settings(chat_id, settings)
+
+
 # ---------------------------------------------------------------------------
 # История цен: накопленный минимум и активность по каждому предмету.
 #

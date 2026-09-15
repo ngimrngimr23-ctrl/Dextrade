@@ -63,7 +63,9 @@ _HUNDRED = Decimal(100)
 
 # Значения по умолчанию. Все переопределяются настройками чата.
 DEFAULT_MIN_PROFIT_PCT = envcfg.env_float("ORDER_MIN_PROFIT_PCT", 20.0)
-DEFAULT_MIN_VOLUME_PER_DAY = envcfg.env_int("ORDER_MIN_VOLUME", 3)
+# Ликвидность считаем В НЕДЕЛЮ — теми же единицами, что и /dips. Суточные и
+# недельные числа в разных командах однажды обязательно сравнят друг с другом.
+DEFAULT_MIN_VOLUME_PER_WEEK = envcfg.env_int("ORDER_MIN_WEEK_VOLUME", 21)
 DEFAULT_MAX_SPREAD_PCT = envcfg.env_float("ORDER_MAX_SPREAD_PCT", 15.0)
 DEFAULT_MAX_ORDER_USD = envcfg.env_float("ORDER_MAX_USD", 20.0)
 
@@ -110,11 +112,11 @@ def plan(
     market_hash_name: str,
     *,
     steam_price_cents: int,
-    volume_per_day: int | None,
+    volume_per_week: int | None,
     spread_pct: float | None,
     rival_orders_cents: list[int] | None = None,
     min_profit_pct: float = DEFAULT_MIN_PROFIT_PCT,
-    min_volume_per_day: int = DEFAULT_MIN_VOLUME_PER_DAY,
+    min_volume_per_week: int = DEFAULT_MIN_VOLUME_PER_WEEK,
     max_spread_pct: float = DEFAULT_MAX_SPREAD_PCT,
     max_order_usd: float = DEFAULT_MAX_ORDER_USD,
 ) -> tuple[OrderPlan | None, str]:
@@ -125,18 +127,18 @@ def plan(
     отказ, и когда согласие: по ней потом видно, чем бот руководствовался, без
     раскопок в коде.
 
-    volume_per_day=None означает «не знаем», и это НЕ то же самое, что ноль.
+    volume_per_week=None означает «не знаем», и это НЕ то же самое, что ноль.
     Неизвестное отсеиваем — на деньгах домысливать нельзя, — но говорим об этом
     отдельной причиной.
     """
     if steam_price_cents <= 0:
         return None, "нет цены Steam — сравнивать не с чем"
 
-    if volume_per_day is None:
+    if volume_per_week is None:
         return None, "объём продаж неизвестен — на деньгах не гадаем"
-    if volume_per_day < min_volume_per_day:
+    if volume_per_week < min_volume_per_week:
         return None, (
-            f"продаётся {volume_per_day} шт/сутки при пороге {min_volume_per_day} — "
+            f"продаётся {volume_per_week} шт/нед при пороге {min_volume_per_week} — "
             "выйти обратно будет не у кого"
         )
 

@@ -152,6 +152,8 @@ from storage import (
     get_market_settings,
     set_market_setting,
     get_dips_settings,
+    get_order_settings,
+    set_order_setting,
     set_dips_setting,
     get_price_history,
     redis_call_total,
@@ -6609,6 +6611,110 @@ async def _order_candidates_from_dips(chat_id: int) -> list[_OrderCandidate]:
     return out
 
 
+def _order_arg(raw: str, *, integer: bool = False):
+    """
+    Разобрать одно значение настройки. Прочерк — «не менять», как в /markets.
+
+    Возвращает (значение, менять_ли). Ноль прочерку не равнозначен: ноль может
+    быть осмысленной настройкой, а прочерк — это прямо сказанное «оставь как
+    было».
+    """
+    if raw in ("-", "—", "_"):
+        return None, False
+    value = float(raw.replace(",", "."))
+    return (int(value) if integer else value), True
+
+
+async def setorders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /setorders <прибыль%> <шт/нед> <мин$> <макс$> — все пороги ордеров разом.
+
+    Одной командой, потому что порознь их крутить бессмысленно: прибыль,
+    ликвидность и диапазон цены задают одну картину, и менять их надо вместе,
+    видя все четыре числа сразу.
+
+    Ликвидность недельная — теми же единицами, что и в /dips. Две команды с
+    разными единицами однажды обязательно сравнят друг с другом.
+    """
+    chat_id = update.effective_chat.id
+    saved = await get_order_settings(chat_id)
+
+    def _now(key, default):
+        value = saved.get(key)
+        return default if value is None else value
+
+    profit = _now("min_profit", buy_orders.DEFAULT_MIN_PROFIT_PCT)
+    volume = _now("min_week_volume", buy_orders.DEFAULT_MIN_VOLUME_PER_WEEK)
+    low = _now("min_price", 0.0)
+    high = _now("max_price", buy_orders.DEFAULT_MAX_ORDER_USD)
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "<b>Пороги ордеров</b>\n"
+            f"• прибыль от <b>{profit:g}%</b> (после комиссии Steam)\n"
+            f"• продаётся от <b>{volume:g} шт/нед</b>\n"
+            f"• цена предмета <b>${low:g}–${high:g}</b>\n\n"
+            "Задать всё разом: <code>/setorders 25 20 5 300</code>\n"
+            "Оставить прежним — прочерк: <code>/setorders 25 - - 300</code>\n\n"
+            "Верхняя граница — заодно потолок на один ордер.\n"
+            "Что бот поставил бы: /orders (сухой прогон)",
+            parse_mode="HTML",
+        )
+        return
+
+    if len(args) != 4:
+        await update.message.reply_text(
+            "Нужно четыре значения: прибыль%, шт/нед, мин$, макс$\n"
+            "Например: /setorders 25 20 5 300\n"
+            "Прочерк оставляет значение прежним: /setorders 25 - - 300"
+        )
+        return
+
+    try:
+        new_profit, set_profit = _order_arg(args[0])
+        new_volume, set_volume = _order_arg(args[1], integer=True)
+        new_low, set_low = _order_arg(args[2])
+        new_high, set_high = _order_arg(args[3])
+    except ValueError:
+        await update.message.reply_text(
+            "Не разобрал числа. Пример: /setorders 25 20 5 300"
+        )
+        return
+
+    final_low = new_low if set_low else low
+    final_high = new_high if set_high else high
+    if final_high <= final_low:
+        await update.message.reply_text(
+            f"Верхняя граница (${final_high:g}) должна быть больше нижней "
+            f"(${final_low:g}) — иначе под диапазон не попадёт ни один предмет."
+        )
+        return
+    if set_profit and new_profit <= 0:
+        await update.message.reply_text(
+            "Прибыль должна быть больше нуля: ордер без маржи не нужен."
+        )
+        return
+
+    if set_profit:
+        await set_order_setting(chat_id, "min_profit", new_profit)
+    if set_volume:
+        await set_order_setting(chat_id, "min_week_volume", new_volume)
+    if set_low:
+        await set_order_setting(chat_id, "min_price", new_low)
+    if set_high:
+        await set_order_setting(chat_id, "max_price", new_high)
+
+    await update.message.reply_text(
+        "<b>Пороги ордеров обновлены</b>\n"
+        f"• прибыль от <b>{(new_profit if set_profit else profit):g}%</b>\n"
+        f"• продаётся от <b>{(new_volume if set_volume else volume):g} шт/нед</b>\n"
+        f"• цена предмета <b>${final_low:g}–${final_high:g}</b>\n\n"
+        "Проверить на живом рынке: /orders",
+        parse_mode="HTML",
+    )
+
+
 async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /orders — СУХОЙ ПРОГОН: какие ордера на покупку бот поставил бы сейчас.
@@ -6623,6 +6729,15 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     лишний запрос, поэтому ищем только для тех, кто дошёл до стакана.
     """
     chat_id = update.effective_chat.id
+    saved = await get_order_settings(chat_id)
+    limits = {
+        "profit": saved.get("min_profit") or buy_orders.DEFAULT_MIN_PROFIT_PCT,
+        "volume": (saved.get("min_week_volume")
+                   if saved.get("min_week_volume") is not None
+                   else buy_orders.DEFAULT_MIN_VOLUME_PER_WEEK),
+        "low": saved.get("min_price") or 0.0,
+        "high": saved.get("max_price") or buy_orders.DEFAULT_MAX_ORDER_USD,
+    }
     await update.message.reply_text(
         "Сухой прогон ордеров: смотрю арбитраж и просадки, читаю стаканы…\n"
         "Ничего не покупаю и не ставлю."
@@ -6649,7 +6764,16 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         seen = best.get(cand.market_hash_name)
         if seen is None or cand.steam_price_cents > seen.steam_price_cents:
             best[cand.market_hash_name] = cand
-    ranked = sorted(best.values(), key=lambda c: -c.steam_price_cents)[:ORDERS_PROBE_LIMIT]
+    # Диапазон цены применяем ДО чтения стаканов: каждый стакан стоит запроса,
+    # и тратить их на предметы, заведомо выпадающие из диапазона, незачем.
+    # Верхнюю границу берём с запасом вдвое: предмет дороже потолка ордера ещё
+    # может пройти — ордер-то ставится ниже, — а вот дешевле нижней границы уже
+    # нет смысла считать.
+    in_range = [
+        c for c in best.values()
+        if c.steam_price_cents >= limits["low"] * 100
+    ]
+    ranked = sorted(in_range, key=lambda c: -c.steam_price_cents)[:ORDERS_PROBE_LIMIT]
 
     plans: list[tuple[_OrderCandidate, buy_orders.OrderPlan]] = []
     refused: list[tuple[str, str]] = []
@@ -6670,12 +6794,20 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 listing_id = lots[0].listing_id
 
             rivals = await csfloat_client.buy_orders_for(session, listing_id)
+            # Объём у нас суточный (окно last_24h прайс-листа), а порог
+            # недельный — переводим тем же способом, что и /dips.
+            weekly = (
+                None if cand.volume_per_day is None else cand.volume_per_day * 7
+            )
             plan, why = buy_orders.plan(
                 cand.market_hash_name,
                 steam_price_cents=cand.steam_price_cents,
-                volume_per_day=cand.volume_per_day,
+                volume_per_week=weekly,
                 spread_pct=cand.spread_pct,
                 rival_orders_cents=rivals,
+                min_profit_pct=limits["profit"],
+                min_volume_per_week=limits["volume"],
+                max_order_usd=limits["high"],
             )
             if plan is None:
                 refused.append((cand.market_hash_name, why))
@@ -6709,10 +6841,10 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines.append("")
     lines.append(
-        f"Пороги: прибыль от {buy_orders.DEFAULT_MIN_PROFIT_PCT:g}%, "
-        f"продаж от {buy_orders.DEFAULT_MIN_VOLUME_PER_DAY}/сутки, "
-        f"разброс до {buy_orders.DEFAULT_MAX_SPREAD_PCT:g}%, "
-        f"потолок ордера ${buy_orders.DEFAULT_MAX_ORDER_USD:g}"
+        f"Пороги: прибыль от {limits['profit']:g}%, "
+        f"продаж от {limits['volume']:g} шт/нед, "
+        f"цена ${limits['low']:g}–${limits['high']:g}, "
+        f"разброс до {buy_orders.DEFAULT_MAX_SPREAD_PCT:g}%. Менять: /setorders"
     )
     await update.message.reply_text(
         scan_errors.scrub("\n".join(lines)), parse_mode="HTML",
@@ -8758,6 +8890,15 @@ COMMANDS: tuple[Command, ...] = (
         "/setarb сброс — снять кулдаун CSFloat\n"
         "/setarb off — выключить\n"
         "Остальные пороги арбитража — /start → Пороги → Арбитраж.",
+    ),
+    Command(
+        "setorders", setorders, "Пороги ордеров",
+        "Прибыль, ликвидность и диапазон цены",
+        "/setorders — показать текущие пороги\n"
+        "/setorders <прибыль%> <шт/нед> <мин$> <макс$> — задать всё разом, "
+        "например /setorders 25 20 5 300\n"
+        "Прочерк оставляет значение прежним: /setorders 25 - - 300\n"
+        "Верхняя граница диапазона — заодно потолок на один ордер.",
     ),
     Command(
         "orders", orders_cmd, "Сухой прогон ордеров",
