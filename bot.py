@@ -2738,8 +2738,13 @@ async def _run_watchlist_scan(
                         sticker_prices_before, pricing.sticker_price_totals()
                     )
 
+                    # Подсказка только когда порог ДЕЙСТВИТЕЛЬНО не пустил:
+                    # лучшая наценка выше него, но не в разы. Без нижней
+                    # границы она срабатывала и на удачных прогонах и писала
+                    # «не хватило -2 п.п.» при лучшей наценке 0% и пороге 2% —
+                    # то есть жаловалась на порог, который лот прошёл.
                     ceiling = limits.get("наценка до %")
-                    if best is not None and ceiling and best <= ceiling * 2:
+                    if best is not None and ceiling and ceiling < best <= ceiling * 2:
                         log.info(
                             "watchlist: до находок не хватило %.0f п.п. — лучший лот "
                             "просил %.0f%% наценки при пороге %g%%. Это настройка, "
