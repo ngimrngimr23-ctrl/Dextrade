@@ -6532,7 +6532,28 @@ class _OrderCandidate(NamedTuple):
 
 
 async def _order_candidates_from_arb(chat_id: int) -> list[_OrderCandidate]:
-    """Кандидаты из широкого скана CSFloat — те же, что идут в /arbnow."""
+    """
+    Кандидаты из широкого скана CSFloat — те же, что идут в /arbnow.
+
+    Прогон тяжёлый: тридцать запросов к CSFloat при квоте 200 в час, которую
+    уже выбирает автоскан арбитража. Поэтому сначала смотрим, есть ли вообще
+    куда идти: при мёртвом пуле и кулдауне скан не даст ничего, кроме минуты
+    ожидания и сотни отказов в логе. 2026-09-15 так и вышло — шлюз отказывал
+    целиком, а команда молча стояла.
+    """
+    cooldown = csfloat_client.cooldown_remaining()
+    if cooldown > 0:
+        raise CSFloatRateLimited(
+            f"CSFloat на кулдауне ещё {cooldown / 60:.0f} мин — широкий скан "
+            "пропускаю, кандидаты будут только из просадок"
+        )
+    pool = csfloat_client.CSFLOAT_POOL
+    if pool.enabled() and not pool.available():
+        raise CSFloatError(
+            f"все прокси CSFloat недоступны ({pool.describe()}) — широкий скан "
+            "пропускаю, кандидаты будут только из просадок"
+        )
+
     settings = await get_arb_settings(chat_id)
     listings = await csfloat_client.fetch_market_wide(
         target=ARB_TARGET_LISTINGS, sort_by=ARB_SORT_BY,
@@ -6743,15 +6764,28 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Ничего не покупаю и не ставлю."
     )
 
+    log.info("orders: chat_id=%s сухой прогон начат, пороги %s", chat_id, limits)
+
+    from_arb = from_dips = 0
     try:
         candidates = await _order_candidates_from_arb(chat_id)
+        from_arb = len(candidates)
     except (CSFloatRateLimited, CSFloatError) as e:
-        await update.message.reply_text(f"⚠️ Арбитраж не дал кандидатов: {e}")
+        log.info("orders: арбитраж пропущен — %s", scan_errors.scrub(str(e)))
+        await update.message.reply_text(f"⚠️ {scan_errors.scrub(str(e))}")
         candidates = []
     try:
-        candidates += await _order_candidates_from_dips(chat_id)
+        dips_found = await _order_candidates_from_dips(chat_id)
+        from_dips = len(dips_found)
+        candidates += dips_found
     except Exception as e:  # noqa: BLE001 — один источник не должен ронять другой
         log.warning("orders: просадки не дали кандидатов: %s", e)
+        await update.message.reply_text(f"⚠️ Просадки не дали кандидатов: {e}")
+
+    log.info(
+        "orders: chat_id=%s кандидатов — арбитраж %d, просадки %d",
+        chat_id, from_arb, from_dips,
+    )
 
     if not candidates:
         await update.message.reply_text("Кандидатов нет — ни в арбитраже, ни в просадках.")
@@ -6839,8 +6873,13 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(refused) > 6:
             lines.append(f"…и ещё {len(refused) - 6}")
 
+    log.info(
+        "orders: chat_id=%s итог — планов %d, отказов %d",
+        chat_id, len(plans), len(refused),
+    )
     lines.append("")
     lines.append(
+        f"Кандидатов: арбитраж {from_arb}, просадки {from_dips}. "
         f"Пороги: прибыль от {limits['profit']:g}%, "
         f"продаж от {limits['volume']:g} шт/нед, "
         f"цена ${limits['low']:g}–${limits['high']:g}, "
