@@ -990,8 +990,17 @@ async def get_sticker_prices(sticker_keys: set[str]) -> dict[str, float]:
     for key in keys_list:
         cached = cached_map.get(key)
         if cached and (now - cached["updated_at"]) < CACHE_TTL_SECONDS:
-            result[key] = cached["price"]
-            _tally("из кэша")
+            if cached["price"] > 0:
+                result[key] = cached["price"]
+                _tally("из кэша")
+            else:
+                # Ноль в кэше — след недоступности Steam, а не цена. Считать
+                # его ценой значит на 12 часов объявить наклейку бесплатной, а
+                # лот с ней — «без цен на стикеры». Перезапрашиваем: источник
+                # мог уже освободиться. Это же чинит уже отравленный кэш —
+                # ждать истечения CACHE_TTL не приходится.
+                _tally("ноль в кэше (перезапрашиваю)")
+                to_fetch.append(key)
         else:
             to_fetch.append(key)
 

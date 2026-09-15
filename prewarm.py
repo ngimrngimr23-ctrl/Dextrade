@@ -73,6 +73,7 @@ async def _prewarm_once():
         return
 
     log.info("prewarm: обновляю %d стикер(ов)", len(stale_keys))
+    zeros = 0
     overrides = _load_overrides()
     catalog = await get_catalog()
 
@@ -80,10 +81,33 @@ async def _prewarm_once():
         for key in stale_keys:
             try:
                 matched_name, price = await _fetch_one_price(session, key, overrides, catalog)
-                await set_price(key, matched_name, price, CACHE_TTL_SECONDS)
+                # Ноль — это НЕ цена, а «узнать не удалось». _fetch_one_price
+                # честно предупреждает в докстринге: «по старому контракту
+                # всегда возвращаем число, 0.0 в худшем случае», и худший
+                # случай наступает всякий раз, когда Steam недоступен.
+                #
+                # Кэширование этого нуля на 12 часов и убило находки. Цепочка
+                # (разобрана 2026-09-15): Steam в бане -> _fetch_one_price
+                # возвращает 0.0 -> prewarm кладёт 0.0 в кэш на CACHE_TTL ->
+                # get_sticker_prices находит ключ в кэше и отдаёт ноль ->
+                # stickers_value суммируется в РОВНО ноль -> лот уходит в «цен
+                # на стикеры нет» -> находок нет вовсе. В логе это выглядело
+                # как покрытие 99%: кэш-то полон, просто нулями.
+                if price > 0:
+                    await set_price(key, matched_name, price, CACHE_TTL_SECONDS)
+                else:
+                    zeros += 1
             except Exception:
                 log.exception("prewarm: не смог обновить %s", key)
             await asyncio.sleep(REQUEST_DELAY)
+
+    if zeros:
+        log.warning(
+            "prewarm: у %d из %d стикеров цену узнать не удалось — в кэш НЕ кладу. "
+            "Обычно это значит, что Steam недоступен: цены подтянутся, когда он "
+            "освободится",
+            zeros, len(stale_keys),
+        )
 
 
 async def prewarm_loop():
