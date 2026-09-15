@@ -1284,6 +1284,50 @@ class _BandRun:
         return f"${lo}-{hi}"
 
 
+async def buy_orders_for(
+    session: aiohttp.ClientSession, listing_id: str, *, limit: int = 20
+) -> list[int]:
+    """
+    Стакан чужих ордеров на покупку по этому лоту. Цены в ЦЕНТАХ, как отдаёт API.
+
+    Ручка недокументирована: в официальном репозитории csfloat/docs описаны
+    только GET /listings, GET /listings/<id> и POST /listings. Но она отвечает —
+    проверено /csfloatapi на живом ключе, — и без неё нельзя узнать главное:
+    какую цену надо перебить, чтобы наш ордер стоял первым.
+
+    Отсутствие стакана НЕ ошибка: у предмета может не быть ни одного ордера, и
+    это как раз лучший случай. Поэтому на любой сбой возвращаем пустой список —
+    планировщик поймёт его как «соперников нет» и предложит свой потолок.
+    """
+    url, params = _build_request(
+        f"/listings/{listing_id}/buy-orders", {"limit": str(limit)}
+    )
+    proxy = CSFLOAT_POOL.next() if CSFLOAT_POOL.enabled() else None
+    try:
+        async with session.get(
+            url, params=params, proxy=proxy,
+            headers={**_API_HEADERS, "Authorization": CSFLOAT_API_KEY},
+        ) as resp:
+            if resp.status != 200:
+                log.info(
+                    "csfloat: стакан по лоту %s — HTTP %s, считаю что ордеров нет",
+                    listing_id, resp.status,
+                )
+                return []
+            data = await resp.json(content_type=None)
+    except Exception as e:  # noqa: BLE001 — пустой стакан безопаснее отказа
+        log.info("csfloat: стакан по лоту %s не получен (%s)", listing_id, scrub(str(e)))
+        return []
+
+    rows = data.get("orders", data) if isinstance(data, dict) else data
+    out: list[int] = []
+    for row in rows or []:
+        price = row.get("price") if isinstance(row, dict) else None
+        if isinstance(price, (int, float)) and price > 0:
+            out.append(int(price))
+    return out
+
+
 async def fetch_market_wide(
     *,
     target: int,

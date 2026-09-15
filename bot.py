@@ -47,6 +47,7 @@ import io
 import json
 import logging
 import envcfg
+import buy_orders
 import price_ruler
 import os
 import re
@@ -6509,6 +6510,216 @@ async def reset_cooldowns(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+# Сколько кандидатов доводить до стакана за один сухой прогон.
+#
+# Каждый стоит запроса к CSFloat (а кандидат из /dips — двух: сначала найти лот
+# по имени, потом прочитать его стакан), а квота там 200 в час на ключ и её уже
+# выбирает арбитраж. Десяток хватает, чтобы увидеть картину, и не ломает скан.
+ORDERS_PROBE_LIMIT = envcfg.env_int("ORDERS_PROBE_LIMIT", 10)
+
+
+class _OrderCandidate(NamedTuple):
+    """Предмет, на который стоило бы поставить ордер. Цены в центах."""
+
+    market_hash_name: str
+    listing_id: str | None     # у находок /dips его нет, придётся искать
+    steam_price_cents: int
+    volume_per_day: int | None
+    spread_pct: float | None
+    source: str                # откуда пришёл — арбитраж или просадки
+
+
+async def _order_candidates_from_arb(chat_id: int) -> list[_OrderCandidate]:
+    """Кандидаты из широкого скана CSFloat — те же, что идут в /arbnow."""
+    settings = await get_arb_settings(chat_id)
+    listings = await csfloat_client.fetch_market_wide(
+        target=ARB_TARGET_LISTINGS, sort_by=ARB_SORT_BY,
+        min_price=settings["min_price"], max_price=settings["max_price"],
+    )
+    await _fill_steam_prices(listings)
+    # Разброс окон живёт на лоте, а не на оффере — забираем по имени.
+    spread_by_name = {
+        l.market_hash_name: l.steam_price_spread_pct for l in listings
+    }
+    offers = find_arbitrage_offers(
+        listings,
+        min_discount_pct=max(0.0, settings["min_discount"] - ARB_PREFILTER_MARGIN_PCT),
+        min_price=settings["min_price"], max_price=settings["max_price"],
+        min_steam_volume=settings["min_volume"],
+        sticker_max_markup_pct=settings["sticker_markup"],
+    )
+    return [
+        _OrderCandidate(
+            market_hash_name=o.market_hash_name,
+            listing_id=o.listing_id,
+            steam_price_cents=int(round((o.steam_price or 0) * 100)),
+            volume_per_day=o.steam_volume,
+            spread_pct=spread_by_name.get(o.market_hash_name),
+            source="арбитраж",
+        )
+        for o in offers
+    ]
+
+
+async def _order_candidates_from_dips(chat_id: int) -> list[_OrderCandidate]:
+    """
+    Кандидаты из /dips — предметы, просевшие ниже своей нормы.
+
+    Лота на CSFloat у них нет: просадка считается по Steam. Поэтому listing_id
+    оставляем пустым, а искать его будем только для тех, кто дошёл до стакана —
+    иначе один прогон съел бы сотню запросов на предметы, которые всё равно
+    отсеются по ликвидности.
+    """
+    saved = await get_dips_settings(chat_id)
+    details = await get_csgotrader_price_details()
+    if not details:
+        return []
+
+    def _setting(key, default=None):
+        value = saved.get(key)
+        return default if value is None else value
+
+    found, _dropped = dips.find_dips(
+        details,
+        min_drop_pct=_setting("min_drop", DIPS_DEFAULT_DROP),
+        min_price=_setting("min_price", dips.MIN_PRICE),
+        max_price=saved.get("max_price"),
+    )
+    if not found:
+        return []
+
+    names = [d.market_hash_name for d in found[:ORDERS_PROBE_LIMIT * 2]]
+    quotes = await _live_prices_for(chat_id, names, max_age=DIPS_MAX_QUOTE_AGE)
+
+    out: list[_OrderCandidate] = []
+    for dip in found[:ORDERS_PROBE_LIMIT * 2]:
+        quote = quotes.get(dip.market_hash_name)
+        if quote is None or not quote.ask:
+            continue
+        found_price = details.get(dip.market_hash_name)
+        out.append(_OrderCandidate(
+            market_hash_name=dip.market_hash_name,
+            listing_id=None,
+            # Продавать будем в Steam по низу стакана — от него и считаем.
+            steam_price_cents=int(round(quote.ask * 100)),
+            volume_per_day=quote.volume,
+            spread_pct=getattr(found_price, "recent_spread_pct", None),
+            source="просадка",
+        ))
+    return out
+
+
+async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /orders — СУХОЙ ПРОГОН: какие ордера на покупку бот поставил бы сейчас.
+
+    Ничего не отправляет в CSFloat и ничего не тратит: только читает стаканы и
+    считает. Отправки ордеров в коде нет вовсе — она появится отдельно и после
+    того, как сухой прогон покажет вменяемые числа на живом рынке.
+
+    Кандидаты берутся из двух источников сразу: широкий скан арбитража (лоты,
+    которые дешевле Steam прямо сейчас) и /dips (предметы, просевшие ниже своей
+    нормы). У первых уже есть лот на CSFloat, у вторых его надо найти — это
+    лишний запрос, поэтому ищем только для тех, кто дошёл до стакана.
+    """
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(
+        "Сухой прогон ордеров: смотрю арбитраж и просадки, читаю стаканы…\n"
+        "Ничего не покупаю и не ставлю."
+    )
+
+    try:
+        candidates = await _order_candidates_from_arb(chat_id)
+    except (CSFloatRateLimited, CSFloatError) as e:
+        await update.message.reply_text(f"⚠️ Арбитраж не дал кандидатов: {e}")
+        candidates = []
+    try:
+        candidates += await _order_candidates_from_dips(chat_id)
+    except Exception as e:  # noqa: BLE001 — один источник не должен ронять другой
+        log.warning("orders: просадки не дали кандидатов: %s", e)
+
+    if not candidates:
+        await update.message.reply_text("Кандидатов нет — ни в арбитраже, ни в просадках.")
+        return
+
+    # Один предмет мог прийти из обоих источников — оставляем дороже, по нему и
+    # прибыль считается щедрее.
+    best: dict[str, _OrderCandidate] = {}
+    for cand in candidates:
+        seen = best.get(cand.market_hash_name)
+        if seen is None or cand.steam_price_cents > seen.steam_price_cents:
+            best[cand.market_hash_name] = cand
+    ranked = sorted(best.values(), key=lambda c: -c.steam_price_cents)[:ORDERS_PROBE_LIMIT]
+
+    plans: list[tuple[_OrderCandidate, buy_orders.OrderPlan]] = []
+    refused: list[tuple[str, str]] = []
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+        for cand in ranked:
+            listing_id = cand.listing_id
+            if listing_id is None:
+                try:
+                    lots, _ = await csfloat_client.fetch_listings_page(
+                        session, limit=1, market_hash_name=cand.market_hash_name,
+                    )
+                except (CSFloatRateLimited, CSFloatError) as e:
+                    refused.append((cand.market_hash_name, f"лот не найден: {e}"))
+                    continue
+                if not lots:
+                    refused.append((cand.market_hash_name, "на CSFloat лотов нет"))
+                    continue
+                listing_id = lots[0].listing_id
+
+            rivals = await csfloat_client.buy_orders_for(session, listing_id)
+            plan, why = buy_orders.plan(
+                cand.market_hash_name,
+                steam_price_cents=cand.steam_price_cents,
+                volume_per_day=cand.volume_per_day,
+                spread_pct=cand.spread_pct,
+                rival_orders_cents=rivals,
+            )
+            if plan is None:
+                refused.append((cand.market_hash_name, why))
+            else:
+                plans.append((cand, plan))
+
+    lines = ["<b>Сухой прогон ордеров</b> — ничего не поставлено", ""]
+    if plans:
+        for cand, plan in sorted(plans, key=lambda x: -x[1].profit_pct):
+            rival = (f"перебиваем ${plan.rival_cents / 100:.2f}"
+                     if plan.rival_cents is not None else "стакан пуст")
+            lines.append(
+                f"• <code>{html_module.escape(plan.market_hash_name)}</code> "
+                f"({cand.source})"
+            )
+            lines.append(
+                f"  ордер <b>${plan.price_cents / 100:.2f}</b> · "
+                f"Steam ${plan.steam_price_cents / 100:.2f} · "
+                f"прибыль <b>{plan.profit_pct:.0f}%</b> · {rival}"
+            )
+    else:
+        lines.append("Ни одного ордера не поставил бы.")
+
+    if refused:
+        lines.append("")
+        lines.append(f"<b>Отказы ({len(refused)}):</b>")
+        for name, why in refused[:6]:
+            lines.append(f"• {html_module.escape(name)} — {html_module.escape(why)}")
+        if len(refused) > 6:
+            lines.append(f"…и ещё {len(refused) - 6}")
+
+    lines.append("")
+    lines.append(
+        f"Пороги: прибыль от {buy_orders.DEFAULT_MIN_PROFIT_PCT:g}%, "
+        f"продаж от {buy_orders.DEFAULT_MIN_VOLUME_PER_DAY}/сутки, "
+        f"разброс до {buy_orders.DEFAULT_MAX_SPREAD_PCT:g}%, "
+        f"потолок ордера ${buy_orders.DEFAULT_MAX_ORDER_USD:g}"
+    )
+    await update.message.reply_text(
+        scan_errors.scrub("\n".join(lines)), parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
 async def csfloatapi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /csfloatapi — что из API CSFloat доступно нашему ключу.
@@ -8547,6 +8758,15 @@ COMMANDS: tuple[Command, ...] = (
         "/setarb сброс — снять кулдаун CSFloat\n"
         "/setarb off — выключить\n"
         "Остальные пороги арбитража — /start → Пороги → Арбитраж.",
+    ),
+    Command(
+        "orders", orders_cmd, "Сухой прогон ордеров",
+        "Какие ордера бот поставил бы сейчас",
+        "/orders — СУХОЙ ПРОГОН. Показывает, какие ордера на покупку бот поставил "
+        "бы прямо сейчас: кандидаты из широкого скана арбитража и из просадок "
+        "(/dips), цена подбирается на цент выше верхнего чужого ордера, но не "
+        "дороже потолка прибыли.\n"
+        "Ничего не покупает и не ставит — отправки ордеров в коде пока нет вовсе.",
     ),
     Command(
         "csfloatapi", csfloatapi, "Что доступно ключу CSFloat",
