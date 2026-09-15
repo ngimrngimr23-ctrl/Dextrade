@@ -2256,6 +2256,45 @@ _TEMPORARY_MARKERS = (
 )
 
 
+def _log_sticker_coverage(before: dict, after: dict) -> None:
+    """
+    Откуда брались цены стикеров за прогон — и где потерялись.
+
+    Отдельной функцией, а не куском внутри _run_watchlist_scan, по причине из
+    практики: в первой версии этот расчёт жил там же и завёл локальную
+    переменную `got`, которым в той же функции уже назывался словарь со
+    статистикой разбора. Число затёрло словарь, и следующая же строка
+    `got["listings"]` уронила /scan с «'int' object is not subscriptable».
+    Сводка в этой функции разрослась за сессию до полусотни строк, и отдельная
+    область видимости у каждого куска — единственная защита от повторения.
+
+    Само число нужно затем, что «цен на стикеры нет 9728» не отвечает на
+    главный вопрос: цены нет, потому что наклейка даром, или потому что мы её
+    не нашли. Покрытие отвечает.
+    """
+    delta = {k: after[k] - before.get(k, 0) for k in after}
+    delta = {k: v for k, v in delta.items() if v}
+    if not delta:
+        return
+
+    asked = delta.get("запрошено", 0)
+    priced = delta.get("из кэша", 0) + delta.get("из прайс-листа", 0)
+    log.info(
+        "watchlist: цены стикеров — %s. Покрытие %s",
+        ", ".join(f"{k} {v}" for k, v in delta.items()),
+        f"{priced / asked * 100:.0f}% ({priced} из {asked})" if asked else "—",
+    )
+
+    lost = delta.get("каталог не сопоставил", 0)
+    if asked and lost > asked * 0.2:
+        log.warning(
+            "watchlist: каталог стикеров не сопоставил %d ключ(ей) из %d — по ним "
+            "цена НЕ ИЩЕТСЯ вовсе, и лоты с такими стикерами уходят в «цен на "
+            "стикеры нет». Это не порог, это дыра в каталоге",
+            lost, asked,
+        )
+
+
 def _looks_temporary(exc: BaseException) -> bool:
     text = f"{type(exc).__name__} {exc}".lower()
     return any(marker in text for marker in _TEMPORARY_MARKERS)
@@ -2695,32 +2734,9 @@ async def _run_watchlist_scan(
                     # порог отстоит от рынка на считанные проценты. Пока это
                     # приходилось высчитывать в уме, «ничего не нашлось»
                     # читалось как поломка.
-                    # Откуда брались цены стикеров. Без этого «цен на стикеры
-                    # нет 9728» не отвечает на главный вопрос — цены нет,
-                    # потому что стикер даром, или потому что мы её не нашли.
-                    sp_after = pricing.sticker_price_totals()
-                    sp = {
-                        k: sp_after[k] - sticker_prices_before.get(k, 0)
-                        for k in sp_after
-                    }
-                    sp = {k: v for k, v in sp.items() if v}
-                    if sp:
-                        asked = sp.get("запрошено", 0)
-                        got = sp.get("из кэша", 0) + sp.get("из прайс-листа", 0)
-                        log.info(
-                            "watchlist: цены стикеров — %s. Покрытие %s",
-                            ", ".join(f"{k} {v}" for k, v in sp.items()),
-                            f"{got / asked * 100:.0f}% ({got} из {asked})" if asked else "—",
-                        )
-                        lost = sp.get("каталог не сопоставил", 0)
-                        if asked and lost > asked * 0.2:
-                            log.warning(
-                                "watchlist: каталог стикеров не сопоставил %d ключ(ей) "
-                                "из %d — по ним цена НЕ ИЩЕТСЯ вовсе, и лоты с такими "
-                                "стикерами уходят в «цен на стикеры нет». Это не порог, "
-                                "это дыра в каталоге",
-                                lost, asked,
-                            )
+                    _log_sticker_coverage(
+                        sticker_prices_before, pricing.sticker_price_totals()
+                    )
 
                     ceiling = limits.get("наценка до %")
                     if best is not None and ceiling and best <= ceiling * 2:
