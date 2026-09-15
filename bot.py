@@ -2490,6 +2490,7 @@ async def _run_watchlist_scan(
         lanes_before = steam_lane_totals()
         parse_before = steam_parse_totals()
         drops_before = analyzer.offer_drops()
+        sticker_prices_before = pricing.sticker_price_totals()
         take_lock_wait()  # обнуляем счётчик очереди на полосу перед прогоном
 
         queue: asyncio.Queue = asyncio.Queue()
@@ -2694,6 +2695,33 @@ async def _run_watchlist_scan(
                     # порог отстоит от рынка на считанные проценты. Пока это
                     # приходилось высчитывать в уме, «ничего не нашлось»
                     # читалось как поломка.
+                    # Откуда брались цены стикеров. Без этого «цен на стикеры
+                    # нет 9728» не отвечает на главный вопрос — цены нет,
+                    # потому что стикер даром, или потому что мы её не нашли.
+                    sp_after = pricing.sticker_price_totals()
+                    sp = {
+                        k: sp_after[k] - sticker_prices_before.get(k, 0)
+                        for k in sp_after
+                    }
+                    sp = {k: v for k, v in sp.items() if v}
+                    if sp:
+                        asked = sp.get("запрошено", 0)
+                        got = sp.get("из кэша", 0) + sp.get("из прайс-листа", 0)
+                        log.info(
+                            "watchlist: цены стикеров — %s. Покрытие %s",
+                            ", ".join(f"{k} {v}" for k, v in sp.items()),
+                            f"{got / asked * 100:.0f}% ({got} из {asked})" if asked else "—",
+                        )
+                        lost = sp.get("каталог не сопоставил", 0)
+                        if asked and lost > asked * 0.2:
+                            log.warning(
+                                "watchlist: каталог стикеров не сопоставил %d ключ(ей) "
+                                "из %d — по ним цена НЕ ИЩЕТСЯ вовсе, и лоты с такими "
+                                "стикерами уходят в «цен на стикеры нет». Это не порог, "
+                                "это дыра в каталоге",
+                                lost, asked,
+                            )
+
                     ceiling = limits.get("наценка до %")
                     if best is not None and ceiling and best <= ceiling * 2:
                         log.info(

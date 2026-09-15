@@ -928,6 +928,35 @@ async def _fetch_one_price(session: aiohttp.ClientSession, key: str, overrides: 
 # обработка вручную присланного Steam-JSON в bot-16.handle_document) не трогаем.
 # ---------------------------------------------------------------------------
 
+# Откуда взялись (или не взялись) цены стикеров за прогон.
+#
+# Зачем. find_offers считает stickers_value через sticker_prices.get(s, 0.0), и
+# ключ без цены МОЛЧА становится нулём — лот уходит в «цен на стикеры нет» и до
+# порогов не доживает. Прогон 2026-09-15: 9728 лотов с нулём и всего 74 в
+# диапазоне $0-3. Так не бывает при работающих ценах: обычные стикеры стоят
+# центы, их должны быть тысячи в этом промежутке. Значит цены не находятся, а
+# по логу было не понять, на каком шаге.
+#
+# Шагов три, и они ломаются по-разному:
+#   catalog_miss — каталог не сопоставил код точному market_hash_name. Такой
+#                  ключ в прайс-листе даже НЕ ИЩЕТСЯ (см. is_exact ниже), то
+#                  есть теряется до всякой сети. Лечится каталогом.
+#   pricelist_miss — имя нашли, а цены в csgotrader.app по нему нет. Лечится
+#                  prewarm'ом (или ручным прайс-листом).
+# Прежний лог валил оба в одну строку «не нашлись в прайс-листе», хотя во
+# втором случае искали, а в первом — нет.
+_sticker_price_totals: dict[str, int] = {}
+
+
+def sticker_price_totals() -> dict[str, int]:
+    """Откуда брались цены стикеров. Накапливается по прогону."""
+    return dict(_sticker_price_totals)
+
+
+def _tally(field: str, n: int = 1) -> None:
+    _sticker_price_totals[field] = _sticker_price_totals.get(field, 0) + n
+
+
 async def get_sticker_prices(sticker_keys: set[str]) -> dict[str, float]:
     """
     На входе — множество ключей вида 'paris2023:sig_dupreeh_champion'.
@@ -948,11 +977,21 @@ async def get_sticker_prices(sticker_keys: set[str]) -> dict[str, float]:
     # отдельного HTTP-похода в Upstash на каждый стикер по очереди —
     # на лоте с десятками стикеров это раньше было главной причиной паузы.
     keys_list = list(sticker_keys)
+    _tally("запрошено", len(keys_list))
+    if not catalog:
+        # Каталог пуст — сопоставить не удастся НИ ОДИН ключ, и весь стикерный
+        # отбор обнулится молча. Раньше об этом не было ни слова: get_catalog()
+        # при неудачной загрузке возвращает {} без единой строки в лог.
+        log.warning(
+            "get_sticker_prices: каталог стикеров ПУСТ — ни один код не будет "
+            "сопоставлен имени, цены не найдутся ни у одного лота"
+        )
     cached_map = await get_prices_batch(keys_list)
     for key in keys_list:
         cached = cached_map.get(key)
         if cached and (now - cached["updated_at"]) < CACHE_TTL_SECONDS:
             result[key] = cached["price"]
+            _tally("из кэша")
         else:
             to_fetch.append(key)
 
@@ -1000,7 +1039,11 @@ async def get_sticker_prices(sticker_keys: set[str]) -> dict[str, float]:
         if ct_price is not None:
             ct_hits.append((key, name_or_query, ct_price, CACHE_TTL_SECONDS))
             result[key] = ct_price
+            _tally("из прайс-листа")
         else:
+            # Разводим два разных «нет цены»: имя не сопоставлено каталогом
+            # (в прайс-листе даже не искали) и имя есть, а цены нет.
+            _tally("каталог не сопоставил" if not is_exact else "нет в прайс-листе")
             steam_fallback_needed.append((key, name_or_query, is_exact))
 
     if ct_hits:
@@ -1022,10 +1065,13 @@ async def get_sticker_prices(sticker_keys: set[str]) -> dict[str, float]:
         # кулдаун — см. prewarm.py). Ничего не кэшируем нулём, чтобы при
         # следующем прогоне (когда prewarm их уже посчитает) взялась
         # актуальная цена.
+        unresolved = sum(1 for _, _, is_exact in steam_fallback_needed if not is_exact)
         log.info(
-            "get_sticker_prices: %s ключей не нашлись в прайс-листе csgotrader.app — "
-            "оставляю их фоновому prewarm'у, живой путь к Steam за ценой стикера не ходит",
-            len(steam_fallback_needed),
+            "get_sticker_prices: %s ключей без цены — из них %s каталог не сопоставил "
+            "имени (в прайс-листе даже не искали), %s есть в каталоге, но нет в "
+            "csgotrader.app. Живой путь к Steam за ценой стикера не ходит",
+            len(steam_fallback_needed), unresolved,
+            len(steam_fallback_needed) - unresolved,
         )
         rate_limited_count += len(steam_fallback_needed)
 
