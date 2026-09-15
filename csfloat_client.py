@@ -805,21 +805,21 @@ async def probe() -> list[tuple[str, str, int | None, str]]:
         for path, why in PROBE_PATHS:
             url, params = _build_request(path, {})
 
-            # Маршруты по порядку: сначала логины из пула (каждая попытка —
-            # СВОЙ логин), в конце обязательно прямой адрес.
+            # Маршруты по порядку: СНАЧАЛА прямой адрес, потом логины из пула
+            # (каждая попытка — свой).
             #
-            # Прямой нужен не для галочки. Первая версия ходила только через
-            # пул, а он лежал целиком — 802 отказа шлюза за прогон, — и все
-            # четыре ручки отчитались «не дошло», не проверив ничего. При этом
-            # прокси для CSFloat заводился под СТАРЫЙ адрес Render, который
-            # блокировали как датацентровый; адрес нового сервиса другой, и
-            # вполне может пройти напрямую. Заодно это отличает «лежит прокси»
-            # от «CSFloat нас не пускает»: ответ CSFloat про VPN выглядит
-            # совсем иначе, чем 403 от шлюза.
-            routes: list[tuple[str | None, str]] = []
+            # Порядок именно такой по результату первого же замера: с прямого
+            # адреса /me и /me/buy-orders ответили 200, а 429 «disable your
+            # VPN» словила только публичная /listings. То есть ручки с
+            # авторизацией CSFloat с датацентрового адреса пускает, и гнать их
+            # через прокси незачем — он платный, он лежит третий день, и без
+            # него они прекрасно работают.
+            #
+            # Прокси остаётся запасным: он нужен публичной /listings, которая
+            # напрямую не идёт.
+            routes: list[tuple[str | None, str]] = [(None, "прямой адрес")]
             if CSFLOAT_POOL.enabled():
-                routes = [(CSFLOAT_POOL.next(), "прокси") for _ in range(PROBE_ATTEMPTS)]
-            routes.append((None, "прямой адрес"))
+                routes += [(CSFLOAT_POOL.next(), "прокси") for _ in range(PROBE_ATTEMPTS)]
 
             last_error = "не пробовали"
             status = None
@@ -841,8 +841,8 @@ async def probe() -> list[tuple[str, str, int | None, str]]:
 
             if status is None:
                 body = (
-                    f"не дошло ни через прокси ({PROBE_ATTEMPTS} попыт.), "
-                    f"ни напрямую: {last_error}"
+                    f"не дошло ни напрямую, ни через прокси "
+                    f"({PROBE_ATTEMPTS} попыт.): {last_error}"
                 )
             out.append((path, why, status, body, route_used))
             await asyncio.sleep(MIN_REQUEST_INTERVAL)
@@ -1298,25 +1298,49 @@ async def buy_orders_for(
     Отсутствие стакана НЕ ошибка: у предмета может не быть ни одного ордера, и
     это как раз лучший случай. Поэтому на любой сбой возвращаем пустой список —
     планировщик поймёт его как «соперников нет» и предложит свой потолок.
+
+    ПРЯМОЙ АДРЕС ПЕРВЫМ, прокси только запасным. Это не общее правило для
+    CSFloat, а вывод из замера /csfloatapi 2026-09-15 на живом ключе:
+
+        /me, /me/buy-orders   -> HTTP 200 с прямого адреса Render
+        /listings (публичная) -> HTTP 429 «disable your VPN»
+
+    Ручки с авторизацией CSFloat с датацентрового адреса пускает, а публичный
+    список лотов — нет. Значит стакан незачем гнать через прокси: прямой путь
+    бесплатен, не зависит от провайдера и не тратит трафик. А прокси у нас
+    лежит третий день подряд, и без этой перестановки /orders был бы мёртв
+    вместе с ним.
     """
     url, params = _build_request(
         f"/listings/{listing_id}/buy-orders", {"limit": str(limit)}
     )
-    proxy = CSFLOAT_POOL.next() if CSFLOAT_POOL.enabled() else None
-    try:
-        async with session.get(
-            url, params=params, proxy=proxy,
-            headers={**_API_HEADERS, "Authorization": CSFLOAT_API_KEY},
-        ) as resp:
-            if resp.status != 200:
-                log.info(
-                    "csfloat: стакан по лоту %s — HTTP %s, считаю что ордеров нет",
-                    listing_id, resp.status,
-                )
-                return []
-            data = await resp.json(content_type=None)
-    except Exception as e:  # noqa: BLE001 — пустой стакан безопаснее отказа
-        log.info("csfloat: стакан по лоту %s не получен (%s)", listing_id, scrub(str(e)))
+    routes: list[str | None] = [None]
+    if CSFLOAT_POOL.enabled():
+        routes.append(CSFLOAT_POOL.next())
+
+    data = None
+    for proxy in routes:
+        try:
+            async with session.get(
+                url, params=params, proxy=proxy,
+                headers={**_API_HEADERS, "Authorization": CSFLOAT_API_KEY},
+            ) as resp:
+                if resp.status != 200:
+                    log.info(
+                        "csfloat: стакан по лоту %s — HTTP %s через %s",
+                        listing_id, resp.status,
+                        "прямой адрес" if proxy is None else "прокси",
+                    )
+                    continue
+                data = await resp.json(content_type=None)
+            break
+        except Exception as e:  # noqa: BLE001 — пустой стакан безопаснее отказа
+            log.info(
+                "csfloat: стакан по лоту %s не получен через %s (%s)",
+                listing_id, "прямой адрес" if proxy is None else "прокси",
+                scrub(str(e)),
+            )
+    if data is None:
         return []
 
     rows = data.get("orders", data) if isinstance(data, dict) else data
