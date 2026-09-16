@@ -6669,6 +6669,11 @@ ORDERS_PROBE_LIMIT = envcfg.env_int("ORDERS_PROBE_LIMIT", 25)
 # сколько финалистов доходит до стакана.
 ORDERS_STEAM_VERIFY_LIMIT = envcfg.env_int("ORDERS_STEAM_VERIFY_LIMIT", 25)
 
+# Насколько свежим должен быть ответ Steam, чтобы считать цену подтверждённой.
+# Свежему запросу проставляется возраст 0, поэтому порог нужен маленький — он
+# лишь отделяет «только что спросили» от «лежало в кэше».
+ORDERS_STEAM_FRESH_SECONDS = envcfg.env_float("ORDERS_STEAM_FRESH", 60.0)
+
 # ГЛУБИНА ШИРОКОГО СКАНА. Считается от остатка квоты, а не задаётся числом.
 #
 # Арифметика, из которой всё следует. Квота CSFloat — 200 запросов в час НА
@@ -7216,12 +7221,26 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             quote = fresh.get(c.market_hash_name)
             if quote is None or not quote.ask:
                 return c
+            # «Подтверждено живым Steam» ставим ТОЛЬКО за свежий ответ.
+            #
+            # _live_prices_for отдаёт и записи из кэша — в том числе неполные,
+            # когда перезапросить не вышло (Steam на кулдауне). Первая версия
+            # этой проверки помечала такие как подтверждённые просто потому,
+            # что в них была цена, и отчёт врал прямым текстом: «живым Steam
+            # подтверждено 8» рядом с «объём не пришёл, кулдаун ещё 59 мин».
+            # Ничего живого там не происходило.
+            #
+            # Различает их возраст: свежему ответу ставится age 0, записи из
+            # кэша — её настоящий возраст.
+            live = quote.age_seconds <= ORDERS_STEAM_FRESH_SECONDS
             return c._replace(
-                steam_price_cents=int(round(quote.ask * 100)),
+                steam_price_cents=(
+                    int(round(quote.ask * 100)) if live else c.steam_price_cents
+                ),
                 volume_per_day=(
                     quote.volume if quote.volume is not None else c.volume_per_day
                 ),
-                steam_verified=True,
+                steam_verified=live,
             )
 
         ranked = [_with_live(c) for c in ranked]
