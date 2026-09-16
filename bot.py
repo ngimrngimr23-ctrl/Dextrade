@@ -6692,9 +6692,20 @@ class _OrderCandidate(NamedTuple):
     market_hash_name: str
     listing_id: str | None     # у находок /dips его нет, придётся искать
     steam_price_cents: int
+    # ШТУК ЗА СУТКИ, ПРОДАННЫХ В STEAM. Не «сколько лежит на витрине».
+    #
+    # Различие стоит денег, и на нём уже споткнулись. У лотов CSFloat есть
+    # reference.quantity — «сколько таких предметов на рынке», то есть ЗАПАС
+    # на витрине CSFloat. Оно подставлялось в steam_volume как «грубая мера
+    # ликвидности», а здесь умножалось на семь и сравнивалось с порогом
+    # «продаётся 21 шт/нед». Запас и скорость продаж — разные величины, и
+    # первая ничего не говорит про вторую: сто лотов могут висеть годами.
     volume_per_day: int | None
     spread_pct: float | None
     source: str                # откуда пришёл — арбитраж или просадки
+    # Сошлись ли два независимых источника цены Steam (прайс-лист csgotrader и
+    # справка CSFloat). None — сверить было не с чем.
+    price_confirmed: bool | None = None
 
 
 async def _order_candidates_from_arb(chat_id: int) -> list[_OrderCandidate]:
@@ -6771,6 +6782,11 @@ async def _order_candidates_from_arb(chat_id: int) -> list[_OrderCandidate]:
     spread_by_name = {
         l.market_hash_name: l.steam_price_spread_pct for l in listings
     }
+    # Сошлись ли прайс-лист и справка CSFloat — независимая проверка цены,
+    # которая уже посчитана в _fill_steam_prices и до сих пор пропадала зря.
+    confirmed_by_name = {
+        l.market_hash_name: l.steam_price_confirmed for l in listings
+    }
     offers = find_arbitrage_offers(
         listings,
         min_discount_pct=prefilter_pct,
@@ -6783,9 +6799,14 @@ async def _order_candidates_from_arb(chat_id: int) -> list[_OrderCandidate]:
             market_hash_name=o.market_hash_name,
             listing_id=o.listing_id,
             steam_price_cents=int(round((o.steam_price or 0) * 100)),
-            volume_per_day=o.steam_volume,
+            # Объём НЕ берём: у лотов CSFloat в steam_volume лежит
+            # reference.quantity — запас на витрине, а не продажи в Steam (см.
+            # _OrderCandidate.volume_per_day). Настоящий объём спросим у Steam
+            # по короткому списку финалистов, в orders_cmd.
+            volume_per_day=None,
             spread_pct=spread_by_name.get(o.market_hash_name),
             source="арбитраж",
+            price_confirmed=confirmed_by_name.get(o.market_hash_name),
         )
         for o in offers
     ]
@@ -6837,6 +6858,7 @@ async def _order_candidates_from_dips(chat_id: int) -> list[_OrderCandidate]:
             listing_id=None,
             # Продавать будем в Steam по низу стакана — от него и считаем.
             steam_price_cents=int(round(quote.ask * 100)),
+            # Здесь объём настоящий: штук за сутки от Steam priceoverview.
             volume_per_day=quote.volume,
             spread_pct=getattr(found_price, "recent_spread_pct", None),
             source="просадка",
@@ -7083,6 +7105,31 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     ranked = sorted(in_range, key=lambda c: -c.steam_price_cents)[:ORDERS_PROBE_LIMIT]
 
+    # Настоящий объём продаж — по короткому списку финалистов.
+    #
+    # Кандидаты арбитража приходят без объёма намеренно: у лотов CSFloat есть
+    # только запас на витрине, а порог задан в продажах за неделю. Спрашивать
+    # Steam про все триста лотов скана нельзя — это триста запросов к
+    # эндпоинту, который банит за темп. А про десяток финалистов можно: они и
+    # так уже прошли цену, диапазон и устойчивость, и это ровно тот момент,
+    # когда запрос окупается.
+    #
+    # Отказаться и написать «объём неизвестен» было бы дешевле, но неправильно:
+    # данные достижимы, просто за ними надо сходить.
+    need = [c.market_hash_name for c in ranked if c.volume_per_day is None]
+    if need:
+        fresh = await _live_prices_for(chat_id, need, need_volume=True)
+        ranked = [
+            c if c.volume_per_day is not None or c.market_hash_name not in fresh
+            else c._replace(volume_per_day=fresh[c.market_hash_name].volume)
+            for c in ranked
+        ]
+        got = sum(1 for c in ranked if c.volume_per_day is not None)
+        log.info(
+            "orders: объём спрашивали у %d финалист(ов), знаем теперь у %d из %d",
+            len(need), got, len(ranked),
+        )
+
     plans: list[tuple[_OrderCandidate, buy_orders.OrderPlan]] = []
     refused: list[tuple[str, str]] = []
     # Предметы, у которых стакан прочитать не вышло. Ордер по ним считается —
@@ -7117,6 +7164,23 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         listing_id = lots[0].listing_id
                     else:
                         blind[cand.market_hash_name] = "на CSFloat лотов нет"
+
+            # Два независимых источника цены Steam разошлись — считать по
+            # такой цене прибыль нельзя.
+            #
+            # Прогон 2026-09-16 показал ровно этот случай: Tec-9 | Cut Out с
+            # «прибылью 163%» при верхнем чужом ордере $9.00. Живой стакан —
+            # это мнение рынка о цене, и когда наша оценка расходится с ним
+            # втрое, вероятнее ошиблись мы, а не рынок. Проверка эта уже
+            # считалась в _fill_steam_prices (прайс-лист против справки
+            # CSFloat) и до сих пор никуда не шла.
+            if cand.price_confirmed is False:
+                refused.append((
+                    cand.market_hash_name,
+                    "источники цены Steam разошлись — прибыль от такой цены "
+                    "посчитать нельзя",
+                ))
+                continue
 
             if listing_id is None:
                 # Стакан недоступен, но план от него не зависит: потолок цены
