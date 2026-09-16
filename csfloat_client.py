@@ -435,6 +435,16 @@ def _note_budget(headers: dict) -> None:
     }
 
 
+def budget_remaining() -> int | None:
+    """
+    Сколько запросов осталось в текущем окне по последнему ответу CSFloat.
+    None — заголовков лимита мы ещё не видели.
+
+    Число, а не строка: по нему принимаются решения, а не только пишутся логи.
+    """
+    return None if not _last_budget else _last_budget.get("remaining")
+
+
 def budget_description() -> str | None:
     """
     Человекочитаемый остаток квоты для /status. None — мы ещё ни одного ответа
@@ -1240,6 +1250,33 @@ async def fetch_listings_page(
             if proxy:
                 reset_in = _seconds_until_reset(retry.headers) or COOLDOWN_AFTER_429_SECONDS
                 CSFLOAT_POOL.mark_exhausted(proxy, reset_in, "квота CSFloat исчерпана")
+
+            # Остаток НОЛЬ — перебирать адреса бессмысленно, и это не теория, а
+            # число от самого CSFloat в заголовке x-ratelimit-remaining.
+            #
+            # Здесь в модуле жило прямое противоречие. Комментарий у цикла
+            # утверждал «квотный 429 — это на ЭТОМ адресе бюджет кончился», а
+            # докстринг модуля и проверка бюджета при старте исходят из
+            # обратного: «лимит 200 — это лимит НА КЛЮЧ» и «6 прогонов в час =
+            # 180 из 200 доступных». Верно второе, и цена ошибки измерена:
+            # шесть полос по восемь повторов — это 48 запросов, каждый под
+            # общим замком в секунду, то есть 48 секунд ожидания. /orders со
+            # своим таймаутом 45 с не доживал. Хуже того, каждый повтор ещё и
+            # ТРАТИЛ запрос из того же исчерпанного окна.
+            #
+            # Когда остаток больше нуля, поведение прежнее: возможно, дело
+            # всё-таки в адресе, и следующий пройдёт.
+            left = budget_remaining()
+            if left == 0:
+                seconds, is_ip_block = await _note_429(
+                    _header(retry.headers, "Retry-After"), retry.headers, retry.body
+                )
+                raise CSFloatRateLimited(
+                    f"Квота ключа CSFloat исчерпана ({budget_description() or 'остаток 0'}). "
+                    f"Смена адреса не поможет — лимит считается по ключу. "
+                    f"Пауза {seconds / 60:.0f} мин.",
+                    is_ip_block=is_ip_block,
+                ) from None
 
             if attempt >= max_attempts:
                 if direct_left:
