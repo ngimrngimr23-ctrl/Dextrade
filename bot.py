@@ -4824,13 +4824,31 @@ async def proxycheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + (f", на кулдауне {on_cooldown}" if on_cooldown else "")
     )
 
-    # Отметки живости держим в пуле: /status и решения о маршруте должны знать
-    # про мёртвые адреса, а не только тот, кто запустил проверку.
-    for proxy, first, _second, _err in results:
-        if first:
-            pool.mark_alive(proxy)
-        else:
-            pool.mark_dead(proxy, "не ответил при проверке")
+    # Отметки живости раскладываем по ОБОИМ пулам, а не только по тому, на
+    # котором гоняли проверку.
+    #
+    # Это главный результат команды, и раньше он пропадал наполовину. Замер
+    # 2026-09-16 дал «работают 38 из 134»: три четверти логинов отвечают
+    # отказом, и знание, КАКИЕ именно, стоит целого прогона. Пул CSFloat его
+    # не получал — проверка шла по пулу Steam (списки обычно одни и те же), и
+    # широкий скан потом заново выяснял то же самое перебором, по секунде на
+    # логин.
+    #
+    # Мёртвая отметка не вечная: DEAD_RETRY_SECONDS вернёт адрес в строй, и
+    # если провайдер оживёт, следующая проверка это увидит.
+    taught = 0
+    for target in (STEAM_POOL, csfloat_client.CSFLOAT_POOL):
+        if not target.enabled():
+            continue
+        for proxy, first, _second, _err in results:
+            if proxy not in target.proxies:
+                continue
+            if first:
+                target.mark_alive(proxy)
+            else:
+                target.mark_dead(proxy, "не ответил при проверке")
+            taught += 1
+    log.info("proxycheck: разнёс %d отметок живости по пулам", taught)
 
     if rotating:
         lines.append("")
