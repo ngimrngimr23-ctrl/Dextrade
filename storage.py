@@ -620,6 +620,18 @@ async def get_steam_prices_batch(names: list[str]) -> dict[str, dict]:
     return out
 
 
+async def get_steam_price_entry(name: str) -> dict | None:
+    """Одна запись из кэша цен Steam целиком. None — записи нет."""
+    if REDIS_ENABLED:
+        try:
+            raw = await _redis_cmd("GET", STEAM_PRICE_KEY_PREFIX + name)
+            return json.loads(raw) if raw else None
+        except Exception:
+            pass
+    entry = _local_steam_prices_load().get(name)
+    return entry if isinstance(entry, dict) else None
+
+
 async def set_steam_price(
     name: str, price: float, volume: int | None, median: float | None = None,
 ) -> None:
@@ -634,8 +646,33 @@ async def set_steam_price(
     /dips сравнивал заявку со средней за 30 дней и выдавал эти 13% спреда за
     просадку — на каждом предмете, даром.
     """
-    entry = {"price": price, "volume": volume, "median": median, "updated_at": time.time()}
-    # Неполную запись держим коротко — см. STEAM_PRICE_NO_VOLUME_TTL_SECONDS.
+    now = time.time()
+    entry = {"price": price, "volume": volume, "volume_at": now,
+             "median": median, "updated_at": now}
+
+    # ОБЪЁМ НЕ СТИРАЕМ НЕИЗВЕСТНОСТЬЮ.
+    #
+    # volume=None здесь не значит «продаж нет» — значит «спросить не вышло»:
+    # цену взяли запасным путём из листингов, а priceoverview был недоступен
+    # (кулдаун, 429, мёртвый прокси). Раньше такая запись затирала прежде
+    # измеренный объём, и недоступность источника превращала УЖЕ ИЗВЕСТНОЕ
+    # число в незнание. Дальше /orders отказывал «объём продаж неизвестен» по
+    # предмету, объём которого мы отлично знали час назад.
+    #
+    # Теперь последнее измеренное значение переносится вперёд вместе с
+    # моментом замера (volume_at). Возраст виден потребителю — пусть сам
+    # решает, годится ли ему суточный объём вчерашней свежести; выбрасывать
+    # его за него мы права не имеем.
+    if volume is None:
+        previous = await get_steam_price_entry(name)
+        carried = previous.get("volume") if previous else None
+        if carried is not None:
+            entry["volume"] = carried
+            entry["volume_at"] = previous.get("volume_at", previous.get("updated_at", 0))
+
+    # Срок жизни считаем по СВЕЖЕМУ замеру, а не по перенесённому значению:
+    # запись без нового объёма остаётся неполной, сколько бы старых чисел мы
+    # в неё ни положили, и перезапросить её стоит скоро.
     ttl = (
         STEAM_PRICE_TTL_SECONDS if volume is not None
         else STEAM_PRICE_NO_VOLUME_TTL_SECONDS

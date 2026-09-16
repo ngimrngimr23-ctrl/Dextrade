@@ -6844,6 +6844,25 @@ async def _order_candidates_from_dips(chat_id: int) -> list[_OrderCandidate]:
     return out
 
 
+def _volume_line(volume) -> str:
+    """
+    Строка про порог ликвидности — с прямым предупреждением, когда он снят.
+
+    Ноль здесь не «ещё один фильтр послабее», а снятая защита: бот начинает
+    считать ордера по предметам, ликвидность которых НЕ ПОДТВЕРЖДЕНА. Разница
+    существенная — выйти из неликвида потом будет не у кого, — и подавать её
+    одним безобидным «0 шт/нед» нечестно.
+    """
+    if volume and volume > 0:
+        return f"продаётся от <b>{volume:g} шт/нед</b> 🟢 проверка ликвидности включена"
+    return (
+        "🔴 <b>проверка ликвидности ВЫКЛЮЧЕНА</b> (порог 0)\n"
+        "  ⚠️ ордера считаются и по предметам с неизвестным объёмом продаж — "
+        "выйти из такого потом может быть не у кого. Вернуть: "
+        "<code>/setorders - 21 - -</code>"
+    )
+
+
 def _order_arg(raw: str, *, integer: bool = False):
     """
     Разобрать одно значение настройки. Прочерк — «не менять», как в /markets.
@@ -6886,7 +6905,7 @@ async def setorders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "<b>Пороги ордеров</b>\n"
             f"• прибыль от <b>{profit:g}%</b> (после комиссии Steam)\n"
-            f"• продаётся от <b>{volume:g} шт/нед</b>\n"
+            f"• {_volume_line(volume)}\n"
             f"• цена предмета <b>${low:g}–${high:g}</b>\n\n"
             "Задать всё разом: <code>/setorders 25 20 5 300</code>\n"
             "Оставить прежним — прочерк: <code>/setorders 25 - - 300</code>\n\n"
@@ -6941,7 +6960,7 @@ async def setorders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "<b>Пороги ордеров обновлены</b>\n"
         f"• прибыль от <b>{(new_profit if set_profit else profit):g}%</b>\n"
-        f"• продаётся от <b>{(new_volume if set_volume else volume):g} шт/нед</b>\n"
+        f"• {_volume_line(new_volume if set_volume else volume)}\n"
         f"• цена предмета <b>${final_low:g}–${final_high:g}</b>\n\n"
         "Проверить на живом рынке: /orders",
         parse_mode="HTML",
@@ -7139,8 +7158,12 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• <code>{html_module.escape(plan.market_hash_name)}</code> "
                 f"({cand.source})"
             )
+            # Цена без прочитанного стакана — не «почти готовый ордер», а
+            # потолок: выше него прибыли нет. Помечаем это в самой строке, а
+            # не сноской внизу, иначе число читается как решение.
+            label = "потолок" if plan.market_hash_name in blind else "ордер"
             lines.append(
-                f"  ордер <b>${plan.price_cents / 100:.2f}</b> · "
+                f"  {label} <b>${plan.price_cents / 100:.2f}</b> · "
                 f"Steam ${plan.steam_price_cents / 100:.2f} · "
                 f"прибыль <b>{plan.profit_pct:.0f}%</b> · {rival}"
             )
@@ -7148,10 +7171,24 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("Ни одного ордера не поставил бы.")
 
     if route_down:
+        # Сколько ИМЕННО кандидатов осталось без стакана, и отдельной строкой —
+        # техническая причина.
+        #
+        # Прежний текст сливал их в одну фразу: «Стаканы не прочитаны: 126 не
+        # отложены из 134, 8 из 8 отказал шлюз». Числа тут про ПУЛ ЛОГИНОВ, а
+        # стояли в предложении про стаканы — и читались как «134 кандидата, у
+        # 126 нет стакана». Именно так это и прочли. Кандидатов в том прогоне
+        # было восемь.
         lines.append("")
         lines.append(
-            f"⚠️ Стаканы не прочитаны: {html_module.escape(route_down)}. "
-            "Цены ниже посчитаны по потолку прибыли, без оглядки на чужие ордера."
+            f"🟡 Стакан не прочитан у {len(blind)} из {len(ranked)} кандидат(ов) — "
+            "это «не знаем, кого перебивать», а НЕ «ордер плохой». Цена у них "
+            "стоит по потолку прибыли: столько мы готовы дать, а не столько "
+            "нужно, чтобы стоять первым."
+        )
+        lines.append(
+            f"<i>Причина (про пул прокси, не про кандидатов): "
+            f"{html_module.escape(route_down)}</i>"
         )
 
     # Объём продаж есть только у Steam priceoverview, а тот регулярно лежит под
