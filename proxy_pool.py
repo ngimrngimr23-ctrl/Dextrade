@@ -23,6 +23,7 @@ describe()/mask() — не печатать сырые значения.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import time
@@ -43,14 +44,42 @@ _SPLIT_RE = re.compile(r"[\s,;]+")
 _SUPPORTED_SCHEMES = ("http", "https")
 
 
+def login_tag(url: str) -> str:
+    """
+    Короткая нетайная метка логина: первые шесть шестнадцатеричных цифр от
+    sha256 его логина с паролем.
+
+    Зачем метка вообще. Раньше логин с паролем заменялись на «***», и у всех
+    логинов одного шлюза выходила ОДНА И ТА ЖЕ строка в логе. При ста
+    тридцати четырёх логинах на proxy.flameproxies.com:8989 сто тридцать
+    четыре разные попытки печатались неотличимо, и по логу нельзя было
+    ответить на простейший вопрос: бот перебирает разные логины или долбится
+    в один? Это спросили прямым текстом, и правильного ответа в логах не
+    нашлось — только косвенный, по убыванию счётчика свободных адресов.
+
+    Почему хеш, а не кусок логина. Логин — часть доступа, и печатать его
+    куски в лог, который уезжает в отдельный репозиторий, не стоит. Хеш
+    отвечает ровно на нужный вопрос («тот же или другой») и не отвечает ни
+    на какой другой. Шесть цифр — 16 млн значений: на пуле в пару сотен
+    совпадение двух меток практически исключено.
+    """
+    parsed = urlsplit(url)
+    userinfo = f"{parsed.username or ''}:{parsed.password or ''}"
+    return hashlib.sha256(userinfo.encode("utf-8", "replace")).hexdigest()[:6]
+
+
 def mask(url: str) -> str:
-    """Адрес прокси без логина и пароля — для логов и /status."""
+    """Адрес прокси без логина и пароля, но с меткой логина — для логов и /status."""
     try:
         parsed = urlsplit(url)
         if not parsed.hostname:
             return "адрес не разобрался (ожидается http://логин:пароль@хост:порт)"
         if parsed.username or parsed.password:
-            return urlunsplit((parsed.scheme, f"***@{parsed.hostname}:{parsed.port}", "", "", ""))
+            return urlunsplit((
+                parsed.scheme,
+                f"логин-{login_tag(url)}@{parsed.hostname}:{parsed.port}",
+                "", "", "",
+            ))
         return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
     except Exception:
         return "адрес не разобрался (ожидается http://логин:пароль@хост:порт)"
@@ -372,6 +401,12 @@ class ProxyPool:
                 len(self._gateway_strikes), self.GATEWAY_GIVE_UP_AFTER,
             )
             return False
+        log.warning(
+            "%s: подряд отказали %d РАЗНЫХ логин(ов) на одном шлюзе — это отказ "
+            "двери, а не совпадение. Метки логинов в строках выше показывают, "
+            "что перебор был настоящим.",
+            self.name, len(self._gateway_strikes),
+        )
         self.mark_gateway_refused(proxy, seconds, reason)
         # Счётчик обнуляем ЗДЕСЬ, а не только на успехе. Без этого получался
         # самоподдерживающийся замок, и он тут же выстрелил в проде: набрав
