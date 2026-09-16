@@ -5657,7 +5657,7 @@ class LiveQuote(NamedTuple):
 
 async def _live_prices_for(
     chat_id: int, names: list[str], *, max_age: float | None = None,
-    need_volume: bool = False,
+    need_volume: bool = False, budget: int | None = None,
 ) -> dict[str, LiveQuote]:
     """
     Живая цена Steam по списку имён — сколько получится в рамках бюджета.
@@ -5717,7 +5717,10 @@ async def _live_prices_for(
             entry["price"], entry.get("median"), entry.get("volume"), age,
         )
 
-    misses = [n for n in names if n not in out][:STEAM_LIVE_BUDGET]
+    # budget — сколько живых запросов разрешено этому вызову. Умолчание общее
+    # (STEAM_LIVE_BUDGET), но у проверки финалистов /orders своя цена вопроса:
+    # там каждый запрос решает, ставить ли настоящие деньги, и восьми мало.
+    misses = [n for n in names if n not in out][:budget or STEAM_LIVE_BUDGET]
     if stale:
         log.info(
             "живые цены: %d записей старше %.0f мин — перезапрашиваю",
@@ -6655,15 +6658,72 @@ async def reset_cooldowns(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Каждый стоит запроса к CSFloat (а кандидат из /dips — двух: сначала найти лот
 # по имени, потом прочитать его стакан), а квота там 200 в час на ключ и её уже
 # выбирает арбитраж. Десяток хватает, чтобы увидеть картину, и не ломает скан.
-ORDERS_PROBE_LIMIT = envcfg.env_int("ORDERS_PROBE_LIMIT", 10)
+ORDERS_PROBE_LIMIT = envcfg.env_int("ORDERS_PROBE_LIMIT", 25)
 
-# Сколько лотов тянуть широким сканом ради ордеров.
+# Сколько финалистов проверять живым запросом к Steam.
 #
-# Ордерам полный скан не нужен: кандидатов мы всё равно режем до
-# ORDERS_PROBE_LIMIT штук, а квота CSFloat — 200 запросов в час НА КЛЮЧ, и её
-# почти целиком выбирает автоскан арбитража. Триста лотов — это шесть страниц
-# и шесть запросов вместо тридцати.
-ORDERS_ARB_TARGET = envcfg.env_int("ORDERS_ARB_TARGET", 300)
+# Каждый такой запрос решает, ставить ли настоящие деньги, поэтому скупиться
+# здесь неправильно — но и щедрость упирается в живое ограничение:
+# priceoverview отвечает по одному предмету и банит за темп на часы. Двадцать
+# пять — это верх того, что мы уже наблюдали без 429, и ровно столько же,
+# сколько финалистов доходит до стакана.
+ORDERS_STEAM_VERIFY_LIMIT = envcfg.env_int("ORDERS_STEAM_VERIFY_LIMIT", 25)
+
+# ГЛУБИНА ШИРОКОГО СКАНА. Считается от остатка квоты, а не задаётся числом.
+#
+# Арифметика, из которой всё следует. Квота CSFloat — 200 запросов в час НА
+# КЛЮЧ, страница отдаёт максимум 50 лотов, между любыми двумя запросами общая
+# пауза в секунду. Значит:
+#
+#     потолок за час      = 200 x 50 = 10 000 лотов
+#     время на этот потолок = 200 x 1 с = 3.3 минуты
+#
+# Отсюда важный вывод, который стоит сказать прямо: сканировать ДОЛЬШЕ можно,
+# но лотов от этого не прибавится. Пять или восемь минут — это те же 10 000
+# лотов, просто медленнее. Ширина упирается в квоту, а не во время, и просьба
+# «пусть идёт 5-8 минут» на деле означает «возьми столько, сколько квота
+# вообще позволяет» — то есть около десяти тысяч лотов против прежних трёхсот.
+#
+# Поэтому цель не константа. Смотрим, сколько запросов ключу осталось в этом
+# окне, вычитаем запас на проверку финалистов и тратим остальное. Так скан
+# всегда настолько широк, насколько сегодня можно, и при этом не добивает
+# окно до 429 (см. историю правки про x-ratelimit-remaining).
+ORDERS_ARB_TARGET_MAX = envcfg.env_int("ORDERS_ARB_TARGET_MAX", 10000)
+
+# Ниже этого скан не имеет смысла — проще честно сказать, что квоты нет.
+ORDERS_ARB_TARGET_MIN = envcfg.env_int("ORDERS_ARB_TARGET_MIN", 300)
+
+# Запас запросов, который скан НЕ трогает. Из него оплачивается вторая
+# половина работы: стакан по каждому финалисту плюс поиск лота по имени для
+# кандидатов из просадок. Без запаса глубокий скан съедал бы окно целиком и
+# оставлял финалистов без стаканов — то есть менял бы качество на количество.
+ORDERS_ARB_RESERVE = envcfg.env_int("ORDERS_ARB_RESERVE", 40)
+
+
+def _orders_scan_target() -> tuple[int, str]:
+    """
+    Сколько лотов просить у широкого скана сейчас. Возвращает (цель, пояснение).
+
+    Цель 0 значит «квоты не хватает даже на минимум» — вызывающий тогда честно
+    пропускает скан вместо того, чтобы упереться в 429 на первой же полосе.
+    """
+    left = csfloat_client.budget_remaining()
+    if left is None:
+        # Заголовков лимита ещё не видели (например, после рестарта). Берём
+        # минимум: он заведомо безопасен и сам добудет заголовки.
+        return ORDERS_ARB_TARGET_MIN, "остаток квоты пока неизвестен, беру минимум"
+
+    affordable = max(0, left - ORDERS_ARB_RESERVE)
+    target = min(ORDERS_ARB_TARGET_MAX, affordable * csfloat_client.MAX_LIMIT)
+    if target < ORDERS_ARB_TARGET_MIN:
+        return 0, (
+            f"ключу осталось {left} запрос(ов), из них {ORDERS_ARB_RESERVE} "
+            f"держим на стаканы — на скан не хватает"
+        )
+    return target, (
+        f"ключу осталось {left} запрос(ов), {ORDERS_ARB_RESERVE} держим на "
+        f"стаканы, на скан трачу до {target // csfloat_client.MAX_LIMIT}"
+    )
 
 # Сколько ждать широкий скан, прежде чем ответить без него.
 #
@@ -6679,11 +6739,16 @@ ORDERS_ARB_TARGET = envcfg.env_int("ORDERS_ARB_TARGET", 300)
 # не начинается. Осталась одна задача — не оставить человека в тишине, если
 # сеть повисла совсем.
 #
-# Верхняя оценка честной работы: шесть страниц, на первой до восьми попыток
+# ШЕСТЬСОТ, А НЕ СТО ВОСЕМЬДЕСЯТ (правка про глубокий скан). Скан теперь
+# тянет до десяти тысяч лотов — это до двухсот страниц по секунде на запрос,
+# то есть около трёх с половиной минут чистого времени плюс поиск живого
+# логина и подстановка цен. Сто восемьдесят рубили бы его на середине.
+#
+# ПРЕЖНЯЯ верхняя оценка честной работы: шесть страниц, на первой до восьми попыток
 # найти живой логин, между любыми двумя запросами общая пауза в секунду,
 # плюс подстановка цен и отбор. Это десятки секунд, не минуты. Сто
 # восемьдесят оставляют запас втрое и всё ещё отвечают в обозримое время.
-ORDERS_ARB_TIMEOUT = envcfg.env_float("ORDERS_ARB_TIMEOUT", 180.0)
+ORDERS_ARB_TIMEOUT = envcfg.env_float("ORDERS_ARB_TIMEOUT", 600.0)
 
 
 class _OrderCandidate(NamedTuple):
@@ -6706,9 +6771,19 @@ class _OrderCandidate(NamedTuple):
     # Сошлись ли два независимых источника цены Steam (прайс-лист csgotrader и
     # справка CSFloat). None — сверить было не с чем.
     price_confirmed: bool | None = None
+    # Цена подтверждена ЖИВЫМ запросом к Steam, а не взята из прайс-листа.
+    #
+    # Разница принципиальная и уже стоила ложной находки. Прайс-лист даёт
+    # медиану СДЕЛОК за сутки, а ордер исполнится по низу стакана СЕЙЧАС —
+    # это разные числа, и на тонком предмете они расходятся в разы. Прогон
+    # 2026-09-16 показал «прибыль 163%» при верхнем чужом ордере $9.00:
+    # оценка была из прайс-листа, а рынок думал иначе.
+    steam_verified: bool = False
 
 
-async def _order_candidates_from_arb(chat_id: int) -> list[_OrderCandidate]:
+async def _order_candidates_from_arb(
+    chat_id: int,
+) -> tuple[list[_OrderCandidate], int]:
     """
     Кандидаты из широкого скана CSFloat — те же, что идут в /arbnow.
 
@@ -6735,24 +6810,22 @@ async def _order_candidates_from_arb(chat_id: int) -> list[_OrderCandidate]:
     # Квота CSFloat — 200 запросов в час НА КЛЮЧ, и её почти целиком выбирает
     # автоскан арбитража: при ARB_TARGET_LISTINGS=1500 это 30 запросов за
     # прогон и 180 из 200 за час. Широкому скану ордеров остаётся 20, а нужно
-    # ему ORDERS_ARB_TARGET/50 страниц плюс по запросу на стакан.
+    # ему столько страниц, сколько позволит остаток (см. _orders_scan_target).
     #
     # Раньше он всё равно шёл и получал 429 на каждой полосе. Это не просто
     # бесполезно — вредно: каждый отказ тоже считается запросом, то есть скан
     # добивал окно, из-за которого сам же и падал. И длилось это дольше
     # таймаута, так что человек видел «прокси не отвечают», хотя прокси были
     # ни при чём.
-    need = max(1, -(-ORDERS_ARB_TARGET // csfloat_client.MAX_LIMIT))
-    left = csfloat_client.budget_remaining()
-    if left is not None and left < need:
-        detail = csfloat_client.budget_description() or f"остаток {left}"
+    target, why = _orders_scan_target()
+    if target == 0:
         raise CSFloatRateLimited(
-            f"ключу CSFloat осталось {left} запрос(ов), широкому скану нужно "
-            f"{need} — пропускаю его, кандидаты будут только из просадок. "
-            f"Квота 200/час считается ПО КЛЮЧУ, и её выбирает автоскан "
-            f"арбитража; чтобы освободить место — реже прогон или меньше "
-            f"ARB_TARGET_LISTINGS. Замер: {detail}"
+            f"{why}. Квота 200/час считается ПО КЛЮЧУ, и её выбирает автоскан "
+            f"арбитража; чтобы освободить место под глубокий скан — реже "
+            f"прогон или меньше ARB_TARGET_LISTINGS. "
+            f"Замер: {csfloat_client.budget_description() or 'нет данных'}"
         )
+    log.info("orders: глубина скана — %d лотов (%s)", target, why)
 
     settings = await get_arb_settings(chat_id)
 
@@ -6774,9 +6847,10 @@ async def _order_candidates_from_arb(chat_id: int) -> list[_OrderCandidate]:
     )
 
     listings = await csfloat_client.fetch_market_wide(
-        target=ORDERS_ARB_TARGET, sort_by=ARB_SORT_BY,
+        target=target, sort_by=ARB_SORT_BY,
         min_price=settings["min_price"], max_price=settings["max_price"],
     )
+    log.info("orders: широкий скан принёс %d лотов", len(listings))
     await _fill_steam_prices(listings)
     # Разброс окон живёт на лоте, а не на оффере — забираем по имени.
     spread_by_name = {
@@ -6809,7 +6883,7 @@ async def _order_candidates_from_arb(chat_id: int) -> list[_OrderCandidate]:
             price_confirmed=confirmed_by_name.get(o.market_hash_name),
         )
         for o in offers
-    ]
+    ], len(listings)
 
 
 async def _order_candidates_from_dips(chat_id: int) -> list[_OrderCandidate]:
@@ -7040,18 +7114,26 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     warm_took = time.monotonic() - warm_started
     log.info("orders: прайс-лист готов за %.1f с", warm_took)
 
-    from_arb = from_dips = 0
+    from_arb = from_dips = scanned = 0
     try:
         # Таймаут обязателен: без него команда зависит от того, как быстро
         # отвечает чужая сеть, а она может не отвечать вовсе — и тогда человек
         # видит только первое сообщение и тишину.
         scan_started = time.monotonic()
-        candidates = await asyncio.wait_for(
+        candidates, scanned = await asyncio.wait_for(
             _order_candidates_from_arb(chat_id), timeout=ORDERS_ARB_TIMEOUT
         )
         from_arb = len(candidates)
-        log.info("orders: широкий скан отработал за %.1f с",
-                 time.monotonic() - scan_started)
+        took = time.monotonic() - scan_started
+        log.info("orders: широкий скан отработал за %.1f с, лотов %d, кандидатов %d",
+                 took, scanned, from_arb)
+        # Скан идёт минутами, поэтому о его исходе сообщаем сразу, не дожидаясь
+        # конца всей команды: иначе человек несколько минут смотрит в одно
+        # первое сообщение и не знает, жив ли прогон.
+        await update.message.reply_text(
+            f"Широкий скан: просмотрено {scanned} лот(ов) за {took:.0f} с, "
+            f"кандидатов {from_arb}. Дальше проверяю их живым Steam и читаю стаканы…"
+        )
     except asyncio.TimeoutError:
         # Причину НЕ называем. Прошлый текст утверждал «прокси CSFloat не
         # отвечает» — и врал: время уходило на прайс-лист. Таймаут знает
@@ -7105,29 +7187,48 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     ranked = sorted(in_range, key=lambda c: -c.steam_price_cents)[:ORDERS_PROBE_LIMIT]
 
-    # Настоящий объём продаж — по короткому списку финалистов.
+    # ПРОВЕРКА ФИНАЛИСТОВ ЖИВЫМ STEAM — и цены, и объёма, одним запросом.
     #
-    # Кандидаты арбитража приходят без объёма намеренно: у лотов CSFloat есть
-    # только запас на витрине, а порог задан в продажах за неделю. Спрашивать
-    # Steam про все триста лотов скана нельзя — это триста запросов к
-    # эндпоинту, который банит за темп. А про десяток финалистов можно: они и
-    # так уже прошли цену, диапазон и устойчивость, и это ровно тот момент,
-    # когда запрос окупается.
+    # До сих пор цена Steam бралась из прайс-листа csgotrader. Это медиана
+    # СДЕЛОК за сутки, а ордер исполнится по низу стакана СЕЙЧАС — разные
+    # числа, и на тонком предмете они расходятся в разы. Прогон 2026-09-16
+    # выдал «прибыль 163%» при верхнем чужом ордере $9.00: оценка была из
+    # прайс-листа, а живой рынок думал иначе, и поверить следовало рынку.
     #
-    # Отказаться и написать «объём неизвестен» было бы дешевле, но неправильно:
-    # данные достижимы, просто за ними надо сходить.
-    need = [c.market_hash_name for c in ranked if c.volume_per_day is None]
-    if need:
-        fresh = await _live_prices_for(chat_id, need, need_volume=True)
-        ranked = [
-            c if c.volume_per_day is not None or c.market_hash_name not in fresh
-            else c._replace(volume_per_day=fresh[c.market_hash_name].volume)
-            for c in ranked
-        ]
-        got = sum(1 for c in ranked if c.volume_per_day is not None)
+    # priceoverview отдаёт ровно то, что нужно, одним ответом: низ стакана,
+    # медиану сделок и объём за сутки. Раньше из него брали только объём, а
+    # цену — выбрасывали. Теперь цена финалиста ЗАМЕНЯЕТСЯ живой.
+    #
+    # Почему только финалисты. Пакетного эндпоинта у Steam нет, запрос идёт по
+    # одному предмету, и за темп он банит на часы. Спрашивать про десять тысяч
+    # просмотренных лотов невозможно; про два десятка, уже прошедших цену,
+    # диапазон и устойчивость, — можно, и там запрос окупается: он решает,
+    # ставить ли настоящие деньги.
+    verified_names = [c.market_hash_name for c in ranked]
+    fresh: dict[str, LiveQuote] = {}
+    if verified_names:
+        fresh = await _live_prices_for(
+            chat_id, verified_names, need_volume=True,
+            budget=ORDERS_STEAM_VERIFY_LIMIT,
+        )
+
+        def _with_live(c: _OrderCandidate) -> _OrderCandidate:
+            quote = fresh.get(c.market_hash_name)
+            if quote is None or not quote.ask:
+                return c
+            return c._replace(
+                steam_price_cents=int(round(quote.ask * 100)),
+                volume_per_day=(
+                    quote.volume if quote.volume is not None else c.volume_per_day
+                ),
+                steam_verified=True,
+            )
+
+        ranked = [_with_live(c) for c in ranked]
         log.info(
-            "orders: объём спрашивали у %d финалист(ов), знаем теперь у %d из %d",
-            len(need), got, len(ranked),
+            "orders: живым Steam подтверждено %d из %d финалист(ов), объём знаем у %d",
+            sum(1 for c in ranked if c.steam_verified), len(ranked),
+            sum(1 for c in ranked if c.volume_per_day is not None),
         )
 
     plans: list[tuple[_OrderCandidate, buy_orders.OrderPlan]] = []
@@ -7211,6 +7312,9 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 plans.append((cand, plan))
 
+    verified_by_name = {c.market_hash_name: c.steam_verified for c in ranked}
+    checked = sum(1 for c in ranked if c.steam_verified)
+
     lines = ["<b>Сухой прогон ордеров</b> — ничего не поставлено", ""]
     if plans:
         for cand, plan in sorted(plans, key=lambda x: -x[1].profit_pct):
@@ -7226,9 +7330,14 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # потолок: выше него прибыли нет. Помечаем это в самой строке, а
             # не сноской внизу, иначе число читается как решение.
             label = "потолок" if plan.market_hash_name in blind else "ордер"
+            # Откуда цена Steam — важнее самой цены. Из прайс-листа это
+            # медиана сделок за сутки, из живого запроса — низ стакана сейчас.
+            # Ордер исполнится по второму, поэтому первое всегда помечаем.
+            verified = verified_by_name.get(plan.market_hash_name, False)
+            mark = "✅ Steam" if verified else "🟡 Steam (оценка)"
             lines.append(
                 f"  {label} <b>${plan.price_cents / 100:.2f}</b> · "
-                f"Steam ${plan.steam_price_cents / 100:.2f} · "
+                f"{mark} ${plan.steam_price_cents / 100:.2f} · "
                 f"прибыль <b>{plan.profit_pct:.0f}%</b> · {rival}"
             )
     else:
@@ -7297,7 +7406,11 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     lines.append("")
     lines.append(
-        f"Кандидатов: арбитраж {from_arb}, просадки {from_dips}. "
+        f"Просмотрено лотов: {scanned}. Кандидатов: арбитраж {from_arb}, "
+        f"просадки {from_dips}. В финал вышло {len(ranked)}, "
+        f"живым Steam подтверждено {checked}."
+    )
+    lines.append(
         f"Пороги: прибыль от {limits['profit']:g}%, "
         f"продаж от {limits['volume']:g} шт/нед, "
         f"цена ${limits['low']:g}–${limits['high']:g}, "
