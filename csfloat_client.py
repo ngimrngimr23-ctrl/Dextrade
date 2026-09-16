@@ -636,6 +636,10 @@ class CSFloatListing:
     reference_price: float | None = None
     predicted_price: float | None = None
     reference_quantity: int | None = None
+    # Сколько таких предметов лежит на витрине CSFloat. ЗАПАС, не продажи.
+    # Отдельно от steam_volume намеренно: путать их — значит сравнивать
+    # единицы с единицами другого рода (см. bot._fill_steam_prices).
+    csfloat_quantity: int | None = None
     # Были ли у предмета продажи в Steam за последнюю неделю — по наличию окон
     # last_24h/last_7d в прайс-листе. Это НЕЗАВИСИМЫЙ от CSFloat признак
     # ликвидности и единственный честный ответ на вопрос «смогу ли я это

@@ -3290,10 +3290,25 @@ async def _fill_steam_prices(listings) -> int:
     confirmed = 0
     disagree = 0
     for l in missing:
-        # Ликвидность: reference.quantity от CSFloat — замена пропавшему
-        # scm.volume. Приходит вместе с лотом, лишних запросов не требует.
-        if l.steam_volume is None and l.reference_quantity is not None:
-            l.steam_volume = l.reference_quantity
+        # ЗАПАС НА ВИТРИНЕ — НЕ СКОРОСТЬ ПРОДАЖ, и подставлять его в
+        # steam_volume нельзя.
+        #
+        # reference.quantity от CSFloat — это «сколько таких предметов на
+        # рынке», то есть СКОЛЬКО ЛЕЖИТ. Он попал сюда как «замена пропавшему
+        # scm.volume», но scm.volume означал ШТУК ПРОДАНО ЗА СУТКИ, и это
+        # совсем другая величина: сто лотов могут висеть на витрине годами и
+        # не продаться ни разу. Дальше по коду это число сравнивалось с
+        # порогом min_steam_volume, заданным в продажах, — то есть фильтр
+        # ликвидности сравнивал единицы с единицами другого рода.
+        #
+        # В /orders это уже исправлено: объём там спрашивается у Steam по
+        # короткому списку финалистов. Здесь делать так же нельзя — кандидатов
+        # тысячи, а priceoverview отвечает по одному предмету и банит за темп,
+        # — поэтому запас кладём в ОТДЕЛЬНОЕ поле. Ликвидность же у арбитража
+        # проверяет _verify_against_steam живым запросом по тем, кто прошёл
+        # отбор: именно там объём настоящий.
+        if l.csfloat_quantity is None and l.reference_quantity is not None:
+            l.csfloat_quantity = l.reference_quantity
 
         found = prices.get(l.market_hash_name)
         # Только суточное окно, без отката на недельное и старше — см.
@@ -6743,6 +6758,15 @@ ORDERS_STEAM_VERIFY_LIMIT = envcfg.env_int("ORDERS_STEAM_VERIFY_LIMIT", 25)
 # лишь отделяет «только что спросили» от «лежало в кэше».
 ORDERS_STEAM_FRESH_SECONDS = envcfg.env_float("ORDERS_STEAM_FRESH", 60.0)
 
+# Насколько низко относительно витрины CSFloat заявка ещё имеет шанс.
+#
+# 0.5 значит «не ниже половины текущей цены продавца». Число взято не из
+# замера, а как граница здравого смысла, и его видно в настройках: заявка на
+# 20-30% ниже витрины дождётся того, кто спешит продать, а заявка в сто раз
+# ниже — никого. Отказом это НЕ делается: лотерейный билет стоит дёшево и
+# вреда не наносит, он лишь не должен стоять первой строкой отчёта.
+ORDERS_MIN_REACH = envcfg.env_float("ORDERS_MIN_REACH", 0.5)
+
 # ГЛУБИНА ШИРОКОГО СКАНА. Считается от остатка квоты, а не задаётся числом.
 #
 # Арифметика, из которой всё следует. Квота CSFloat — 200 запросов в час НА
@@ -6845,6 +6869,15 @@ class _OrderCandidate(NamedTuple):
     # Сошлись ли два независимых источника цены Steam (прайс-лист csgotrader и
     # справка CSFloat). None — сверить было не с чем.
     price_confirmed: bool | None = None
+    # Самая низкая цена продавца на CSFloat, в центах. None — не смотрели.
+    #
+    # Нужна ровно для одного вопроса: исполнится ли наша заявка вообще.
+    # Прогон 2026-09-16 выдал «ордер $1.02, Steam $102.62, прибыль 8653%,
+    # перебиваем $1.01» — то есть мы становимся первыми в стакане, которым
+    # никто не пользуется, на нож стоимостью в сотню. Заявка в сто раз ниже
+    # рынка не исполнится никогда, а прибыль при этом считается настоящей и
+    # уезжает на первую строку отчёта.
+    csfloat_ask_cents: int | None = None
     # Цена подтверждена ЖИВЫМ запросом к Steam, а не взята из прайс-листа.
     #
     # Разница принципиальная и уже стоила ложной находки. Прайс-лист даёт
@@ -6954,6 +6987,7 @@ async def _order_candidates_from_arb(
             volume_per_day=None,
             spread_pct=spread_by_name.get(o.market_hash_name),
             source="арбитраж",
+            csfloat_ask_cents=int(round(o.price * 100)),
             price_confirmed=confirmed_by_name.get(o.market_hash_name),
         )
         for o in offers
@@ -7489,6 +7523,11 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     if lots:
                         listing_id = lots[0].listing_id
+                        # Тот же запрос отдаёт и цену продавца — берём, она
+                        # решает, исполнима ли заявка вообще.
+                        cand = cand._replace(
+                            csfloat_ask_cents=int(round(lots[0].price * 100))
+                        )
                     else:
                         blind[cand.market_hash_name] = "на CSFloat лотов нет"
 
@@ -7542,8 +7581,31 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     checked = sum(1 for c in ranked if c.steam_verified)
 
     lines = ["<b>Сухой прогон ордеров</b> — ничего не поставлено", ""]
+    # ЧТО ЗНАЧИТ «ЗАЯВКА ДОСТАЁТ ДО РЫНКА».
+    #
+    # Смысл ордера — купить дешевле, чем просят сейчас, и подождать. Но ждать
+    # можно по-разному: заявка на 20% ниже витрины дождётся того, кто спешит
+    # продать, а заявка в сто раз ниже витрины не дождётся никого. Разделяет
+    # их отношение нашей цены к самой низкой цене продавца на CSFloat.
+    #
+    # Порог не отказ, а сортировка и пометка: заявка-лотерейный билет стоит
+    # дёшево и вреда не делает, а вот стоять первой строкой отчёта с
+    # «прибылью 8653%» она не должна — иначе именно её и поставят.
+    def _reach(cand, plan) -> float | None:
+        """Наша цена в долях от цены продавца. None — цену продавца не знаем."""
+        if not cand.csfloat_ask_cents:
+            return None
+        return plan.price_cents / cand.csfloat_ask_cents
+
+    def _order_rank(row):
+        cand, plan = row
+        reach = _reach(cand, plan)
+        # Сначала те, что достают до рынка; внутри группы — по прибыли.
+        plausible = reach is None or reach >= ORDERS_MIN_REACH
+        return (0 if plausible else 1, -plan.profit_pct)
+
     if plans:
-        for cand, plan in sorted(plans, key=lambda x: -x[1].profit_pct):
+        for cand, plan in sorted(plans, key=_order_rank):
             if plan.rival_cents is not None:
                 rival = f"перебиваем ${plan.rival_cents / 100:.2f}"
             else:
@@ -7566,6 +7628,18 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{mark} ${plan.steam_price_cents / 100:.2f} · "
                 f"прибыль <b>{plan.profit_pct:.0f}%</b> · {rival}"
             )
+            reach = _reach(cand, plan)
+            if reach is not None and reach < ORDERS_MIN_REACH:
+                lines.append(
+                    f"  ⚠️ на CSFloat просят ${cand.csfloat_ask_cents / 100:.2f} — "
+                    f"наша заявка ниже витрины в {1 / reach:.0f} раз(а). "
+                    f"Прибыль настоящая, но исполнится такое едва ли."
+                )
+            elif cand.csfloat_ask_cents:
+                lines.append(
+                    f"  на CSFloat просят ${cand.csfloat_ask_cents / 100:.2f} — "
+                    f"заявка ниже витрины на {(1 - reach) * 100:.0f}%"
+                )
     else:
         lines.append("Ни одного ордера не поставил бы.")
 
