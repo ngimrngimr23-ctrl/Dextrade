@@ -912,6 +912,36 @@ PROXY_TRANSIENT_COOLDOWN_SECONDS = 60
 # пул может быть каким угодно большим, а ждать человек готов секунды.
 PROXY_ATTEMPTS_PER_PAGE = envcfg.env_int("CSFLOAT_PROXY_ATTEMPTS", 8)
 
+
+# Адрес, через который в последний раз реально прошёл запрос.
+#
+# CSFLOAT_MAX_ADDRESSES=1 — правило верное: квота у CSFloat считается по ключу,
+# а на множество адресов с одного ключа он ругается прямым текстом («too many
+# requests from too many IPs»). Но «один адрес» и «ПЕРВЫЙ попавшийся адрес» —
+# разные вещи, и разницу эту измерили:
+#
+#     /proxycheck: работают 38 из 134
+#
+# То есть случайно взятый логин мёртв с вероятностью примерно 0.72. Полосы
+# широкого скана брали lane_addresses = proxies[:1], все шесть садились на
+# ОДИН такой логин, и когда он оказывался мёртвым — а так бывало в трёх
+# случаях из четырёх — каждая полоса самостоятельно перебирала по восемь
+# замен. В логе это ровно «48 из 48 отказал шлюз» при 86 свободных адресах.
+#
+# Липкий адрес чинит это, не нарушая правила: адресов по-прежнему один, просто
+# это тот, про который известно, что он работает. Первый же удачный запрос
+# запоминает его, и остальные полосы садятся сразу на рабочий.
+_sticky_lane: str | None = None
+
+
+def lane_address() -> str | None:
+    """Рабочий адрес для полосы: липкий, если он ещё свободен, иначе новый."""
+    if not CSFLOAT_POOL.enabled():
+        return None
+    if _sticky_lane and _sticky_lane in CSFLOAT_POOL.available():
+        return _sticky_lane
+    return CSFLOAT_POOL.next()
+
 DIRECT_BLOCK_SECONDS = envcfg.env_int("CSFLOAT_DIRECT_BLOCK_SECONDS", 900)
 _direct_blocked_until = 0.0
 
@@ -1214,6 +1244,12 @@ async def fetch_listings_page(
                 session, url, request_params, proxy,
                 shared_cooldown=not going_direct,
             )
+            # Запрос прошёл — запоминаем адрес как рабочую полосу. Следующим
+            # полосам незачем заново выяснять то, что только что выяснилось
+            # (см. _sticky_lane).
+            if proxy:
+                global _sticky_lane
+                _sticky_lane = proxy
             break
         except _DirectRefused as refused:
             # Прямой адрес отказал. Ключ при этом цел, пул тоже — просто этот
@@ -1575,7 +1611,11 @@ async def fetch_market_wide(
     # час, проверено — числом прокси не умножается), а темп и так держит общий
     # throttle по ключу. Прокси нужен ровно для одного — обойти блокировку
     # датацентрового адреса Render. Для этого хватает одного.
-    lane_addresses = proxies[:max(1, CSFLOAT_MAX_ADDRESSES)]
+    # Берём липкий рабочий адрес, а не просто первый из списка — см.
+    # _sticky_lane. Число адресов от этого не меняется, меняется только их
+    # качество.
+    lane_addresses = [a for a in (lane_address(),) if a] or proxies[:1]
+    lane_addresses = lane_addresses[:max(1, CSFLOAT_MAX_ADDRESSES)]
 
     # Бюджет запросов на прогон. Нижняя граница — по странице на полосу: без
     # неё при маленьком target часть полос не получила бы ни одного запроса и
@@ -1601,7 +1641,12 @@ async def fetch_market_wide(
         try:
             listings, cursor = await fetch_listings_page(
                 session, cursor=band.cursor, sort_by=sort_by,
-                min_price=band.lo, max_price=band.hi, proxy=band.proxy,
+                # Адрес берём В МОМЕНТ запроса, а не тот, что был при
+                # постройке полосы. Полосы идут не одновременно — их
+                # выстраивает общий throttle по ключу, — поэтому к запросу
+                # второй полосы первая уже выяснила, какой логин живой.
+                min_price=band.lo, max_price=band.hi,
+                proxy=lane_address() or band.proxy,
             )
         except (CSFloatRateLimited, CSFloatError) as e:
             # Отдаём то, что успели набрать, а не теряем всё.
