@@ -1221,6 +1221,17 @@ async def fetch_listings_page(
             proxy, force_direct = None, False
         elif proxy and attempt == 0:
             pass
+        elif attempt == 0:
+            # Первая попытка — на ЗАВЕДОМО рабочий логин, а не на случайный.
+            #
+            # Липкая полоса была только у широкого скана, а поштучные запросы
+            # (поиск лота по имени для /orders) брали next() вслепую. При
+            # доле рабочих логинов 37 из 134 это восемь промахов подряд с
+            # вероятностью 0.72^8 ≈ 7%, и в отчёте регулярно вылезало
+            # «8 из 8 отказал шлюз» при 126 неотложенных адресах. Знание,
+            # какой логин живой, общее — незачем добывать его заново на
+            # каждом запросе.
+            proxy = lane_address()
         else:
             proxy = CSFLOAT_POOL.next() if CSFLOAT_POOL.enabled() else None
 
@@ -1517,7 +1528,8 @@ async def buy_orders_for(
     )
     routes: list[str | None] = [None]
     if CSFLOAT_POOL.enabled():
-        routes.append(CSFLOAT_POOL.next())
+        # Запасной маршрут — липкий рабочий логин, а не случайный из пула.
+        routes.append(lane_address())
 
     data = None
     for proxy in routes:
