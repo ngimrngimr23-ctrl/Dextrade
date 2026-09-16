@@ -1071,12 +1071,29 @@ async def _request_listings(
             CSFLOAT_POOL.note_gateway_refusal(
                 proxy, PROXY_TRANSIENT_COOLDOWN_SECONDS, f"HTTP 403: {e}"
             )
-        raise _ProxyTransient(f"HTTP {e.status} от прокси: {e}") from None
+        # ТЕКСТ ИСКЛЮЧЕНИЯ ЧИСТИМ ЗДЕСЬ, А НЕ НА ВЫХОДЕ.
+        #
+        # aiohttp кладёт в ClientHttpProxyError полный url прокси — вместе с
+        # логином и ПАРОЛЕМ. Отсюда он расходился по цепочке: в _ProxyTransient,
+        # оттуда в «Последний ответ: ...» у CSFloatError, оттуда в сообщение
+        # арбитража — и 2026-09-16 пароль ушёл в чат открытым текстом.
+        #
+        # Чистка на выходе (scan_errors.scrub) существует, но полагаться
+        # только на неё нельзя: путей наружу много, и достаточно одного, где
+        # её забыли — что и случилось. Секрет не должен попадать в строку
+        # вообще, тогда забывать будет нечего.
+        raise _ProxyTransient(
+            f"HTTP {e.status} от прокси {mask_proxy(proxy)}"
+        ) from None
     except _TRANSIENT_PROXY_ERRORS as e:
         # Без прокси менять нечего — тогда это честная сетевая ошибка наружу.
         if not proxy:
-            raise CSFloatError(f"Сетевая ошибка при запросе к CSFloat: {e}") from None
-        raise _ProxyTransient(f"{type(e).__name__}: {e}") from None
+            raise CSFloatError(
+            f"Сетевая ошибка при запросе к CSFloat: {scrub(str(e))}"
+        ) from None
+        raise _ProxyTransient(
+            f"{type(e).__name__} на {mask_proxy(proxy)}: {scrub(str(e))}"
+        ) from None
 
 
 async def _do_request(
@@ -1309,6 +1326,7 @@ async def fetch_listings_page(
             ) from None
         except _ProxyTransient as broke:
             attempt += 1
+            log.info("csfloat: попытка %d — %s", attempt + 1, broke)
             CSFLOAT_POOL.mark_exhausted(
                 proxy, PROXY_TRANSIENT_COOLDOWN_SECONDS, f"сетевой сбой ({broke})"
             )
@@ -1319,9 +1337,15 @@ async def fetch_listings_page(
                     # за 96 попыток, и до прямого очередь не доходила никогда.
                     force_direct = True
                     continue
+                # Коротко и по делу. Прежний текст вываливал в чат весь
+                # разбор пула на пол-экрана плюс сырой ответ aiohttp — вместе
+                # с логином и паролем прокси. Подробности место в логе;
+                # человеку нужно знать, ЧТО не работает и ЧТО с этим делать.
                 raise CSFloatError(
-                    f"Прокси не пропускают запрос: {CSFLOAT_POOL.failure_hint()}.\n"
-                    f"Последний ответ: {broke}"
+                    f"CSFloat недоступен: прокси отказали "
+                    f"({PROXY_ATTEMPTS_PER_PAGE} логин(ов) подряд, 403 от шлюза), "
+                    f"прямой адрес тоже не прошёл. Это сторона провайдера "
+                    f"прокси. Проверить: /proxycheck, /csfloatapi"
                 ) from None
             # Адрес уже помечен, следующий заход возьмёт другой — паузы не надо.
             continue
@@ -1711,7 +1735,7 @@ async def fetch_market_wide(
             # семь запросов уже отработали и 350 лотов были на руках. За эти
             # запросы бюджет уже списан — выбрасывать их результат бессмысленно
             # вдвойне.
-            band.done, band.reason = True, f"оборвалась ({e})"
+            band.done, band.reason = True, f"оборвалась ({scrub(str(e))})"
             band.broke = True
             broken.append(e)
 

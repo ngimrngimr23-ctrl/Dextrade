@@ -3567,7 +3567,10 @@ async def arb_scan_job(context: ContextTypes.DEFAULT_TYPE):
                 await mark_offer_sent(chat_id, notice_key)
     except CSFloatError as e:
         log.warning("arb: chat_id=%s ошибка CSFloat: %s", chat_id, e)
-        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Арбитраж: {e}")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ Арбитраж: {scan_errors.scrub(str(e))}",
+        )
     except Exception:
         log.exception("arb: непредвиденная ошибка в прогоне chat_id=%s", chat_id)
     finally:
