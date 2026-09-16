@@ -6569,6 +6569,24 @@ async def _order_candidates_from_arb(chat_id: int) -> list[_OrderCandidate]:
     # прямым адресом сам — см. fetch_listings_page.
 
     settings = await get_arb_settings(chat_id)
+
+    # min_discount=None значит «арбитраж в этом чате выключен» (см. /arb выкл),
+    # и сюда это значение приходит наравне с числом. Без проверки оно улетало
+    # прямо в вычитание и роняло всю команду: «unsupported operand type(s)
+    # for -: NoneType and float». В /arbnow такая проверка есть и стоит первой
+    # строкой, а здесь её не было — прогон просто не доходил до этого места,
+    # пока широкий скан падал раньше.
+    #
+    # Отсутствие порога здесь не беда, а норма. Ордерам скидка лота на CSFloat
+    # не нужна вовсе: цену ордера считает buy_orders от цены Steam и целевой
+    # прибыли. Порог арбитража служит лишь предварительным ситом, и когда его
+    # нет — сита нет, кандидатов отбирают пороги ордеров.
+    min_discount = settings["min_discount"]
+    prefilter_pct = (
+        0.0 if min_discount is None
+        else max(0.0, min_discount - ARB_PREFILTER_MARGIN_PCT)
+    )
+
     listings = await csfloat_client.fetch_market_wide(
         target=ORDERS_ARB_TARGET, sort_by=ARB_SORT_BY,
         min_price=settings["min_price"], max_price=settings["max_price"],
@@ -6580,7 +6598,7 @@ async def _order_candidates_from_arb(chat_id: int) -> list[_OrderCandidate]:
     }
     offers = find_arbitrage_offers(
         listings,
-        min_discount_pct=max(0.0, settings["min_discount"] - ARB_PREFILTER_MARGIN_PCT),
+        min_discount_pct=prefilter_pct,
         min_price=settings["min_price"], max_price=settings["max_price"],
         min_steam_volume=settings["min_volume"],
         sticker_max_markup_pct=settings["sticker_markup"],
