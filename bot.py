@@ -4791,6 +4791,47 @@ async def proxycheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     direct_ip, direct_error = await ask_direct_ip()
     results = await asyncio.gather(*(one(p) for p in pool.proxies))
 
+    # ВТОРАЯ ПРОВЕРКА — ДО ТОГО ХОСТА, КУДА БОТ РЕАЛЬНО ХОДИТ.
+    #
+    # Без неё эта команда вводила в заблуждение месяцами, и меня в том числе.
+    # Она спрашивала ipify и докладывала «работают 37 из 134», а скан в ту же
+    # минуту получал 403 на всех восьми попытках к csfloat.com. Оба числа
+    # верны — просто это РАЗНЫЕ вопросы: «пускает ли провайдер вообще» и
+    # «пускает ли он на нужный нам домен».
+    #
+    # Резидентные провайдеры часто фильтруют по адресу назначения, и тогда
+    # логин живой, проверка зелёная, а работа стоит. Проверяется это
+    # единственным способом — постучаться именно туда.
+    #
+    # Квота CSFloat при этом не тратится: мы просим САЙТ, а не /api/v1/*, да и
+    # отказ провайдера случается на CONNECT, ещё до того как запрос уйдёт.
+    # Проверяем только те логины, что прошли первую проверку: у остальных
+    # ответ и так известен.
+    alive = [proxy for proxy, first, _s, _e in results if first]
+
+    async def ask_csfloat(proxy: str):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://csfloat.com/favicon.ico",
+                    proxy=proxy,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    return proxy, resp.status, None
+        except Exception as e:  # noqa: BLE001 — проверка не падает целиком
+            return proxy, None, f"{type(e).__name__}: {e}"
+
+    async def one_csfloat(proxy: str):
+        async with gate:
+            return await ask_csfloat(proxy)
+
+    csfloat_results = await asyncio.gather(*(one_csfloat(p) for p in alive))
+    csfloat_ok = [p for p, status, _e in csfloat_results if status and status < 400]
+    csfloat_refused = [
+        (p, err) for p, status, err in csfloat_results
+        if not (status and status < 400)
+    ]
+
     ips: dict[str, int] = {}
     rotating = 0
     # Построчный список адресов печатаем только у небольшого пула. На полусотне
@@ -4884,6 +4925,31 @@ async def proxycheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "следующий запрос уйдёт уже с другого. Кулдаун таким прокси только "
             "мешает, и он снижен до нескольких секунд."
         )
+
+    # Сравнение двух проверок — самое важное число этой команды.
+    if alive:
+        lines.append("")
+        lines.append(
+            f"<b>До csfloat.com доходят {len(csfloat_ok)} из {len(alive)}</b> "
+            f"(проверялись только те, что ответили ipify)."
+        )
+        if csfloat_ok and len(csfloat_ok) < len(alive):
+            lines.append(
+                "<i>Часть логинов пускает куда угодно, но не на csfloat.com — "
+                "похоже на фильтр по адресу назначения у провайдера.</i>"
+            )
+        elif not csfloat_ok:
+            lines.append(
+                "⚠️ <b>Ни один логин не доходит до csfloat.com, хотя до ipify "
+                "доходят.</b>\n"
+                "Это не «прокси мёртвые» — это <b>фильтр по адресу назначения</b>: "
+                "провайдер пускает вообще, но именно на csfloat.com не пускает. "
+                "Спрашивать надо у поддержки flameproxies, открыт ли у тарифа "
+                "доступ к csfloat.com; сменой логинов это не лечится."
+            )
+            first_err = next((e for _p, e in csfloat_refused if e), None)
+            if first_err:
+                lines.append(f"<i>Ответ: {html_module.escape(first_err)}</i>")
 
     lines.append("")
     if direct_ip:
