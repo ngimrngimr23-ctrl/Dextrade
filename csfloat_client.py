@@ -980,7 +980,20 @@ async def _request_listings(
         if e.status == 403:
             # Отказ авторизации самого прокси-сервиса — разовым ретраем на тот
             # же адрес не лечится, помечаем насовсем (см. ProxyPool.mark_dead).
-            CSFLOAT_POOL.mark_refused(proxy, PROXY_TRANSIENT_COOLDOWN_SECONDS, f"HTTP 403: {e}")
+            #
+            # И заодно считаем серию: восемь РАЗНЫХ логинов подряд с 403 на
+            # CONNECT — это отказ шлюза, а не совпадение, и перебирать
+            # оставшиеся сто двадцать шесть бессмысленно. Пул откладывается
+            # целиком, next() отдаёт None, и запрос тем же заходом уходит
+            # прямым адресом.
+            #
+            # Этой строчки тут не было, и из-за неё вся защита от мёртвого
+            # шлюза работала только у Steam: CSFloat звал mark_refused, то
+            # есть считал каждый отказ отдельным невезением. Отсюда и брались
+            # минутные простои на ровном месте.
+            CSFLOAT_POOL.note_gateway_refusal(
+                proxy, PROXY_TRANSIENT_COOLDOWN_SECONDS, f"HTTP 403: {e}"
+            )
         raise _ProxyTransient(f"HTTP {e.status} от прокси: {e}") from None
     except _TRANSIENT_PROXY_ERRORS as e:
         # Без прокси менять нечего — тогда это честная сетевая ошибка наружу.

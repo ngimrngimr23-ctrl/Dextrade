@@ -4764,6 +4764,31 @@ async def proxycheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 return proxy, None, None, f"{type(e).__name__}: {e}"
 
+    # Свой ПРЯМОЙ адрес спрашиваем отдельно и первым делом.
+    #
+    # Это главный вопрос, когда шлюз отвечает 403 на CONNECT всем логинам
+    # подряд. Такой отказ почти всегда означает не «логины плохие», а «этот
+    # клиент провайдеру незнаком»: у резидентных провайдеров доступ обычно
+    # привязан либо к логину с паролем, либо к белому списку IP. Переезд на
+    # другой аккаунт Render меняет исходящий адрес — и белый список, собранный
+    # на старом, перестаёт совпадать.
+    #
+    # Узнать этот адрес изнутри контейнера больше неоткуда, а внести его в
+    # кабинет провайдера — дело одной минуты. Поэтому печатаем его всегда, а
+    # не только при отказах.
+    async def ask_direct_ip():
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://api.ipify.org?format=json",
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    data = await resp.json(content_type=None)
+                    return data.get("ip"), None
+        except Exception as e:  # noqa: BLE001 — проверка не должна падать целиком
+            return None, f"{type(e).__name__}: {e}"
+
+    direct_ip, direct_error = await ask_direct_ip()
     results = await asyncio.gather(*(one(p) for p in pool.proxies))
 
     ips: dict[str, int] = {}
@@ -4816,10 +4841,30 @@ async def proxycheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "мешает, и он снижен до нескольких секунд."
         )
 
+    lines.append("")
+    if direct_ip:
+        lines.append(
+            f"<b>Наш прямой адрес:</b> <code>{html_module.escape(direct_ip)}</code>\n"
+            "<i>Это тот IP, которым бот приходит к провайдеру прокси. Если "
+            "доступ у провайдера выдан по белому списку — вносить надо именно "
+            "его.</i>"
+        )
+    else:
+        lines.append(
+            f"<b>Свой прямой адрес узнать не вышло:</b> "
+            f"{html_module.escape(direct_error or 'нет ответа')}"
+        )
+
     unique = len(ips)
     lines.append("")
     if unique == 0:
-        lines.append("⚠️ Ни один прокси не ответил — проверь доступы и остаток трафика.")
+        lines.append(
+            "⚠️ <b>Ни один прокси не ответил.</b> При 403 на CONNECT у ВСЕХ "
+            "логинов сразу дело обычно не в логинах, а в доступе аккаунта: "
+            "кончился трафик, истекла подписка, либо доступ выдан по белому "
+            "списку IP, а наш адрес (выше) в нём не значится — так бывает "
+            "после переезда на другой аккаунт хостинга."
+        )
     elif unique == 1 and len(pool) > 1:
         lines.append(
             f"⚠️ <b>Все {len(pool)} прокси выходят с ОДНОГО адреса.</b>\n"
