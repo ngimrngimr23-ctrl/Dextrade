@@ -143,6 +143,14 @@ class ProxyPool:
         self._sidelined_by: dict[str, str] = {}
         # Отказы подряд по каждому адресу — см. mark_refused/mark_ok.
         self._refusals: dict[str, int] = {}
+        # Итог последней явной проверки (/proxycheck): (рабочих, всего, когда).
+        #
+        # Нужен ради одного вопроса, который задали прямым текстом: «какие 86
+        # свободных, если я точно знаю что 37?». Оба числа были правдой о
+        # разном. available() отвечает «сколько адресов сейчас не отложены», а
+        # это НЕ «сколько работают»: адрес, который никто ещё не пробовал, не
+        # отложен. Слово «свободных» обещало второе, а считало первое.
+        self._last_check: tuple[int, int, float] | None = None
         self._cursor = 0
 
         for candidate in _SPLIT_RE.split(raw or ""):
@@ -445,17 +453,32 @@ class ProxyPool:
         self._dead_until.pop(proxy, None)
         self._gateway_strikes.clear()
 
-    def mark_dead(self, proxy: str, reason: str = "") -> None:
+    def mark_dead(self, proxy: str, reason: str = "", retry_after: float | None = None) -> None:
         """
         Пометить адрес нерабочим (не ответил вовсе, а не получил отказ от
         площадки). Держим отдельно от кулдауна: кулдаун — это «занят сейчас»,
         а тут «похоже, не работает совсем», и в /proxycheck это разные строки.
+
+        retry_after — когда дать следующий шанс, если срок не обычный.
+        Нужен, чтобы разводить воскрешения во времени: /proxycheck помечает
+        под сотню адресов одной секундой, и с общим сроком они ровно через
+        пятнадцать минут возвращаются в строй ВСЕ СРАЗУ. Пул мгновенно
+        наливается обратно до ста тридцати четырёх, три четверти из которых —
+        заведомый мусор, и работа заново выясняет перебором то, что проверка
+        уже выяснила. Разложенные во времени, они возвращаются по одному, и
+        каждый проверяется настоящим запросом, а не толпой.
         """
         self.dead[proxy] = reason or "не отвечает"
-        self._dead_until[proxy] = time.time() + self.DEAD_RETRY_SECONDS
+        self._dead_until[proxy] = time.time() + (
+            self.DEAD_RETRY_SECONDS if retry_after is None else retry_after
+        )
 
     def mark_alive(self, proxy: str) -> None:
         self.dead.pop(proxy, None)
+
+    def note_check(self, working: int, total: int) -> None:
+        """Запомнить итог явной проверки — он попадает в describe()."""
+        self._last_check = (working, total, time.time())
 
     def hosts(self) -> set[str]:
         """Разные точки входа в пуле — «хост:порт» без логина и пароля."""
@@ -663,7 +686,15 @@ class ProxyPool:
         if not self.proxies:
             return "не задан"
         free = self.available()
-        parts = [f"{len(free)} свободных из {len(self.proxies)}"]
+        # «не отложены», а не «свободны»: см. _last_check о том, почему это
+        # разные вещи и почему прежнее слово вводило в заблуждение.
+        parts = [f"{len(free)} не отложены из {len(self.proxies)}"]
+        if self._last_check:
+            ok, total, when = self._last_check
+            parts.append(
+                f"по проверке {(time.time() - when) / 60:.0f} мин назад "
+                f"работали {ok} из {total}"
+            )
         if self.dead:
             parts.append(f"{len(self.dead)} не отвечают")
         busy = [p for p in self.proxies if self.cooldown_remaining(p) > 0]

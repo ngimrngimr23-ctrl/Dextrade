@@ -4836,19 +4836,45 @@ async def proxycheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     #
     # Мёртвая отметка не вечная: DEAD_RETRY_SECONDS вернёт адрес в строй, и
     # если провайдер оживёт, следующая проверка это увидит.
+    # Воскрешения разносим по времени, а не назначаем всем один срок.
+    #
+    # Иначе выходит так: проверка помечает под сотню адресов одной секундой,
+    # и ровно через DEAD_RETRY_SECONDS они возвращаются в строй ВСЕ СРАЗУ.
+    # Пул мгновенно наливается обратно до ста тридцати четырёх, три четверти
+    # из которых — заведомый мусор, и работа выясняет перебором ровно то, что
+    # проверка уже выяснила. Со стороны это выглядело как «бот считает
+    # свободными 86, хотя работают 37» — и это был честный вопрос.
+    #
+    # Разложенные по окну, мёртвые возвращаются по одному, и каждого проверяет
+    # настоящий запрос, а не толпа. Если провайдер оживёт, это заметят в
+    # первые же минуты; если нет — пул остаётся чистым.
+    dead_seen = [proxy for proxy, first, _s, _e in results if not first]
+    window = proxy_pool.ProxyPool.DEAD_RETRY_SECONDS
+    step = window / max(1, len(dead_seen))
+
     taught = 0
     for target in (STEAM_POOL, csfloat_client.CSFLOAT_POOL):
         if not target.enabled():
             continue
+        revived_at = 0
         for proxy, first, _second, _err in results:
             if proxy not in target.proxies:
                 continue
             if first:
                 target.mark_alive(proxy)
             else:
-                target.mark_dead(proxy, "не ответил при проверке")
+                revived_at += 1
+                target.mark_dead(
+                    proxy, "не ответил при проверке", retry_after=step * revived_at
+                )
             taught += 1
-    log.info("proxycheck: разнёс %d отметок живости по пулам", taught)
+        target.note_check(len(results) - len(dead_seen), len(results))
+
+    log.info(
+        "proxycheck: разнёс %d отметок по пулам; %d мёртвых вернутся по одному "
+        "каждые %.0f с",
+        taught, len(dead_seen), step,
+    )
 
     if rotating:
         lines.append("")
