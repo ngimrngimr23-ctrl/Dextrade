@@ -5657,6 +5657,7 @@ class LiveQuote(NamedTuple):
 
 async def _live_prices_for(
     chat_id: int, names: list[str], *, max_age: float | None = None,
+    need_volume: bool = False,
 ) -> dict[str, LiveQuote]:
     """
     Живая цена Steam по списку имён — сколько получится в рамках бюджета.
@@ -5666,6 +5667,20 @@ async def _live_prices_for(
     цен живёт 12 часов, а вопрос команды — «дёшево ли ПРЯМО СЕЙЧАС», и
     полусуточная запись на него не отвечает. Записи старше max_age считаются
     промахом и перезапрашиваются.
+
+    need_volume — «запись без объёма продаж мне не годится, спроси заново».
+
+    Зачем отдельный флаг. Запись с ценой, но без объёма — это НЕ ответ Steam,
+    а след того, что спросить не удалось: цену тогда взяли запасным путём из
+    листингов, а объём брать было неоткуда (см. LiveQuote.volume и
+    STEAM_PRICE_NO_VOLUME_TTL_SECONDS в storage). Такая запись проходила как
+    полноценная, потому что цена в ней есть, — и перезапроса не случалось
+    НИКОГДА, до самого истечения её срока.
+
+    Наружу это выглядело тупиком: /orders раз за разом отказывал всем восьми
+    кандидатам с «объём продаж неизвестен», а бот при этом даже не пробовал
+    его узнать. Тем, кому объём нужен для решения, теперь такая запись
+    честно считается промахом.
 
     Молча возвращает то, что удалось: при забаненном priceoverview это пустой
     словарь, и находки уйдут с пометкой «оценка». Отказываться от них целиком
@@ -5678,12 +5693,25 @@ async def _live_prices_for(
 
     out: dict[str, LiveQuote] = {}
     stale = 0
+    # Записи с ценой, но без объёма: запасной вариант на случай, если
+    # перезапросить не выйдет.
+    incomplete_quotes: dict[str, LiveQuote] = {}
     for name, entry in cached.items():
         if not entry.get("price"):
             continue
         age = now - entry.get("updated_at", 0)
         if max_age is not None and age > max_age:
             stale += 1
+            continue
+        if need_volume and entry.get("volume") is None:
+            # Откладываем, но НЕ выбрасываем: если спросить заново не выйдет
+            # (у priceoverview кулдаун жёсткий и пул его не обходит — см.
+            # pricing.get_steam_market_price_retrying), неполная запись всё
+            # равно лучше пустоты. Кандидат тогда останется и честно скажет,
+            # что объём неизвестен, вместо того чтобы молча пропасть.
+            incomplete_quotes[name] = LiveQuote(
+                entry["price"], entry.get("median"), None, age,
+            )
             continue
         out[name] = LiveQuote(
             entry["price"], entry.get("median"), entry.get("volume"), age,
@@ -5695,7 +5723,14 @@ async def _live_prices_for(
             "живые цены: %d записей старше %.0f мин — перезапрашиваю",
             stale, (max_age or 0) / 60,
         )
+    if incomplete_quotes:
+        log.info(
+            "живые цены: %d записей с ценой, но без объёма продаж — "
+            "спрашиваю заново, объём нужен для решения",
+            len(incomplete_quotes),
+        )
     if not misses:
+        out.update(incomplete_quotes)
         return out
 
     semaphore = asyncio.Semaphore(pricing.PRICE_CONCURRENCY)
@@ -5715,6 +5750,20 @@ async def _live_prices_for(
         for name, quote in await asyncio.gather(*(one(session, n) for n in misses)):
             if quote:
                 out[name] = quote
+
+    # Кого спросить не удалось — отдаём тем, что было. Неполный ответ хуже
+    # полного, но лучше молчания: решение примет вызывающий, а не этот кэш.
+    unanswered = 0
+    for name, quote in incomplete_quotes.items():
+        if name not in out:
+            out[name] = quote
+            unanswered += 1
+    if unanswered:
+        log.info(
+            "живые цены: у %d предмет(ов) объём спросить не вышло — отдаю "
+            "цену без объёма",
+            unanswered,
+        )
     return out
 
 
@@ -6770,7 +6819,12 @@ async def _order_candidates_from_dips(chat_id: int) -> list[_OrderCandidate]:
         return []
 
     names = [d.market_hash_name for d in found[:ORDERS_PROBE_LIMIT * 2]]
-    quotes = await _live_prices_for(chat_id, names, max_age=DIPS_MAX_QUOTE_AGE)
+    # need_volume: без объёма продаж buy_orders.plan откажет по любому
+    # кандидату, так что неполная запись в кэше здесь бесполезна — лучше
+    # потратить запрос и спросить.
+    quotes = await _live_prices_for(
+        chat_id, names, max_age=DIPS_MAX_QUOTE_AGE, need_volume=True
+    )
 
     out: list[_OrderCandidate] = []
     for dip in found[:ORDERS_PROBE_LIMIT * 2]:
