@@ -7530,7 +7530,8 @@ async def csfloatapi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     lines = [f"<b>Ключ:</b> {csfloat_client.key_fingerprint()}", ""]
-    for path, why, status, body, route in results:
+    verdicts: list[str] = []
+    for path, why, status, body, route, limits in results:
         if status is None:
             mark = "⚠️"
         elif status == 200:
@@ -7543,7 +7544,46 @@ async def csfloatapi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mark = "❔"
         lines.append(f"{mark} <code>{html_module.escape(path)}</code> — {why}")
         lines.append(f"   HTTP {status if status is not None else '—'} "
-                     f"({route}): {html_module.escape(body[:160])}")
+                     f"({route}, {html_module.escape(limits)}): "
+                     f"{html_module.escape(body[:160])}")
+
+        # 429 читается только вместе с остатком квоты.
+        #
+        # CSFloat отвечает «Please disable your VPN or try a different
+        # network, too many requests» — и это ДВА разных обвинения в одной
+        # фразе. Первое лечится только сменой адреса, второе проходит само за
+        # час, и выводы из них противоположные. Пока мы гадали, чинили не то.
+        if status == 429:
+            if "остаток 0 " in limits or limits.startswith("остаток 0"):
+                verdicts.append(
+                    f"<code>{html_module.escape(path)}</code>: 429 при "
+                    f"<b>нулевом остатке</b> — это КВОТА, а не репутация "
+                    f"адреса. Окно выбрано (его почти целиком съедает автоскан "
+                    f"арбитража), надо ждать сброса или освободить квоту: "
+                    f"реже прогон либо меньше ARB_TARGET_LISTINGS. Смена "
+                    f"адреса тут не поможет вообще."
+                )
+            elif limits.startswith("остаток"):
+                verdicts.append(
+                    f"<code>{html_module.escape(path)}</code>: 429 при "
+                    f"<b>целом окне</b> ({html_module.escape(limits)}) — "
+                    f"значит дело не в частоте, а в РЕПУТАЦИИ адреса: "
+                    f"датацентровый IP Render считают VPN. Лечится только "
+                    f"другим исходящим адресом, то есть рабочим прокси."
+                )
+            else:
+                verdicts.append(
+                    f"<code>{html_module.escape(path)}</code>: 429 без "
+                    f"заголовков лимита — по такому ответу отличить квоту от "
+                    f"репутации нельзя, но отсутствие заголовков само по себе "
+                    f"чаще встречалось у антибота, а не у честной квоты."
+                )
+
+    if verdicts:
+        lines.append("")
+        lines.append("<b>Что это значит:</b>")
+        lines.extend(f"• {v}" for v in verdicts)
+
     lines.append("")
     lines.append(
         "✅ — ключа хватает. 🔒 — ручка есть, но нужен другой способ входа "

@@ -805,12 +805,24 @@ async def probe() -> list[tuple[str, str, int | None, str]]:
     ТОЛЬКО GET и только чтение. Ничего не создаёт, не покупает и не тратит: на
     счету деньги, и пробник — не то место, где стоит рисковать.
 
-    Возвращает [(путь, зачем, HTTP-код или None, начало ответа, каким маршрутом)].
+    Возвращает [(путь, зачем, HTTP-код или None, начало ответа, каким
+    маршрутом, остаток лимита)].
+
+    ОСТАТОК ЛИМИТА — не украшение, а единственный способ прочитать 429
+    правильно. CSFloat отвечает на /listings с прямого адреса фразой
+    «Please disable your VPN or try a different network, too many requests»,
+    и в ней ДВА разных обвинения сразу: «ты через VPN» и «ты частишь». Первое
+    лечится только сменой адреса, второе проходит само за час, и это
+    противоположные выводы о том, что делать.
+
+    Различает их x-ratelimit-remaining. Ноль — мы честно выбрали окно, надо
+    ждать или освободить квоту. Двести при том же 429 — окно целое, значит
+    дело в репутации адреса. Пробник эти заголовки читал и выбрасывал.
     """
     if not csfloat_enabled():
         raise CSFloatError("CSFLOAT_API_KEY не задан")
 
-    out: list[tuple[str, str, int | None, str, str]] = []
+    out: list[tuple[str, str, int | None, str, str, str]] = []
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         for path, why in PROBE_PATHS:
             url, params = _build_request(path, {})
@@ -835,6 +847,7 @@ async def probe() -> list[tuple[str, str, int | None, str]]:
             status = None
             body = ""
             route_used = "—"
+            limits = "заголовков лимита нет"
             for proxy, label in routes:
                 try:
                     async with session.get(
@@ -844,6 +857,14 @@ async def probe() -> list[tuple[str, str, int | None, str]]:
                         status = resp.status
                         body = " ".join((await resp.text())[:200].split())
                         route_used = label
+                        headers = dict(resp.headers)
+                        # Заодно учим бот остатку квоты: он решает, начинать ли
+                        # широкий скан (см. _orders_scan_target).
+                        _note_budget(headers)
+                        remaining = _header(headers, "x-ratelimit-remaining")
+                        limit = _header(headers, "x-ratelimit-limit")
+                        if remaining is not None:
+                            limits = f"остаток {remaining} из {limit or '?'}"
                     break
                 except Exception as e:  # noqa: BLE001 — пробник не падает целиком
                     last_error = scrub(str(e))
@@ -854,7 +875,7 @@ async def probe() -> list[tuple[str, str, int | None, str]]:
                     f"не дошло ни напрямую, ни через прокси "
                     f"({PROBE_ATTEMPTS} попыт.): {last_error}"
                 )
-            out.append((path, why, status, body, route_used))
+            out.append((path, why, status, body, route_used, limits))
             await asyncio.sleep(MIN_REQUEST_INTERVAL)
     return out
 
