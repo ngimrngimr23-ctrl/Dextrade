@@ -6727,7 +6727,7 @@ async def reset_cooldowns(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Каждый стоит запроса к CSFloat (а кандидат из /dips — двух: сначала найти лот
 # по имени, потом прочитать его стакан), а квота там 200 в час на ключ и её уже
 # выбирает арбитраж. Десяток хватает, чтобы увидеть картину, и не ломает скан.
-ORDERS_PROBE_LIMIT = envcfg.env_int("ORDERS_PROBE_LIMIT", 25)
+ORDERS_PROBE_LIMIT = envcfg.env_int("ORDERS_PROBE_LIMIT", 30)
 
 # Сколько финалистов проверять живым запросом к Steam.
 #
@@ -7033,6 +7033,109 @@ def _volume_line(volume) -> str:
     )
 
 
+# Сколько предметов каталога брать в проверку за один прогон.
+#
+# Больше не имеет смысла: каждый предмет стоит трёх запросов (живая цена
+# Steam, поиск лота на CSFloat, чтение его стакана), и упирается это не в
+# каталог, а в квоты обеих площадок.
+ORDERS_CATALOG_BATCH = envcfg.env_int("ORDERS_CATALOG_BATCH", 30)
+
+
+async def _order_candidates_from_catalog(chat_id: int, limits: dict) -> list[_OrderCandidate]:
+    """
+    Кандидаты из ВСЕГО каталога CS2 в заданной ценовой полосе.
+
+    Почему это правильный источник для ордеров, а широкий скан лотов — нет.
+    Ордер ставится на ПРЕДМЕТ (market_hash_name), а не на лот. Широкий скан
+    отвечает на вопрос «что сейчас дёшево продаётся на CSFloat» — это вопрос
+    арбитража, где покупают немедленно. Для ордера вопрос другой: «у каких
+    предметов цена Steam такова, что выгодная заявка вообще возможна». На него
+    отвечает прайс-лист csgotrader — весь каталог CS2 с ценовыми окнами, он у
+    бота уже скачан и лежит на диске.
+
+    Разница в цене вопроса огромная. Просмотреть всю полосу $1-$65 широким
+    сканом — это десятки тысяч лотов, то есть часы при квоте 200 запросов в
+    час. Просмотреть её по каталогу — ноль запросов и доли секунды, потому что
+    отбор идёт локально. Сеть тратится только на ПРОВЕРКУ тех, кто отбор
+    прошёл.
+
+    Что отсеивается здесь, бесплатно:
+      * вне ценовой полосы;
+      * нет суточного окна — предмет сегодня не торговался вовсе, ставить на
+        него заявку значит ждать неизвестно чего;
+      * окна суток и недели разъезжаются сильнее порога — цена такая, что
+        считать от неё прибыль бессмысленно.
+
+    Всё остальное — ликвидность и чужие ордера — требует живых запросов, и
+    ими занимается общий конвейер /orders по короткому списку.
+
+    ОБХОД С МЕТКОЙ. Живьём за прогон проверяются лишь десятки предметов, а в
+    полосе их тысячи. Без метки каждый прогон разбирал бы одну и ту же
+    верхушку, и до остальных очередь не дошла бы никогда. Метка двигается по
+    кругу: прогон за прогоном полоса обходится целиком.
+    """
+    details = await get_csgotrader_price_details()
+    if not details:
+        return []
+
+    low, high = limits["low"], limits["high"]
+    max_spread = buy_orders.DEFAULT_MAX_SPREAD_PCT
+
+    band: list[tuple[str, float, float | None]] = []
+    skipped_quiet = skipped_jumpy = 0
+    for name, sp in details.items():
+        # Берём именно суточное окно, а не sp.price: наличие last_24h само по
+        # себе означает, что сделки сегодня были. Это единственный признак
+        # ликвидности, доступный бесплатно.
+        price = sp.windows.get("last_24h")
+        if price is None:
+            skipped_quiet += 1
+            continue
+        if not (low <= price <= high):
+            continue
+        spread = sp.recent_spread_pct
+        if spread is not None and spread > max_spread:
+            skipped_jumpy += 1
+            continue
+        band.append((name, price, spread))
+
+    if not band:
+        return []
+
+    # Порядок постоянный — иначе метка обхода теряет смысл. Дороже вперёд: при
+    # равной марже в процентах дорогой предмет даёт больше денег на ордер.
+    band.sort(key=lambda row: -row[1])
+
+    cursor = int(limits.get("cursor") or 0) % len(band)
+    window = band[cursor:cursor + ORDERS_CATALOG_BATCH]
+    if len(window) < ORDERS_CATALOG_BATCH:
+        window += band[:ORDERS_CATALOG_BATCH - len(window)]
+    await set_order_setting(
+        chat_id, "catalog_cursor", (cursor + len(window)) % len(band)
+    )
+
+    log.info(
+        "orders: каталог — в полосе $%g-$%g подходят %d предмет(ов) "
+        "(пропущено: %d без сделок за сутки, %d со скачущей ценой). "
+        "Беру %d начиная с %d",
+        low, high, len(band), skipped_quiet, skipped_jumpy, len(window), cursor,
+    )
+
+    return [
+        _OrderCandidate(
+            market_hash_name=name,
+            listing_id=None,
+            steam_price_cents=int(round(price * 100)),
+            # Объём спросим живым Steam по короткому списку — в прайс-листе
+            # его нет ни у одного источника.
+            volume_per_day=None,
+            spread_pct=spread,
+            source="каталог",
+        )
+        for name, price, spread in window
+    ]
+
+
 def _order_arg(raw: str, *, integer: bool = False):
     """
     Разобрать одно значение настройки. Прочерк — «не менять», как в /markets.
@@ -7159,6 +7262,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                    else buy_orders.DEFAULT_MIN_VOLUME_PER_WEEK),
         "low": saved.get("min_price") or 0.0,
         "high": saved.get("max_price") or buy_orders.DEFAULT_MAX_ORDER_USD,
+        "cursor": saved.get("catalog_cursor") or 0,
     }
     await update.message.reply_text(
         "Сухой прогон ордеров: смотрю арбитраж и просадки, читаю стаканы…\n"
@@ -7188,7 +7292,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     warm_took = time.monotonic() - warm_started
     log.info("orders: прайс-лист готов за %.1f с", warm_took)
 
-    from_arb = from_dips = scanned = 0
+    from_arb = from_dips = from_catalog = scanned = 0
     try:
         # Таймаут обязателен: без него команда зависит от того, как быстро
         # отвечает чужая сеть, а она может не отвечать вовсе — и тогда человек
@@ -7234,9 +7338,23 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.warning("orders: просадки не дали кандидатов: %s", e)
         await update.message.reply_text(f"⚠️ Просадки не дали кандидатов: {e}")
 
+    # Третий источник — весь каталог в ценовой полосе.
+    #
+    # Он и отвечает на вопрос «какие вообще предметы от $1 до $65 годятся под
+    # ордер»: широкий скан показывает лишь то, что прямо сейчас выставлено на
+    # CSFloat, а заявку можно поставить на любой предмет. Стоит этот источник
+    # ноль запросов — отбор идёт по уже скачанному прайс-листу.
+    try:
+        catalog_found = await _order_candidates_from_catalog(chat_id, limits)
+        from_catalog = len(catalog_found)
+        candidates += catalog_found
+    except Exception as e:  # noqa: BLE001 — источники независимы
+        log.warning("orders: каталог не дал кандидатов: %s", e)
+        await update.message.reply_text(f"⚠️ Каталог не дал кандидатов: {e}")
+
     log.info(
-        "orders: chat_id=%s кандидатов — арбитраж %d, просадки %d",
-        chat_id, from_arb, from_dips,
+        "orders: chat_id=%s кандидатов — арбитраж %d, просадки %d, каталог %d",
+        chat_id, from_arb, from_dips, from_catalog,
     )
 
     if not candidates:
@@ -7259,7 +7377,27 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c for c in best.values()
         if c.steam_price_cents >= limits["low"] * 100
     ]
-    ranked = sorted(in_range, key=lambda c: -c.steam_price_cents)[:ORDERS_PROBE_LIMIT]
+    # Места в финале делим между источниками по кругу, а не отдаём дороже.
+    #
+    # Иначе каталог забирает финал целиком: он отсортирован по убыванию цены и
+    # при полосе до $65 его верхушка заведомо дороже всего, что приносят
+    # просадки и арбитраж. Те два источника тогда не проверялись бы вовсе —
+    # притом что просадка это «цена упала ПРЯМО СЕЙЧАС», сигнал куда более
+    # скоропортящийся, чем «предмет в принципе подходит под ордер».
+    #
+    # Внутри источника порядок прежний, по убыванию цены.
+    by_source: dict[str, list[_OrderCandidate]] = {}
+    for cand in sorted(in_range, key=lambda c: -c.steam_price_cents):
+        by_source.setdefault(cand.source, []).append(cand)
+
+    ranked: list[_OrderCandidate] = []
+    while len(ranked) < ORDERS_PROBE_LIMIT and any(by_source.values()):
+        for queue in by_source.values():
+            if not queue:
+                continue
+            ranked.append(queue.pop(0))
+            if len(ranked) >= ORDERS_PROBE_LIMIT:
+                break
 
     # ПРОВЕРКА ФИНАЛИСТОВ ЖИВЫМ STEAM — и цены, и объёма, одним запросом.
     #
@@ -7495,8 +7633,8 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("")
     lines.append(
         f"Просмотрено лотов: {scanned}. Кандидатов: арбитраж {from_arb}, "
-        f"просадки {from_dips}. В финал вышло {len(ranked)}, "
-        f"живым Steam подтверждено {checked}."
+        f"просадки {from_dips}, каталог {from_catalog}. "
+        f"В финал вышло {len(ranked)}, живым Steam подтверждено {checked}."
     )
     lines.append(
         f"Пороги: прибыль от {limits['profit']:g}%, "

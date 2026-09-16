@@ -790,12 +790,20 @@ async def get_order_settings(chat_id: int) -> dict:
         "min_week_volume": s.get("ord_min_week_volume"),
         "min_price": s.get("ord_min_price"),
         "max_price": s.get("ord_max_price"),
+        # Докуда дошёл обход каталога — см. bot._order_candidates_from_catalog.
+        # Один прогон проверяет живьём лишь несколько десятков предметов, а в
+        # ценовой полосе их тысячи; без метки каждый прогон разбирал бы одну и
+        # ту же верхушку, и остальная полоса не проверялась бы никогда.
+        "catalog_cursor": s.get("ord_catalog_cursor") or 0,
     }
 
 
 async def set_order_setting(chat_id: int, key: str, value) -> None:
-    """key — одно из: min_profit, min_week_volume, min_price, max_price."""
-    allowed = {"min_profit", "min_week_volume", "min_price", "max_price"}
+    """key — одно из: min_profit, min_week_volume, min_price, max_price, catalog_cursor."""
+    allowed = {
+        "min_profit", "min_week_volume", "min_price", "max_price",
+        "catalog_cursor",
+    }
     if key not in allowed:
         raise ValueError(f"неизвестная настройка ордеров: {key}")
     settings = await _get_chat_settings(chat_id)
