@@ -154,6 +154,7 @@ from storage import (
     get_dips_settings,
     get_order_settings,
     set_order_setting,
+    get_steam_price_entry,
     set_dips_setting,
     get_price_history,
     redis_call_total,
@@ -5737,6 +5738,24 @@ class LiveQuote(NamedTuple):
     median: float | None = None
     volume: int | None = None
     age_seconds: float = 0.0
+    # Сколько секунд назад ИЗМЕРЕН ОБЪЁМ. Отдельно от age_seconds намеренно:
+    # тот про возраст записи о ЦЕНЕ, а это разные величины и приезжают они
+    # по-разному.
+    #
+    # Расходятся они постоянно. У priceoverview жёсткий лимит, и когда он под
+    # кулдауном, цена берётся запасным путём из /render/ — а /render/ ОБЪЁМА
+    # НЕ ОТДАЁТ. Тогда цена свежая, а объём остаётся прошлым замером
+    # (storage переносит его вперёд вместе с моментом). Сколько ему часов,
+    # до сих пор было не видно ни в отчёте, ни в логе.
+    volume_age_seconds: float | None = None
+
+
+def _volume_age(entry: dict, now: float) -> float | None:
+    """Сколько секунд назад измерен объём в этой записи. None — объёма нет."""
+    if not entry or entry.get("volume") is None:
+        return None
+    measured = entry.get("volume_at") or entry.get("updated_at") or 0
+    return max(0.0, now - measured) if measured else None
 
 
 async def _live_prices_for(
@@ -5794,11 +5813,12 @@ async def _live_prices_for(
             # равно лучше пустоты. Кандидат тогда останется и честно скажет,
             # что объём неизвестен, вместо того чтобы молча пропасть.
             incomplete_quotes[name] = LiveQuote(
-                entry["price"], entry.get("median"), None, age,
+                entry["price"], entry.get("median"), None, age, None,
             )
             continue
         out[name] = LiveQuote(
             entry["price"], entry.get("median"), entry.get("volume"), age,
+            _volume_age(entry, now),
         )
 
     # budget — сколько живых запросов разрешено этому вызову. Умолчание общее
@@ -5830,7 +5850,20 @@ async def _live_prices_for(
                 return name, None
             if live and live.lowest:
                 await set_steam_price(name, live.lowest, live.volume, live.median)
-                return name, LiveQuote(live.lowest, live.median, live.volume, 0.0)
+                if live.volume is not None:
+                    return name, LiveQuote(
+                        live.lowest, live.median, live.volume, 0.0, 0.0
+                    )
+                # Цена свежая, а объёма в ответе нет — так бывает всегда, когда
+                # priceoverview под кулдауном и цену взяли из /render/.
+                # set_steam_price только что перенёс вперёд прошлый замер;
+                # поднимаем его обратно ВМЕСТЕ С ВОЗРАСТОМ, иначе объём,
+                # который мы уже знаем, до решения просто не доезжает.
+                stored = await get_steam_price_entry(name) or {}
+                return name, LiveQuote(
+                    live.lowest, live.median, stored.get("volume"), 0.0,
+                    _volume_age(stored, time.time()),
+                )
             return name, None
 
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
@@ -6767,6 +6800,11 @@ ORDERS_STEAM_FRESH_SECONDS = envcfg.env_float("ORDERS_STEAM_FRESH", 60.0)
 # вреда не наносит, он лишь не должен стоять первой строкой отчёта.
 ORDERS_MIN_REACH = envcfg.env_float("ORDERS_MIN_REACH", 0.5)
 
+# С какого возраста замер объёма стоит упомянуть в отчёте. Это ПОКАЗ, а не
+# фильтр: час выбран как «уже не сейчас», и ни одного кандидата он не
+# отсеивает. Настоящий срок годности выведем из накопленных чисел.
+ORDERS_VOLUME_NOTE_SECONDS = envcfg.env_float("ORDERS_VOLUME_NOTE", 3600.0)
+
 # ГЛУБИНА ШИРОКОГО СКАНА. Считается от остатка квоты, а не задаётся числом.
 #
 # Арифметика, из которой всё следует. Квота CSFloat — 200 запросов в час НА
@@ -6886,6 +6924,14 @@ class _OrderCandidate(NamedTuple):
     # 2026-09-16 показал «прибыль 163%» при верхнем чужом ордере $9.00:
     # оценка была из прайс-листа, а рынок думал иначе.
     steam_verified: bool = False
+    # Сколько секунд назад измерен объём продаж. None — объёма нет вовсе.
+    #
+    # Показывается в отчёте НАМЕРЕННО без всякой политики срока годности.
+    # Сначала надо увидеть на живых прогонах, насколько объёмы на самом деле
+    # устаревают и как сильно меняются, — и только потом решать, с какого
+    # возраста считать их негодными. Придумывать TTL из головы значит
+    # выбрасывать рабочие данные или доверять протухшим, наугад.
+    volume_age_seconds: float | None = None
 
 
 async def _order_candidates_from_arb(
@@ -7482,13 +7528,22 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     quote.volume if quote.volume is not None else c.volume_per_day
                 ),
                 steam_verified=live,
+                volume_age_seconds=quote.volume_age_seconds,
             )
 
         ranked = [_with_live(c) for c in ranked]
+        ages = [c.volume_age_seconds for c in ranked
+                if c.volume_age_seconds is not None]
         log.info(
-            "orders: живым Steam подтверждено %d из %d финалист(ов), объём знаем у %d",
+            "orders: живым Steam подтверждено %d из %d финалист(ов), объём знаем "
+            "у %d. Возраст замеров объёма: %s",
             sum(1 for c in ranked if c.steam_verified), len(ranked),
             sum(1 for c in ranked if c.volume_per_day is not None),
+            (f"свежих (<5 мин) {sum(1 for a in ages if a < 300)}, "
+             f"до часа {sum(1 for a in ages if 300 <= a < 3600)}, "
+             f"до суток {sum(1 for a in ages if 3600 <= a < 86400)}, "
+             f"старше суток {sum(1 for a in ages if a >= 86400)}, "
+             f"самый старый {max(ages) / 3600:.1f} ч") if ages else "замеров нет",
         )
 
     plans: list[tuple[_OrderCandidate, buy_orders.OrderPlan]] = []
@@ -7540,7 +7595,20 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # втрое, вероятнее ошиблись мы, а не рынок. Проверка эта уже
             # считалась в _fill_steam_prices (прайс-лист против справки
             # CSFloat) и до сих пор никуда не шла.
-            if cand.price_confirmed is False:
+            # Живой ответ Steam отменяет спор двух оценок.
+            #
+            # price_confirmed сравнивает прайс-лист csgotrader со справкой
+            # CSFloat — ДВЕ ОЦЕНКИ между собой. К этому моменту у финалистов
+            # уже есть третий источник, и он не оценка, а факт: живой запрос к
+            # Steam. Отказывать по несогласию оценок, держа в руках факт, —
+            # значит выбрасывать кандидата по слабейшему из имеющихся
+            # свидетельств.
+            #
+            # Насколько это не исключение, видно по логу прогона:
+            # «CSFloat подтвердил 5, разошёлся на 281» из 294 лотов. То есть
+            # расхождение здесь норма, а не сигнал, и на нём отваливалось по
+            # восемь кандидатов за прогон.
+            if cand.price_confirmed is False and not cand.steam_verified:
                 refused.append((
                     cand.market_hash_name,
                     "источники цены Steam разошлись — прибыль от такой цены "
@@ -7628,6 +7696,13 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{mark} ${plan.steam_price_cents / 100:.2f} · "
                 f"прибыль <b>{plan.profit_pct:.0f}%</b> · {rival}"
             )
+            age = cand.volume_age_seconds
+            if age is not None and age >= ORDERS_VOLUME_NOTE_SECONDS:
+                lines.append(
+                    f"  ℹ️ объём продаж замерен {age / 3600:.0f} ч назад — "
+                    f"свежий Steam не отдал"
+                )
+
             reach = _reach(cand, plan)
             if reach is not None and reach < ORDERS_MIN_REACH:
                 lines.append(
