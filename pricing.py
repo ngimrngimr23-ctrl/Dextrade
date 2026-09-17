@@ -601,6 +601,14 @@ async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict
     tries_left = min(max(1, len(STEAM_POOL)), STEAM_RETRY_CAP)
 
     last_status: int | None = None
+    # Кто реально дошёл до Steam, а кого срезал провайдер прокси.
+    #
+    # Нужно, чтобы отличить «Steam нас забанил» от «нам не на чем было к нему
+    # сходить». Лестница кулдауна (30-60-120-240-360 мин) означает «подождали,
+    # попробовали снова, снова получили бан — значит ждать надо дольше». Это
+    # верно, только если попытка была честной.
+    steam_429_through_proxy = False
+    proxy_refusals = 0
     while True:
         if routes:
             proxy = routes.pop(0)
@@ -642,6 +650,7 @@ async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict
             # ответил». На проде это выглядело как «25 из 25 запросов не прошли —
             # Steam ограничил доступ», хотя Steam тут был ни при чём.
             if proxy:
+                proxy_refusals += 1
                 if getattr(e, "status", None) == 403:
                     STEAM_POOL.mark_refused(proxy, STEAM_PROXY_COOLDOWN_SECONDS, f"HTTP 403: {e}")
                 else:
@@ -662,6 +671,9 @@ async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict
                 )
                 last_status = 429
                 if proxy:
+                    # 429 пришёл через ЖИВОЙ прокси — значит Steam отказывает
+                    # не одному датацентровому адресу, а нам по существу.
+                    steam_429_through_proxy = True
                     # Забанен адрес, а не мы целиком: откладываем его и берём
                     # следующий. Общий кулдаун области — только когда маршруты
                     # кончатся совсем (см. ниже), иначе один плохой адрес
@@ -686,7 +698,32 @@ async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict
     # наказывать за них прямой адрес (а через collateral — ещё и вотчлист)
     # было бы прямо вредно.
     if last_status == 429:
-        await note_steam_429(scope="pricing", headers={})
+        # РАСТИТЬ ЛЕСТНИЦУ можно только после ЧЕСТНОЙ попытки.
+        #
+        # last_status липкий: он ставится один раз и обратно не сбрасывается.
+        # А прямой маршрут пробуется ПЕРВЫМ, и это датацентровый адрес Render
+        # на самом жёстком эндпоинте Steam — 429 оттуда приходит почти
+        # гарантированно. Дальше все прокси могли получить 403 от провайдера,
+        # но last_status так и остался 429, и на выходе мы наращивали счётчик,
+        # будто Steam забанил нас заново.
+        #
+        # Цена ошибки измерена на проде: каждый прогон при мёртвом пуле
+        # поднимал ступень, и за четыре прогона кулдаун уезжал с 30 минут на
+        # 240. Человек ждал часами из-за чужого прокси-сервиса.
+        #
+        # Честной попытка считается, когда 429 пришёл через ЖИВОЙ прокси (то
+        # есть Steam отказывает нам по существу, а не одному адресу), либо
+        # когда провайдер вообще не мешал. Если же всё, кроме прямого адреса,
+        # срезал провайдер — пауза ставится (Steam правда сказал 429), а
+        # лестница стоит на месте.
+        fair = steam_429_through_proxy or proxy_refusals == 0
+        if not fair:
+            log.warning(
+                "%s: 429 только с прямого адреса, а %d прокси срезал провайдер "
+                "— кулдаун ставлю, но счётчик не наращиваю: попытка была нечестной",
+                label, proxy_refusals,
+            )
+        await note_steam_429(scope="pricing", headers={}, escalate=fair)
     raise RateLimited()
 
 
