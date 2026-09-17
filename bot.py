@@ -5750,6 +5750,29 @@ class LiveQuote(NamedTuple):
     volume_age_seconds: float | None = None
 
 
+def _order_links(cand) -> str:
+    """
+    Две ссылки на предмет: страница Steam и страница CSFloat.
+
+    КУДА ИМЕННО ВЕДЁТ ССЫЛКА НА CSFLOAT — не мелочь. Ордер ставится на
+    ПРЕДМЕТ, а не на лот, поэтому по умолчанию ведём на поиск по имени: там
+    видно весь стакан и всю витрину, то есть ровно то, что нужно проверить
+    перед заявкой. Ссылка на конкретный лот полезна отдельно — по ней видно
+    цену продавца, от которой считается «ниже витрины на N%», — и она
+    добавляется, только когда лот известен.
+
+    Имя кодируем через quote(safe=""), иначе «|» и пробелы в
+    market_hash_name ломают адрес.
+    """
+    name = quote(cand.market_hash_name, safe="")
+    steam = f"https://steamcommunity.com/market/listings/730/{name}"
+    csfloat = f"https://csfloat.com/search?market_hash_name={name}"
+    parts = [f'<a href="{steam}">Steam</a>', f'<a href="{csfloat}">CSFloat</a>']
+    if cand.listing_id:
+        parts.append(f'<a href="https://csfloat.com/item/{cand.listing_id}">лот</a>')
+    return " · ".join(parts)
+
+
 def _volume_age(entry: dict, now: float) -> float | None:
     """Сколько секунд назад измерен объём в этой записи. None — объёма нет."""
     if not entry or entry.get("volume") is None:
@@ -7715,6 +7738,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"  на CSFloat просят ${cand.csfloat_ask_cents / 100:.2f} — "
                     f"заявка ниже витрины на {(1 - reach) * 100:.0f}%"
                 )
+            lines.append(f"  {_order_links(cand)}")
     else:
         lines.append("Ни одного ордера не поставил бы.")
 
@@ -7791,10 +7815,17 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"цена ${limits['low']:g}–${limits['high']:g}, "
         f"разброс до {buy_orders.DEFAULT_MAX_SPREAD_PCT:g}%. Менять: /setorders"
     )
-    await update.message.reply_text(
-        scan_errors.scrub("\n".join(lines)), parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
+    # Режем на куски. Telegram не обрезает длинные сообщения, а отказывается их
+    # принимать с «Message is too long», и отчёт пропал бы целиком.
+    #
+    # Раньше это не грозило: строк было немного. Со ссылками стало: адрес
+    # предмета с закодированными «★», «™» и «|» тянет под две сотни символов,
+    # у плана их две-три, и десяток планов переваливает за лимит сам по себе.
+    for chunk in _chunk_lines(lines):
+        await update.message.reply_text(
+            scan_errors.scrub(chunk), parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
 
 
 async def csfloatapi(update: Update, context: ContextTypes.DEFAULT_TYPE):
