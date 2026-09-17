@@ -6987,7 +6987,7 @@ async def _order_candidates_from_arb(
             volume_per_day=None,
             spread_pct=spread_by_name.get(o.market_hash_name),
             source="арбитраж",
-            csfloat_ask_cents=int(round(o.price * 100)),
+            csfloat_ask_cents=int(round(o.csfloat_price * 100)),
             price_confirmed=confirmed_by_name.get(o.market_hash_name),
         )
         for o in offers
