@@ -310,6 +310,18 @@ ARB_INTERVAL_MINUTES = envcfg.env_float("ARB_INTERVAL_MINUTES", 10)
 # кончится на середине часа и остаток времени бот будет молчать.
 ARB_TARGET_LISTINGS = envcfg.env_int("ARB_TARGET_LISTINGS", 1500)
 
+# Запросы, которые автоскан арбитража НЕ тратит на широкий скан.
+#
+# Из них оплачивается вторая половина его работы: добор страницы по скидке
+# (_add_top_discount_page) и проверка кандидатов. Плюс запас на ручные
+# команды — /orders и /csfloatapi ходят в тот же ключ, и если автоскан
+# выбирает окно досуха, им не остаётся ничего.
+ARB_SCAN_RESERVE = envcfg.env_int("ARB_SCAN_RESERVE", 30)
+
+# Ниже этого прогон бессмысленен: несколько страниц не дадут картины рынка,
+# а запросы спишутся. Лучше пропустить круг и дождаться сброса окна.
+ARB_SCAN_MIN_LISTINGS = envcfg.env_int("ARB_SCAN_MIN_LISTINGS", 250)
+
 # Окно прайс-листа для ВТОРОГО мнения о цене. Только суточное, без отката на
 # более старые: недельная и тем более месячная цена подтверждает не сегодняшнюю
 # стоимость, а прошлую, и как проверка справки CSFloat не годится.
@@ -3472,8 +3484,29 @@ async def _run_arb_scan(bot, chat_id: int) -> ArbRun | None:
 
     _arb_running.add(chat_id)
     try:
+        # Глубина по остатку квоты, а не всегда ARB_TARGET_LISTINGS.
+        #
+        # Раньше автоскан просил свои 1500 лотов безусловно: это 30 запросов,
+        # шесть прогонов в час, 180 из 200 доступных. Он выбирал окно почти
+        # целиком независимо от того, сколько там осталось, — и при
+        # исчерпанной квоте честно шёл получать 429 на каждой полосе, а
+        # ручным командам (/orders, /csfloatapi) не оставалось ничего.
+        #
+        # Это ограничение СВЕРХУ, а не новый расход: больше ARB_TARGET_LISTINGS
+        # скан по-прежнему не просит.
+        target, why = _quota_aware_target(
+            ARB_TARGET_LISTINGS, reserve=ARB_SCAN_RESERVE,
+            minimum=ARB_SCAN_MIN_LISTINGS, spent_on="добор и проверку",
+        )
+        if target == 0:
+            raise CSFloatRateLimited(
+                f"Арбитраж пропускает круг: {why}. Окно сбросится само — "
+                f"{csfloat_client.budget_description() or 'момент сброса неизвестен'}"
+            )
+        log.info("arb: chat_id=%s глубина скана — %d лотов (%s)", chat_id, target, why)
+
         listings = await csfloat_client.fetch_market_wide(
-            target=ARB_TARGET_LISTINGS,
+            target=target,
             sort_by=ARB_SORT_BY,
             min_price=settings["min_price"],
             max_price=settings["max_price"],
@@ -6859,6 +6892,48 @@ ORDERS_ARB_TARGET_MIN = envcfg.env_int("ORDERS_ARB_TARGET_MIN", 300)
 ORDERS_ARB_RESERVE = envcfg.env_int("ORDERS_ARB_RESERVE", 40)
 
 
+def _quota_aware_target(
+    desired: int, *, reserve: int, minimum: int, spent_on: str,
+) -> tuple[int, str]:
+    """
+    Сколько лотов просить у широкого скана при нынешнем остатке квоты.
+
+    Возвращает (цель, пояснение). Цель 0 — «не хватает даже на минимум»,
+    вызывающий тогда честно пропускает скан вместо того, чтобы упереться в
+    429 на первой же полосе.
+
+    Общий для /orders и /arbnow. До этого квоту учитывал только /orders, а
+    автоскан арбитража просил свои ARB_TARGET_LISTINGS всегда — 1500 лотов
+    это 30 запросов, шесть прогонов в час, 180 из 200 доступных. То есть он
+    выбирал окно почти целиком независимо от того, сколько там осталось, и
+    при исчерпанной квоте честно шёл получать 429 на каждой полосе.
+
+    ВАЖНО: это ограничение сверху, а не новый расход. Скан никогда не просит
+    больше desired; он лишь перестаёт просить больше, чем есть.
+
+    reserve — запросы, которые скан не трогает: из них оплачивается вторая
+    половина работы (стаканы у ордеров, добор страницы по скидке и проверка
+    живой ценой у арбитража).
+    """
+    left = csfloat_client.budget_remaining()
+    if left is None:
+        # Заголовков лимита ещё не видели (например, после рестарта). Берём
+        # минимум: он заведомо безопасен и сам добудет заголовки.
+        return min(desired, minimum), "остаток квоты пока неизвестен, беру минимум"
+
+    affordable = max(0, left - reserve)
+    target = min(desired, affordable * csfloat_client.MAX_LIMIT)
+    if target < minimum:
+        return 0, (
+            f"ключу осталось {left} запрос(ов), из них {reserve} держим на "
+            f"{spent_on} — на скан не хватает"
+        )
+    return target, (
+        f"ключу осталось {left} запрос(ов), {reserve} держим на {spent_on}, "
+        f"на скан трачу до {target // csfloat_client.MAX_LIMIT}"
+    )
+
+
 def _orders_scan_target() -> tuple[int, str]:
     """
     Сколько лотов просить у широкого скана сейчас. Возвращает (цель, пояснение).
@@ -6866,22 +6941,9 @@ def _orders_scan_target() -> tuple[int, str]:
     Цель 0 значит «квоты не хватает даже на минимум» — вызывающий тогда честно
     пропускает скан вместо того, чтобы упереться в 429 на первой же полосе.
     """
-    left = csfloat_client.budget_remaining()
-    if left is None:
-        # Заголовков лимита ещё не видели (например, после рестарта). Берём
-        # минимум: он заведомо безопасен и сам добудет заголовки.
-        return ORDERS_ARB_TARGET_MIN, "остаток квоты пока неизвестен, беру минимум"
-
-    affordable = max(0, left - ORDERS_ARB_RESERVE)
-    target = min(ORDERS_ARB_TARGET_MAX, affordable * csfloat_client.MAX_LIMIT)
-    if target < ORDERS_ARB_TARGET_MIN:
-        return 0, (
-            f"ключу осталось {left} запрос(ов), из них {ORDERS_ARB_RESERVE} "
-            f"держим на стаканы — на скан не хватает"
-        )
-    return target, (
-        f"ключу осталось {left} запрос(ов), {ORDERS_ARB_RESERVE} держим на "
-        f"стаканы, на скан трачу до {target // csfloat_client.MAX_LIMIT}"
+    return _quota_aware_target(
+        ORDERS_ARB_TARGET_MAX, reserve=ORDERS_ARB_RESERVE,
+        minimum=ORDERS_ARB_TARGET_MIN, spent_on="стаканы",
     )
 
 # Сколько ждать широкий скан, прежде чем ответить без него.
