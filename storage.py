@@ -75,10 +75,53 @@ def _local_save(data: dict) -> None:
 # смешивать их значило бы мерить не то, что стоит времени.
 _redis_calls = 0
 
+# А ВОТ ЭТО — то, что тарифицирует Upstash: КОМАНДЫ, а не походы.
+#
+# Два счётчика намеренно. Походы отвечают на вопрос «сколько времени ушло на
+# сеть» (пайплайн из ста команд — одна задержка), команды — на вопрос «сколько
+# стоило» (тот же пайплайн — сто запросов по счёту Upstash). Пока считали
+# только походы, расход был не виден вовсе: 2026-09-19 месячный лимит
+# бесплатного тарифа (500 000) выбрало досуха, и первым признаком стал отказ
+# читать вотчлист. Никакого предупреждения до этого не было.
+_redis_commands = 0
+_redis_started_at = time.time()
+
+# Как часто писать в лог накопленный расход. Раз в пять тысяч команд: при
+# лимите в полмиллиона это сотня строк за месяц — не шум, но и не проспишь.
+_USAGE_LOG_EVERY = 5000
+_FREE_TIER_MONTHLY = 500_000
+
 
 def redis_call_total() -> int:
     """Накопленное число HTTP-запросов к Upstash. Только растёт."""
     return _redis_calls
+
+
+def redis_command_total() -> int:
+    """Накопленное число КОМАНД — именно их считает тариф Upstash."""
+    return _redis_commands
+
+
+def redis_usage_note() -> str:
+    """Расход и прогноз на месяц одной строкой — для /status и лога."""
+    hours = max((time.time() - _redis_started_at) / 3600, 1 / 60)
+    per_hour = _redis_commands / hours
+    per_month = per_hour * 24 * 30
+    share = per_month / _FREE_TIER_MONTHLY * 100
+    return (
+        f"{_redis_commands} команд за {hours:.1f} ч "
+        f"({per_hour:.0f}/час) -> около {per_month / 1000:.0f} тыс. в месяц, "
+        f"это {share:.0f}% бесплатного лимита"
+    )
+
+
+def _note_commands(n: int) -> None:
+    """Учесть n команд и, если пора, показать расход в логе."""
+    global _redis_commands
+    before = _redis_commands
+    _redis_commands += n
+    if before // _USAGE_LOG_EVERY != _redis_commands // _USAGE_LOG_EVERY:
+        log.info("upstash: расход — %s", redis_usage_note())
 
 
 async def _redis_cmd(*args):
@@ -90,6 +133,7 @@ async def _redis_cmd(*args):
     """
     global _redis_calls
     _redis_calls += 1
+    _note_commands(1)
     session = get_session()
     async with session.post(
         REDIS_URL,
@@ -138,6 +182,8 @@ async def _redis_pipeline(commands: list[list]) -> list:
     """Несколько команд Upstash REST одним HTTP-запросом. Возвращает список {'result':...}/{'error':...} по порядку команд."""
     global _redis_calls
     _redis_calls += 1
+    # Пайплайн — один поход, но СТОЛЬКО ЖЕ команд, сколько в нём операций.
+    _note_commands(len(commands))
     session = get_session()
     async with session.post(
         f"{REDIS_URL}/pipeline",
