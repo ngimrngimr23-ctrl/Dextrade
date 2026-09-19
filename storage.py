@@ -40,6 +40,21 @@ LOCAL_FALLBACK_PATH = Path(__file__).parent / "sticker_prices_local.json"
 KEY_PREFIX = "stickerprice:"
 INDEX_KEY = "stickerprice_index"  # Redis SET со всеми известными ключами — нужен для prewarm
 
+# Ключи, которые этот процесс уже заносил в индекс.
+#
+# Upstash тарифицирует КОМАНДЫ, а не походы: пайплайн из ста команд стоит сто
+# запросов. А индекс — множество, и повторный SADD того же ключа не меняет
+# ничего, только тратит команду. При записи цен стикеров SADD шёл на КАЖДЫЙ
+# ключ рядом с SET, то есть ровно удваивал расход на самом частом пути бота.
+#
+# 2026-09-19 месячный лимит бесплатного тарифа (500 000) выбрало досуха, и
+# хранилище начало отказывать всем подряд — включая чтение вотчлиста, отчего
+# сканы молча шли по огрызку списка.
+#
+# Память процесса тут достаточна: потеря набора при рестарте стоит одного
+# лишнего SADD на ключ, а не потери данных. Индекс нужен только prewarm'у.
+_indexed_keys: set[str] = set()
+
 
 def _local_load() -> dict:
     if LOCAL_FALLBACK_PATH.exists():
@@ -107,7 +122,9 @@ async def set_price(key: str, matched_name: Optional[str], price: float, ttl_sec
     if REDIS_ENABLED:
         try:
             await _redis_cmd("SET", KEY_PREFIX + key, value, "EX", str(ttl_seconds))
-            await _redis_cmd("SADD", INDEX_KEY, key)
+            if key not in _indexed_keys:
+                await _redis_cmd("SADD", INDEX_KEY, key)
+                _indexed_keys.add(key)
             return
         except Exception:
             pass  # тоже падаем на локальный файл, чтобы данные не потерялись
@@ -165,16 +182,22 @@ async def set_prices_batch(entries: list[tuple[str, Optional[str], float, int]])
     if REDIS_ENABLED:
         try:
             commands = []
+            fresh_index: list[str] = []
             for key, matched_name, price, ttl_seconds in entries:
                 value = json.dumps(
                     {"matched_name": matched_name, "price": price, "updated_at": time.time()},
                     ensure_ascii=False,
                 )
                 commands.append(["SET", KEY_PREFIX + key, value, "EX", str(ttl_seconds)])
-                commands.append(["SADD", INDEX_KEY, key])
+                if key not in _indexed_keys:
+                    commands.append(["SADD", INDEX_KEY, key])
+                    fresh_index.append(key)
             results = await _redis_pipeline(commands)
             if any(isinstance(r, dict) and "error" in r for r in results):
                 raise RuntimeError(f"pipeline вернул ошибку хотя бы по одной команде: {results}")
+            # Помечаем только ПОСЛЕ успеха: упади пайплайн, ключ должен попасть
+            # в индекс со следующей попытки, а не потеряться для prewarm.
+            _indexed_keys.update(fresh_index)
             return
         except Exception:
             pass  # тоже падаем на локальный файл, чтобы данные не потерялись
@@ -190,6 +213,9 @@ async def all_known_keys() -> list[str]:
     if REDIS_ENABLED:
         try:
             result = await _redis_cmd("SMEMBERS", INDEX_KEY)
+            # Раз уж прочитали весь индекс — запоминаем, что в нём есть, и
+            # больше не шлём SADD по этим ключам.
+            _indexed_keys.update(result or [])
             return result or []
         except Exception:
             pass
