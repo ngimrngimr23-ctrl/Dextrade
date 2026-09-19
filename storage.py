@@ -1023,6 +1023,38 @@ async def _save_watchlist_entry(chat_id: int, **updates) -> None:
     _local_watchlist_save(data)
 
 
+async def get_watchlist_bundle(chat_id: int) -> dict:
+    """
+    Все три списка чата ОДНИМ чтением: обычный, флоат и приоритетный.
+
+    Зачем отдельная функция. get_watchlist, get_float_watchlist и
+    get_hot_watchlist делают КАЖДЫЙ свой поход в Upstash за одной и той же
+    записью. В /scanall их шесть на команду (три в обработчике, три в
+    прогоне), и любой может молча выродиться в локальную копию.
+
+    Ровно это и случилось 2026-09-19. Список в Upstash был цел — 635
+    предметов, — а одна команда показала три разных числа:
+
+        объявлено 635 ... но подсказки про /hot нет   -> hot прочитался пустым
+        план на 114, ошибок ноль                      -> items выродились
+        следующий запуск объявил 580, подсказка есть  -> выродилось другое
+
+    Ни одно из чисел не было враньём по отдельности: просто каждое пришло из
+    своего похода, а походы независимы. Одно чтение убирает расхождение по
+    построению, а не по удаче, и заодно экономит пять запросов из шести.
+    """
+    entry = await _get_watchlist_entry(chat_id)
+    return {
+        "items": entry.get("items", []),
+        "float_items": entry.get("float_items", []),
+        "hot_items": entry.get("hot_items", []),
+        "paused": bool(entry.get("paused")),
+        # Досталась ли запись запасным путём. Вызывающий решает, можно ли ей
+        # пользоваться: для скана неполный список хуже, чем никакого.
+        "degraded": watchlist_entry_is_degraded(entry),
+    }
+
+
 async def get_watchlist(chat_id: int) -> list[str]:
     """Список предметов (market_hash_name) в вотчлисте чата — охота по стикерам."""
     return (await _get_watchlist_entry(chat_id)).get("items", [])

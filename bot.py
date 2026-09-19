@@ -155,6 +155,7 @@ from storage import (
     get_order_settings,
     set_order_setting,
     get_steam_price_entry,
+    get_watchlist_bundle,
     set_dips_setting,
     get_price_history,
     redis_call_total,
@@ -2445,7 +2446,7 @@ SCAN_HOT = "hot"      # /scan: только приоритетные, курсо
 
 async def _run_watchlist_scan(
     bot, chat_id: int, request_interval: float | None = None, *, mode: str = SCAN_CYCLE,
-    lists: tuple[list[str], list[str]] | None = None,
+    bundle: dict | None = None,
 ) -> WatchlistScanReport | None:
     """
     Прогоняет весь вотчлист чата разом — общая логика для джобы по расписанию
@@ -2469,12 +2470,19 @@ async def _run_watchlist_scan(
     # Поэтому вызывающий, у которого список уже на руках, передаёт его сюда —
     # и объявленное число совпадает с просмотренным по построению, а не по
     # удаче.
-    if lists is not None:
-        sticker_items, float_items = lists
-        skipped_st = skipped_float = 0
-    else:
-        sticker_items, skipped_st = _drop_stattrak(await get_watchlist(chat_id))
-        float_items, skipped_float = _drop_stattrak(await get_float_watchlist(chat_id))
+    if bundle is None:
+        bundle = await get_watchlist_bundle(chat_id)
+    if bundle.get("degraded"):
+        # Неполный список хуже, чем никакого: прогон отчитается «Готово» по
+        # огрызку, и это неотличимо от честно проверенного списка.
+        log.warning(
+            "watchlist: chat_id=%s прогон отменён — список не прочитался из "
+            "Upstash, а сканировать локальную копию значит врать отчётом",
+            chat_id,
+        )
+        return None
+    sticker_items, skipped_st = _drop_stattrak(bundle["items"])
+    float_items, skipped_float = _drop_stattrak(bundle["float_items"])
     if skipped_st or skipped_float:
         log.info(
             "watchlist: chat_id=%s пропускаю StatTrak — %d из вотчлиста, %d из флоат-списка",
@@ -2489,7 +2497,7 @@ async def _run_watchlist_scan(
     # затем предметы, которые нужны только под флоат.
     # Переменная называется plan, а не scan_plan: одноимённый модуль уже
     # импортирован, и совпадение имён здесь ломало бы вызов его функции.
-    hot_names = set(await get_hot_watchlist(chat_id))
+    hot_names = set(bundle["hot_items"])
 
     # Приоритетные проверяются на флоат ВСЕГДА, даже если их нет в /float.
     # Это можно себе позволить, потому что флоат-проверка бесплатна в том
@@ -8008,8 +8016,18 @@ async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     chat_id = update.effective_chat.id
     want_profile = bool(context.args) and context.args[0].lower() in _PROFILE_WORDS
-    sticker_items, st_a = _drop_stattrak(await get_watchlist(chat_id))
-    float_items, st_b = _drop_stattrak(await get_float_watchlist(chat_id))
+    # ОДНО чтение на всю команду — и объявленное число, и план, и подсказка
+    # про /hot берутся из него. См. storage.get_watchlist_bundle о том, почему
+    # шесть независимых походов за одной записью давали три разных ответа.
+    bundle = await get_watchlist_bundle(chat_id)
+    if bundle.get("degraded"):
+        await update.message.reply_text(
+            "Не удалось прочитать список из хранилища — скан отменён, чтобы не "
+            "отчитаться по неполной копии. Попробуй ещё раз."
+        )
+        return
+    sticker_items, st_a = _drop_stattrak(bundle["items"])
+    float_items, st_b = _drop_stattrak(bundle["float_items"])
     items = set(sticker_items) | set(float_items)
     if not items and (st_a or st_b):
         await update.message.reply_text(
@@ -8054,7 +8072,7 @@ async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # выглядит как ошибка.
     minutes = len(items) * MANUAL_REQUEST_INTERVAL / 60
     note = f"Начинаю скан {len(items)} предмет(ов) — весь список, ≈{minutes:.0f} мин."
-    if await get_hot_watchlist(chat_id):
+    if bundle["hot_items"]:
         note += "\n(Автопрогон берёт только часть — см. /hot. Здесь всё.)"
     if want_profile:
         note += "\n📊 Профиль пришлю в конце, вместе с «Готово»."
@@ -8064,8 +8082,8 @@ async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # потока, см. MANUAL_REQUEST_INTERVAL).
     report = await _run_watchlist_scan(
         context.bot, chat_id, request_interval=MANUAL_REQUEST_INTERVAL, mode=SCAN_ALL,
-        # Тот же список, по которому только что объявлено число предметов.
-        lists=(sticker_items, float_items),
+        # Тот же набор, по которому только что объявлено число предметов.
+        bundle=bundle,
     )
     # None сюда дойти не должен: списки непустые и "уже идёт" отсеяно выше,
     # но проверка дешёвая, а падать на отчёте о завершении не хочется.
