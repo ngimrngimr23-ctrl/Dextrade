@@ -8247,6 +8247,73 @@ async def clearprices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Прайс-лист стикеров очищен (было {count} записей). Можно загружать заново через /pricefile.")
 
 
+# Куда вернуть файл со списком имён. Ключ — начало имени файла, ровно того,
+# который бот сам и выдаёт (_send_names_file): watchlist_635.txt,
+# floatlist_12.txt, hotlist_3.txt.
+_NAMES_FILE_ROUTES = {
+    "watchlist": ("watch", "обычный вотчлист"),
+    "floatlist": ("floatadd", "список охоты за флоатом"),
+    "hotlist": ("hot", "приоритетный список"),
+}
+
+
+def _names_from_file(text: str) -> list[str] | None:
+    """
+    Имена предметов из текстового файла — или None, если это не он.
+
+    Формат тот же, что выдаёт _send_names_file: одно имя в строке, без
+    номеров и шапки. Файл, выгруженный ботом, возвращается в него же без
+    единой правки — это и есть перенос списка между базами.
+
+    Как отличаем от JSON. Признак простой и надёжный: в JSON есть фигурные
+    скобки, в списке имён их нет никогда. Ошибиться в безопасную сторону тут
+    важнее точности: приняв JSON за список имён, мы насоздавали бы мусорных
+    записей, а приняв список за JSON — всего лишь покажем прежнюю ошибку.
+    """
+    if "{" in text or "}" in text:
+        return None
+    names = [line.strip() for line in text.splitlines()]
+    names = [n for n in names if n and not n.startswith("#")]
+    if not names:
+        return None
+    # У market_hash_name всегда есть степень износа в скобках либо «|» —
+    # случайный текстовый файл под это не подойдёт.
+    looks_right = sum(1 for n in names if "|" in n or "(" in n)
+    return names if looks_right >= max(1, len(names) // 2) else None
+
+
+async def _absorb_names_file(update, context, filename: str, names: list[str]) -> None:
+    """
+    Добавить имена из файла в нужный список.
+
+    Куда — решает имя файла, а имя файла бот выдал сам: watchlist_635.txt
+    уходит в вотчлист, floatlist_*.txt в охоту за флоатом, hotlist_*.txt в
+    приоритетные. То есть выгруженный файл возвращается туда, откуда взят,
+    без единого аргумента от человека. Незнакомое имя — в обычный вотчлист,
+    и мы прямо говорим, куда положили.
+
+    Добавляем ЧУЖИМИ руками: подставляем имена в context.args и зовём ту же
+    команду, что и при вводе с клавиатуры. Иначе пришлось бы повторить всю её
+    логику — разбор названий, степень износа, дубликаты, отчёт, — и две копии
+    разошлись бы на первой же правке. Сцепка «склеить через запятую, потом
+    разрезать по пробелам» точная: " ".join(x.split(" ")) == x.
+    """
+    stem = filename.rsplit("/", 1)[-1].lower()
+    handler_name, human = "watch", "обычный вотчлист"
+    for prefix, (name, label) in _NAMES_FILE_ROUTES.items():
+        if stem.startswith(prefix):
+            handler_name, human = name, label
+            break
+
+    handler = globals()[handler_name if handler_name != "hot" else "hot_cmd"]
+
+    await update.message.reply_text(
+        f"Файл распознан: {len(names)} предмет(ов) -> {human}. Добавляю…"
+    )
+    context.args = (", ".join(names)).split(" ")
+    await handler(update, context)
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     document = update.message.document
@@ -8297,22 +8364,38 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raise ValueError("не удалось определить кодировку файла")
             text = text.strip()
 
-        # если файл (HTML-страница целиком или PDF с шапкой браузера) содержит
-        # что-то до/после JSON — вытаскиваем именно JSON-объект
-        if not text.startswith("{"):
-            start = text.find("{")
-            end = text.rfind("}")
-            if start == -1 or end == -1 or end <= start:
-                raise ValueError("в файле не найден JSON-объект (похоже, это не тот файл)")
-            text = text[start:end + 1]
+        # Список имён — это не JSON, и разбирать его как JSON не надо.
+        #
+        # Проверяем ДО извлечения JSON-объекта: иначе файл со списком уходил
+        # в ветку «в файле не найден JSON-объект», и единственный способ
+        # вернуть выгруженный список был скопировать его руками.
+        pending_names = _names_from_file(text)
+        if pending_names is not None:
+            data = None
+        else:
+            # если файл (HTML-страница целиком или PDF с шапкой браузера) содержит
+            # что-то до/после JSON — вытаскиваем именно JSON-объект
+            if not text.startswith("{"):
+                start = text.find("{")
+                end = text.rfind("}")
+                if start == -1 or end == -1 or end <= start:
+                    raise ValueError("в файле не найден JSON-объект (похоже, это не тот файл)")
+                text = text[start:end + 1]
 
-        data = json.loads(text)
+            data = json.loads(text)
     except Exception as e:
         await update.message.reply_text(
             f"Не смог прочитать файл как JSON: {e}\n\n"
             f"Присылай либо сохранённый .json (Ctrl+S -> Текстовый файл), либо "
-            f"PDF, сохранённый через «Печать -> Сохранить как PDF» с той же страницы."
+            f"PDF, сохранённый через «Печать -> Сохранить как PDF» с той же страницы, "
+            f"либо .txt со списком предметов (одно имя в строке) — такой файл "
+            f"выдают /watchlist файл, /float файл и /hot файл."
         )
+        return
+
+    # Файл со списком имён добавляем в тот список, из которого он выгружен.
+    if pending_names is not None:
+        await _absorb_names_file(update, context, filename, pending_names)
         return
 
     # Режим "жду прайс-лист стикеров" включается командой /pricefile —
