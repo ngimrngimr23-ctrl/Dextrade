@@ -2444,7 +2444,8 @@ SCAN_HOT = "hot"      # /scan: только приоритетные, курсо
 
 
 async def _run_watchlist_scan(
-    bot, chat_id: int, request_interval: float | None = None, *, mode: str = SCAN_CYCLE
+    bot, chat_id: int, request_interval: float | None = None, *, mode: str = SCAN_CYCLE,
+    lists: tuple[list[str], list[str]] | None = None,
 ) -> WatchlistScanReport | None:
     """
     Прогоняет весь вотчлист чата разом — общая логика для джобы по расписанию
@@ -2457,8 +2458,23 @@ async def _run_watchlist_scan(
         log.info("watchlist: прогон для chat_id=%s уже идёт, пропускаю повторный запуск", chat_id)
         return None
 
-    sticker_items, skipped_st = _drop_stattrak(await get_watchlist(chat_id))
-    float_items, skipped_float = _drop_stattrak(await get_float_watchlist(chat_id))
+    # Списки читаем ОДИН раз за операцию.
+    #
+    # /scanall читал их дважды: сам обработчик — чтобы объявить «начинаю скан
+    # N предметов», и этот прогон — чтобы построить план. Два чтения одного и
+    # того же могут разойтись, и 2026-09-19 разошлись: объявлено 635,
+    # проверено 114, ошибок ноль. Отчёт при этом выглядел как честно
+    # пройденный список.
+    #
+    # Поэтому вызывающий, у которого список уже на руках, передаёт его сюда —
+    # и объявленное число совпадает с просмотренным по построению, а не по
+    # удаче.
+    if lists is not None:
+        sticker_items, float_items = lists
+        skipped_st = skipped_float = 0
+    else:
+        sticker_items, skipped_st = _drop_stattrak(await get_watchlist(chat_id))
+        float_items, skipped_float = _drop_stattrak(await get_float_watchlist(chat_id))
     if skipped_st or skipped_float:
         log.info(
             "watchlist: chat_id=%s пропускаю StatTrak — %d из вотчлиста, %d из флоат-списка",
@@ -8047,7 +8063,9 @@ async def scanall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # всплеск на пару минут Steam переносит (в отличие от круглосуточного
     # потока, см. MANUAL_REQUEST_INTERVAL).
     report = await _run_watchlist_scan(
-        context.bot, chat_id, request_interval=MANUAL_REQUEST_INTERVAL, mode=SCAN_ALL
+        context.bot, chat_id, request_interval=MANUAL_REQUEST_INTERVAL, mode=SCAN_ALL,
+        # Тот же список, по которому только что объявлено число предметов.
+        lists=(sticker_items, float_items),
     )
     # None сюда дойти не должен: списки непустые и "уже идёт" отсеяно выше,
     # но проверка дешёвая, а падать на отчёте о завершении не хочется.

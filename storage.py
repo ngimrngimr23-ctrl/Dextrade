@@ -941,14 +941,54 @@ def _local_watchlist_save(data: dict) -> None:
     LOCAL_WATCHLIST_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
+# Записи вотчлиста, прочитанные НЕ из Upstash, а с локального запасного пути.
+#
+# Хранятся по id объекта словаря: нужно отличить «это настоящие данные» от
+# «это то, что удалось наскрести», причём отличить уже после возврата.
+_degraded_watchlists: set[int] = set()
+
+
 async def _get_watchlist_entry(chat_id: int) -> dict:
+    """
+    Запись вотчлиста чата. При сбое Upstash отдаёт локальную копию — и
+    ПОМЕЧАЕТ её как неполноценную.
+
+    Зачем пометка. Прежде сбой чтения глотался молча (`except: pass`), и
+    вызывающий не мог отличить настоящий список от того, что осталось в файле
+    контейнера. Файл этот живёт до ближайшего передеплоя и легко бывает
+    устаревшим или обрезанным.
+
+    Во что это обошлось 2026-09-19. /scanall прочитал список ДВАЖДЫ: команда
+    для сообщения «начинаю скан 635 предмет(ов)», и сам прогон — для плана.
+    Второе чтение сорвалось, молча вернуло локальную копию, и бот отсканировал
+    114 предметов вместо 635, отчитавшись «Готово» без единой ошибки. Со
+    стороны неотличимо от честно проверенного списка.
+
+    Вторая беда опаснее первой и до сих пор просто не выстрелила:
+    _save_watchlist_entry берёт за основу эту же запись. Сорвись чтение перед
+    добавлением предмета — и в Upstash уехал бы обрезанный список, то есть
+    сбой сети СТИРАЛ БЫ вотчлист. Поэтому запись, добытая запасным путём,
+    теперь помечена, и писать поверх неё нельзя.
+    """
     if REDIS_ENABLED:
         try:
             raw = await _redis_cmd("GET", WATCHLIST_KEY_PREFIX + str(chat_id))
             return json.loads(raw) if raw else {}
         except Exception:
-            pass
-    return _local_watchlist_load().get(str(chat_id), {})
+            log.warning(
+                "вотчлист chat_id=%s: Upstash не ответил, беру локальную копию. "
+                "Она может быть устаревшей или неполной",
+                chat_id, exc_info=True,
+            )
+    entry = _local_watchlist_load().get(str(chat_id), {})
+    if REDIS_ENABLED:
+        _degraded_watchlists.add(id(entry))
+    return entry
+
+
+def watchlist_entry_is_degraded(entry: dict) -> bool:
+    """Досталась ли эта запись запасным путём, а не из Upstash."""
+    return id(entry) in _degraded_watchlists
 
 
 async def _save_watchlist_entry(chat_id: int, **updates) -> None:
@@ -959,6 +999,14 @@ async def _save_watchlist_entry(chat_id: int, **updates) -> None:
     затереть соседнее. Теперь достаточно передать то, что меняется.
     """
     entry = await _get_watchlist_entry(chat_id)
+    if watchlist_entry_is_degraded(entry):
+        # Записывать поверх недочитанного — значит стереть настоящий список.
+        # Лучше отказать в изменении: предмет можно добавить ещё раз, а
+        # потерянные шестьсот восстанавливать неоткуда.
+        raise RuntimeError(
+            "не удалось прочитать вотчлист из Upstash — изменение отменено, "
+            "чтобы не затереть список неполной копией. Попробуй ещё раз"
+        )
     entry.update(updates)
     value = json.dumps(entry, ensure_ascii=False)
 
