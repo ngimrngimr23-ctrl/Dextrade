@@ -610,6 +610,15 @@ async def _maintain(
                         listing_id = lots[0].listing_id
                         entry["listing_id"] = listing_id
                         book = await csfloat_client.order_book(session, listing_id)
+                if book is None:
+                    # Поиск закрыт (прокси отказывают) — номер последней
+                    # продажи из истории, она с адреса Render открыта (см.
+                    # csfloat_client.recent_sale_listing_id).
+                    sold_id = await csfloat_client.recent_sale_listing_id(session, name)
+                    if sold_id and sold_id != listing_id:
+                        book = await csfloat_client.order_book(session, sold_id)
+                        if book is not None:
+                            entry["listing_id"] = sold_id
                 entry["checked_at"] = now
                 checked += 1
                 if book is None:

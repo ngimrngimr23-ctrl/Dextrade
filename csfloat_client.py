@@ -74,6 +74,7 @@ from scan_errors import scrub
 import os
 import time
 from dataclasses import dataclass, field
+from urllib.parse import quote
 
 import aiohttp
 import yarl
@@ -1819,9 +1820,13 @@ async def _authed(
     params: dict[str, str] | None = None,
     body: dict | None = None,
     repeatable: bool = True,
+    anonymous: bool = False,
 ) -> tuple[int, object]:
     """
     Один запрос к авторизованной ручке. Возвращает (HTTP-код, JSON или текст).
+
+    anonymous=True — без ключа: для публичных ручек вроде истории продаж,
+    чтобы не тратить на них квоту ключа (200 запросов в час на всё).
 
     repeatable=False — для запросов, повтор которых может задвоить действие
     (создание ордера). Тогда на запасной маршрут уходим, только если первый
@@ -1835,7 +1840,10 @@ async def _authed(
     if not csfloat_enabled():
         raise CSFloatError("CSFLOAT_API_KEY не задан")
 
-    url = f"{CSFLOAT_BASE_URL}{path}"
+    # encoded=True: путь может нести уже закодированное имя предмета
+    # (история продаж), и повторное кодирование превратило бы %20 в %2520 —
+    # на этом уже обжигались в steam_client.
+    url = yarl.URL(f"{CSFLOAT_BASE_URL}{path}", encoded=True)
     routes: list[str | None] = [None]
     if CSFLOAT_POOL.enabled():
         backup = lane_address()
@@ -1847,9 +1855,12 @@ async def _authed(
         label = "прямой адрес" if proxy is None else f"прокси {mask_proxy(proxy)}"
         await _throttle_all(proxy)
         try:
+            request_headers = dict(_API_HEADERS)
+            if not anonymous:
+                request_headers["Authorization"] = CSFLOAT_API_KEY
             async with session.request(
                 method, url, params=params, json=body, proxy=proxy,
-                headers={**_API_HEADERS, "Authorization": CSFLOAT_API_KEY},
+                headers=request_headers,
                 timeout=aiohttp.ClientTimeout(total=AUTHED_TIMEOUT_SECONDS),
             ) as resp:
                 status = resp.status
@@ -2161,6 +2172,51 @@ async def buy_orders_for(
     if book is None:
         return None
     return [o.price_cents for o in book if not o.conditional]
+
+
+async def recent_sale_listing_id(
+    session: aiohttp.ClientSession, market_hash_name: str,
+) -> str | None:
+    """
+    Номер недавно ПРОДАННОГО лота предмета — чтобы прочитать стакан без поиска.
+
+    Зачем. Стакан ордеров (/listings/<id>/buy-orders) открывается по номеру
+    лота, а номер до сих пор брался из поиска /listings. Поиск же CSFloat с
+    адреса Render не пускает («disable your VPN»), и он живёт только через
+    прокси, — а когда прокси отказывают (2026-10-24: 403 от провайдера на
+    каждом логине), /orders не мог прочитать ни одного стакана и не ставил
+    ничего.
+
+    История продаж (/history/<имя>/sales) — публичная ручка, и проверка
+    2026-10-24 показала, что она отвечает даже без ключа с адреса
+    дата-центра. Стакан при этом нужен про ПРЕДМЕТ, а не про конкретный лот:
+    простой ордер на имя исполняется любым экземпляром. Поэтому годится и
+    номер лота, уже ушедшего покупателю.
+
+    Чего проверить заранее нельзя: отдаёт ли CSFloat стакан по номеру
+    проданного лота — без ключа ручка стакана отвечает «authorization not
+    set». Если не отдаёт, order_book вернёт None, и в логе будет видно, что
+    ответил сервер.
+
+    Анонимно — чтобы не тратить на это квоту ключа.
+    """
+    path = "/history/" + quote(market_hash_name, safe="") + "/sales"
+    try:
+        status, data = await _authed(session, "GET", path, anonymous=True)
+    except (CSFloatError, CSFloatRateLimited) as e:
+        log.info("csfloat: история продаж «%s» не прочитана — %s",
+                 market_hash_name, scrub(str(e)))
+        return None
+    if status != 200 or not isinstance(data, list):
+        log.info("csfloat: история продаж «%s» — HTTP %s: %s",
+                 market_hash_name, status, _api_message(data)[:120])
+        return None
+    rows = [r for r in data if isinstance(r, dict) and r.get("id")]
+    if rows:
+        _log_shape("история продаж", rows[0])
+    rows.sort(key=lambda r: str(r.get("sold_at") or r.get("created_at") or ""),
+              reverse=True)
+    return str(rows[0]["id"]) if rows else None
 
 
 async def my_recent_purchases(

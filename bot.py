@@ -5830,7 +5830,7 @@ def _order_links(cand) -> str:
     steam = f"https://steamcommunity.com/market/listings/730/{name}"
     csfloat = f"https://csfloat.com/search?market_hash_name={name}"
     parts = [f'<a href="{steam}">Steam</a>', f'<a href="{csfloat}">CSFloat</a>']
-    if cand.listing_id:
+    if cand.listing_id and not getattr(cand, "listing_sold", False):
         parts.append(f'<a href="https://csfloat.com/item/{cand.listing_id}">лот</a>')
     return " · ".join(parts)
 
@@ -7069,6 +7069,11 @@ class _OrderCandidate(NamedTuple):
     # проверки «история сходится с ценой» (buy_orders.HISTORY_RATIO_MIN/MAX):
     # ровные средние ничего не стоят, если сама цена из них выбивается.
     month_avg_cents: int | None = None
+    # listing_id — номер уже ПРОДАННОГО лота из истории продаж: по нему
+    # читается стакан, когда поиск лотов закрыт (см.
+    # csfloat_client.recent_sale_listing_id). Цены витрины у такого
+    # кандидата нет, и ссылку «лот» показывать незачем — он продан.
+    listing_sold: bool = False
 
 
 async def _order_candidates_from_arb(
@@ -7799,6 +7804,8 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # потратив на них по восемь попыток каждый. Одного ответа достаточно:
     # если дверь закрыта, она закрыта для всех десяти предметов.
     route_down: str | None = None
+    # Скольким кандидатам стакан прочитан по номеру последней продажи.
+    via_sale = 0
 
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
         for cand in ranked:
@@ -7827,8 +7834,20 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         cand = cand._replace(
                             csfloat_ask_cents=int(round(lots[0].price * 100))
                         )
-                    else:
-                        blind[cand.market_hash_name] = "на CSFloat лотов нет"
+            if listing_id is None:
+                # Поиск закрыт (прокси отказывают, прямой адрес CSFloat не
+                # пускает) или лотов сейчас нет. Стакан нужен про ПРЕДМЕТ, а
+                # не про лот, — берём номер последней продажи из истории: эта
+                # ручка публичная и с адреса Render открыта.
+                sold_id = await csfloat_client.recent_sale_listing_id(
+                    session, cand.market_hash_name,
+                )
+                if sold_id:
+                    listing_id = sold_id
+                    cand = cand._replace(listing_sold=True)
+                    via_sale += 1
+                elif route_down is None:
+                    blind[cand.market_hash_name] = "на CSFloat ни лотов, ни продаж"
 
             # Два независимых источника цены Steam разошлись — считать по
             # такой цене прибыль нельзя.
@@ -7991,6 +8010,11 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
             reach = _reach(cand, plan)
+            if cand.listing_sold:
+                lines.append(
+                    "  ℹ️ стакан прочитан по последней продаже: поиск лотов "
+                    "CSFloat закрыт, цену витрины сейчас не знаю"
+                )
             if plan.instant:
                 lines.append(
                     f"  ⚡ на CSFloat лот за ${cand.csfloat_ask_cents / 100:.2f} — "
@@ -8021,6 +8045,11 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 126 нет стакана». Именно так это и прочли. Кандидатов в том прогоне
         # было восемь.
         lines.append("")
+        if via_sale:
+            lines.append(
+                f"✅ Поиск лотов закрыт, но у {via_sale} кандидат(ов) стакан "
+                "прочитан по истории продаж — их можно ставить."
+            )
         lines.append(
             f"🟡 Стакан не прочитан у {len(blind)} из {len(ranked)} кандидат(ов) — "
             "это «не знаем, кого перебивать», а НЕ «ордер плохой». Цена у них "
@@ -8068,8 +8097,9 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  {html_module.escape(shown)}")
 
     log.info(
-        "orders: chat_id=%s итог — планов %d, отказов %d, без стакана %d%s",
-        chat_id, len(plans), len(refused), len(blind),
+        "orders: chat_id=%s итог — планов %d, отказов %d, без стакана %d, "
+        "стакан по истории продаж %d%s",
+        chat_id, len(plans), len(refused), len(blind), via_sale,
         f", маршрут закрыт: {route_down}" if route_down else "",
     )
     lines.append("")
@@ -8207,9 +8237,9 @@ async def _offer_order_batch(
             lines += [
                 "",
                 "Главная причина — поиск лотов CSFloat сейчас закрыт (прокси "
-                "отказывают, прямой адрес CSFloat не пускает; подробности выше). "
-                "Без лота бот не может прочитать стакан, а вслепую не ставит. "
-                "Проверь прокси: /proxycheck и кабинет провайдера.",
+                "отказывают, прямой адрес CSFloat не пускает; подробности выше), "
+                "а по истории продаж стакан тоже не прочитался. Без стакана бот "
+                "не ставит. Проверь прокси: /proxycheck и кабинет провайдера.",
             ]
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
         return
