@@ -51,6 +51,7 @@ import buy_orders
 import price_ruler
 import os
 import re
+import secrets
 import statistics
 import subprocess
 import tempfile
@@ -61,7 +62,7 @@ from typing import NamedTuple
 from urllib.parse import quote
 
 import aiohttp
-from telegram import BotCommand, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -154,6 +155,7 @@ from storage import (
     get_dips_settings,
     get_order_settings,
     set_order_setting,
+    get_bot_orders,
     get_steam_price_entry,
     get_watchlist_bundle,
     set_dips_setting,
@@ -178,6 +180,7 @@ from storage import (
 import csfloat_client
 import market_prices
 import menu
+import order_desk
 import pricing
 import dips
 import price_history
@@ -7299,9 +7302,15 @@ async def _order_candidates_from_catalog(chat_id: int, limits: dict) -> list[_Or
     window = band[cursor:cursor + ORDERS_CATALOG_BATCH]
     if len(window) < ORDERS_CATALOG_BATCH:
         window += band[:ORDERS_CATALOG_BATCH - len(window)]
-    await set_order_setting(
-        chat_id, "catalog_cursor", (cursor + len(window)) % len(band)
-    )
+    try:
+        await set_order_setting(
+            chat_id, "catalog_cursor", (cursor + len(window)) % len(band)
+        )
+    except RuntimeError as e:
+        # Хранилище не дало прочитать настройки — метку не двигаем, а
+        # кандидатов всё равно отдаём: прогон от этого не хуже, просто
+        # следующий начнёт с того же места.
+        log.warning("orders: метку обхода каталога не сохранил — %s", e)
 
     log.info(
         "orders: каталог — в полосе $%g-$%g подходят %d предмет(ов) "
@@ -7372,7 +7381,8 @@ async def setorders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Задать всё разом: <code>/setorders 25 20 5 300</code>\n"
             "Оставить прежним — прочерк: <code>/setorders 25 - - 300</code>\n\n"
             "Верхняя граница — заодно потолок на один ордер.\n"
-            "Что бот поставил бы: /orders (сухой прогон)",
+            "Бюджет и число ордеров: /orderbudget\n"
+            "Найти и поставить: /orders",
             parse_mode="HTML",
         )
         return
@@ -7431,11 +7441,11 @@ async def setorders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /orders — СУХОЙ ПРОГОН: какие ордера на покупку бот поставил бы сейчас.
+    /orders — план ордеров на покупку и кнопка, которая их ставит.
 
-    Ничего не отправляет в CSFloat и ничего не тратит: только читает стаканы и
-    считает. Отправки ордеров в коде нет вовсе — она появится отдельно и после
-    того, как сухой прогон покажет вменяемые числа на живом рынке.
+    Сама команда ничего не ставит и не тратит: читает стаканы и считает. Под
+    отчётом — кнопка «Поставить» для планов, прошедших все проверки; деньги
+    уходят только по её нажатию (см. _offer_order_batch и order_desk.place).
 
     Кандидаты берутся из двух источников сразу: широкий скан арбитража (лоты,
     которые дешевле Steam прямо сейчас) и /dips (предметы, просевшие ниже своей
@@ -7454,11 +7464,11 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "cursor": saved.get("catalog_cursor") or 0,
     }
     await update.message.reply_text(
-        "Сухой прогон ордеров: смотрю арбитраж и просадки, читаю стаканы…\n"
-        "Ничего не покупаю и не ставлю."
+        "Ищу ордера: смотрю арбитраж, просадки и каталог, читаю стаканы…\n"
+        "Сам ничего не ставлю — только по кнопке под отчётом."
     )
 
-    log.info("orders: chat_id=%s сухой прогон начат, пороги %s", chat_id, limits)
+    log.info("orders: chat_id=%s прогон начат, пороги %s", chat_id, limits)
 
     # Прайс-лист греем ДО таймера, и это не мелочь.
     #
@@ -7675,8 +7685,13 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             listing_id = cand.listing_id
             if listing_id is None and route_down is None:
                 try:
+                    # САМЫЙ ДЕШЁВЫЙ лот, а не самый свежий. По умолчанию
+                    # поиск сортирует по новизне, и «на CSFloat просят $X»
+                    # показывало цену случайного лота — а по ней решается,
+                    # достаёт ли заявка до рынка и не купит ли она лот сразу.
                     lots, _ = await csfloat_client.fetch_listings_page(
-                        session, limit=1, market_hash_name=cand.market_hash_name,
+                        session, limit=1, sort_by="lowest_price",
+                        market_hash_name=cand.market_hash_name,
                     )
                 except (CSFloatRateLimited, CSFloatError) as e:
                     route_down = scan_errors.reason(e)
@@ -7728,12 +7743,19 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if listing_id is None:
                 # Стакан недоступен, но план от него не зависит: потолок цены
                 # считается от цены Steam и порога прибыли, а чужие ордера
-                # нужны лишь чтобы встать на цент выше верхнего. Нет их —
+                # нужны лишь чтобы встать на шаг выше верхнего. Нет их —
                 # ставим по потолку, это самый выгодный из возможных ордеров.
                 blind.setdefault(cand.market_hash_name, "стакан не прочитан")
                 rivals = None
             else:
                 rivals = await csfloat_client.buy_orders_for(session, listing_id)
+                if rivals is None:
+                    # Лот есть, а стакан не отдали. Раньше это молча
+                    # превращалось в пустой список — и отчёт писал «стакан
+                    # пуст», то есть «перебивать некого», про стакан, которого
+                    # никто не видел. Для настоящей постановки это ордер по
+                    # потолку вслепую.
+                    blind[cand.market_hash_name] = "стакан не прочитан"
             # Объём у нас суточный (окно last_24h прайс-листа), а порог
             # недельный — переводим тем же способом, что и /dips.
             weekly = (
@@ -7748,16 +7770,17 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 min_profit_pct=limits["profit"],
                 min_volume_per_week=limits["volume"],
                 max_order_usd=limits["high"],
+                ask_cents=cand.csfloat_ask_cents,
             )
             if plan is None:
                 refused.append((cand.market_hash_name, why))
             else:
-                plans.append((cand, plan))
+                plans.append((cand._replace(listing_id=listing_id), plan))
 
     verified_by_name = {c.market_hash_name: c.steam_verified for c in ranked}
     checked = sum(1 for c in ranked if c.steam_verified)
 
-    lines = ["<b>Сухой прогон ордеров</b> — ничего не поставлено", ""]
+    lines = ["<b>План ордеров</b> — пока ничего не поставлено", ""]
     # ЧТО ЗНАЧИТ «ЗАЯВКА ДОСТАЁТ ДО РЫНКА».
     #
     # Смысл ордера — купить дешевле, чем просят сейчас, и подождать. Но ждать
@@ -7813,7 +7836,12 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
             reach = _reach(cand, plan)
-            if reach is not None and reach < ORDERS_MIN_REACH:
+            if plan.instant:
+                lines.append(
+                    f"  ⚡ на CSFloat лот за ${cand.csfloat_ask_cents / 100:.2f} — "
+                    "ордер купит его сразу, ждать продавца не придётся"
+                )
+            elif reach is not None and reach < ORDERS_MIN_REACH:
                 lines.append(
                     f"  ⚠️ на CSFloat просят ${cand.csfloat_ask_cents / 100:.2f} — "
                     f"наша заявка ниже витрины в {1 / reach:.0f} раз(а). "
@@ -7912,6 +7940,639 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             scan_errors.scrub(chunk), parse_mode="HTML",
             disable_web_page_preview=True,
         )
+
+    # ЧТО ИЗ ПЛАНОВ МОЖНО СТАВИТЬ НА ДЕНЬГИ.
+    #
+    # Отчёт показывает всё, что посчиталось, но ставить можно не всё. Три
+    # условия, и каждое закрывает свой способ потерять деньги:
+    #   * стакан прочитан — иначе цена «по потолку» стоит вслепую и может
+    #     переплатить соперникам вдвое;
+    #   * цена Steam подтверждена живым запросом — прайс-лист это медиана
+    #     сделок за сутки, а продавать будем по сегодняшнему стакану;
+    #   * заявка достаёт до рынка — лотерейный билет в сто раз ниже витрины
+    #     не исполнится и только займёт место в бюджете и лимите.
+    tickets: list[order_desk.Ticket] = []
+    held: dict[str, int] = {}
+    for cand, plan in sorted(plans, key=_order_rank):
+        reach = _reach(cand, plan)
+        if plan.market_hash_name in blind:
+            why = "стакан не прочитан — не знаю, кого перебивать"
+        elif not verified_by_name.get(plan.market_hash_name, False):
+            why = "цена Steam не подтверждена живым запросом"
+        elif not plan.instant and reach is not None and reach < ORDERS_MIN_REACH:
+            why = "заявка ниже витрины в разы — не исполнится"
+        else:
+            tickets.append(order_desk.Ticket(
+                market_hash_name=plan.market_hash_name,
+                price_cents=plan.price_cents,
+                ceiling_cents=plan.ceiling_cents,
+                steam_price_cents=plan.steam_price_cents,
+                profit_pct=plan.profit_pct,
+                listing_id=cand.listing_id,
+                source=cand.source,
+                instant=plan.instant,
+            ))
+            continue
+        held[why] = held.get(why, 0) + 1
+    if plans:
+        await _offer_order_batch(update, chat_id, tickets, held)
+
+
+# ---------------------------------------------------------------------------
+# Настоящие ордера: кнопка «Поставить», /myorders, /cancelorders,
+# /orderbudget, /autoorders и поддержка по расписанию.
+#
+# Сама логика — в order_desk (постановка, перестановка, отмена) и buy_orders
+# (цена). Здесь только чат: показать, спросить, доложить.
+# ---------------------------------------------------------------------------
+
+# Префикс кнопок ордеров. Свой, а не menu.ACT: у этих кнопок своя жизнь —
+# они живут минуты и ссылаются на план, которого в меню нет.
+ORDER_CB = "ord"
+
+# Сколько живёт кнопка «Поставить». Стакан меняется за минуты, и план,
+# посчитанный час назад, — уже не тот план: цена соперника ушла, Steam
+# подвинулся. Пятнадцать минут — запас на то, чтобы прочитать отчёт.
+ORDERS_TICKET_TTL_SECONDS = envcfg.env_float("ORDERS_TICKET_TTL", 900.0)
+
+ORDERS_JOB_PREFIX = "orders_maintain_"
+
+
+class _OrderBatch(NamedTuple):
+    chat_id: int
+    created_at: float
+    tickets: list
+
+
+# План, ждущий кнопки. В памяти процесса намеренно: после рестарта кнопка
+# должна умереть, а не поставить ордера по ценам из прошлой жизни.
+_order_batches: dict[str, _OrderBatch] = {}
+
+# Что показал последний /myorders — по этому списку /cancelorders N понимает,
+# какой ордер «второй». Без снимка номер означал бы позицию в списке на
+# момент отмены, а список мог успеть поменяться.
+_myorders_view: dict[int, list[str]] = {}
+
+
+async def _order_limits(chat_id: int) -> tuple[int, int, int]:
+    """(бюджет в центах, лимит ботовых ордеров, интервал поддержки в мин; 0 — выкл)."""
+    saved = await get_order_settings(chat_id)
+    budget = saved.get("budget")
+    if budget is None:
+        budget = order_desk.DEFAULT_BUDGET_USD
+    max_count = saved.get("max_count") or order_desk.DEFAULT_MAX_COUNT
+    auto = saved.get("auto_minutes")
+    auto_minutes = order_desk.DEFAULT_AUTO_MINUTES if auto is None else int(auto)
+    return int(round(float(budget) * 100)), int(max_count), auto_minutes
+
+
+def _usd(cents: int | None) -> str:
+    return "—" if cents is None else f"${cents / 100:.2f}"
+
+
+async def _offer_order_batch(update, chat_id: int, tickets: list, held: dict[str, int]) -> None:
+    """Сообщение с кнопкой «Поставить» под отчётом /orders."""
+    held_lines = [
+        f"• {html_module.escape(why)} — {n} шт."
+        for why, n in sorted(held.items(), key=lambda kv: -kv[1])
+    ]
+    if not tickets:
+        await update.message.reply_text(
+            "\n".join(["<b>Ставить нечего</b> — ни один план не прошёл проверки:"]
+                      + held_lines),
+            parse_mode="HTML",
+        )
+        return
+
+    budget_cents, max_count, auto_minutes = await _order_limits(chat_id)
+    now = time.time()
+    for key in [k for k, b in _order_batches.items()
+                if now - b.created_at > ORDERS_TICKET_TTL_SECONDS]:
+        _order_batches.pop(key, None)
+    token = secrets.token_hex(4)
+    _order_batches[token] = _OrderBatch(chat_id, now, tickets)
+
+    total = sum(t.price_cents for t in tickets)
+    instant = sum(1 for t in tickets if t.instant)
+    lines = [
+        f"<b>Можно поставить: {len(tickets)} ордер(ов) на {_usd(total)}</b>",
+        "Прошли все проверки: живая цена Steam, прочитанный стакан, заявка "
+        "достаёт до рынка.",
+    ]
+    if instant:
+        lines.append(
+            f"⚡ {instant} из них купят лот сразу — это покупка, а не ожидание."
+        )
+    lines.append(
+        f"Предохранители: в ботовых ордерах всего не больше {_usd(budget_cents)} "
+        f"и не больше {max_count} шт. — что не влезет, не поставлю "
+        "(менять: /orderbudget)."
+    )
+    lines.append(
+        f"Дальше бот раз в {auto_minutes} мин сверяет свои ордера со стаканом: "
+        "обошли — встаёт на шаг выше, но не выше потолка прибыли; исполнился — "
+        "сообщит. Выключить: /autoorders выкл"
+        if auto_minutes else
+        "Автоподдержка выключена (/autoorders) — обойдённые ордера так и "
+        "останутся стоять."
+    )
+    if held_lines:
+        lines += ["", "Не ставлю (только показал):"] + held_lines
+    lines += ["", f"<i>Кнопка действует {ORDERS_TICKET_TTL_SECONDS / 60:.0f} мин.</i>"]
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(
+        f"✅ Поставить ({len(tickets)} шт., {_usd(total)})",
+        callback_data=f"{ORDER_CB}|place|{token}",
+    )]])
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode="HTML", reply_markup=keyboard,
+    )
+
+
+def _schedule_orders_job(job_queue, chat_id: int, minutes: float, *, delay_minutes: float | None = None) -> None:
+    """Следующая сверка ботовых ордеров — одноразовой джобой, как у арбитража."""
+    if job_queue is None:
+        return
+    for job in job_queue.get_jobs_by_name(f"{ORDERS_JOB_PREFIX}{chat_id}"):
+        job.schedule_removal()
+    if not minutes:
+        return
+    job_queue.run_once(
+        orders_maintain_job,
+        when=(minutes if delay_minutes is None else delay_minutes) * 60,
+        data={"chat_id": chat_id},
+        name=f"{ORDERS_JOB_PREFIX}{chat_id}",
+    )
+
+
+_EVENT_MARKS = {
+    order_desk.FILLED: "🎉",
+    order_desk.GONE: "❔",
+    order_desk.RAISED: "⬆️",
+    order_desk.LOWERED: "⬇️",
+    order_desk.CANCELLED: "🗑",
+    order_desk.OUTBID: "⚠️",
+    order_desk.FAILED: "❌",
+}
+
+
+async def _orders_round(chat_id: int) -> order_desk.Round:
+    """Прогон поддержки с текущими порогами чата."""
+    saved = await get_order_settings(chat_id)
+    budget_cents, _, _ = await _order_limits(chat_id)
+    profit = saved.get("min_profit") or buy_orders.DEFAULT_MIN_PROFIT_PCT
+    high = saved.get("max_price") or buy_orders.DEFAULT_MAX_ORDER_USD
+    return await order_desk.maintain(
+        chat_id,
+        min_profit_pct=float(profit),
+        max_order_cents=int(round(float(high) * 100)),
+        budget_cents=budget_cents,
+    )
+
+
+def _round_lines(rnd: order_desk.Round, *, title: str) -> list[str]:
+    lines = [f"<b>{title}</b>"]
+    for e in rnd.events:
+        lines.append(
+            f"{_EVENT_MARKS.get(e.kind, '•')} <code>{html_module.escape(e.name)}</code> — "
+            f"{html_module.escape(e.text)}"
+        )
+    if rnd.problem:
+        lines.append(f"⚠️ {html_module.escape(scan_errors.scrub(rnd.problem))}")
+    lines.append(
+        f"Ботовых ордеров: {rnd.active} на {_usd(rnd.committed_cents)}. "
+        f"Проверено стаканов: {rnd.checked}"
+        + (f", не прочитано {rnd.blind}" if rnd.blind else "")
+        + ". Все ордера: /myorders"
+    )
+    return lines
+
+
+async def orders_maintain_job(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.data["chat_id"]
+    _, _, auto_minutes = await _order_limits(chat_id)
+    rnd = None
+    try:
+        rnd = await _orders_round(chat_id)
+        log.info(
+            "orders: chat_id=%s поддержка — событий %d, проверено %d, без стакана %d, "
+            "активных %d%s", chat_id, len(rnd.events), rnd.checked, rnd.blind,
+            rnd.active, f", проблема: {rnd.problem}" if rnd.problem else "",
+        )
+        # Пишем только когда есть что сказать: «всё стоит как стояло» каждые
+        # полчаса — это шум, за которым потеряется «ордер исполнен».
+        if rnd.events:
+            for chunk in _chunk_lines(_round_lines(rnd, title="Ордера CSFloat")):
+                await context.bot.send_message(
+                    chat_id=chat_id, text=chunk, parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+    except Exception:
+        log.exception("orders: поддержка chat_id=%s упала", chat_id)
+    finally:
+        # Ботовых ордеров не осталось — расписание засыпает до следующей
+        # постановки, а не дёргает CSFloat вхолостую. Если прогон не
+        # состоялся (сбой сети, хранилища), ордера могли остаться — тогда
+        # повторяем.
+        alive = rnd is None or rnd.active > 0 or rnd.problem is not None
+        if auto_minutes and alive:
+            _schedule_orders_job(context.job_queue, chat_id, auto_minutes)
+
+
+async def _place_batch(query, context, chat_id: int, token: str, send) -> None:
+    batch = _order_batches.pop(token, None)
+    if batch is None or batch.chat_id != chat_id:
+        await send("Эта кнопка уже нажата или устарела. Свежий план: /orders")
+        return
+    age = time.time() - batch.created_at
+    if age > ORDERS_TICKET_TTL_SECONDS:
+        await send(
+            f"План посчитан {age / 60:.0f} мин назад — цены уже могли уйти. "
+            "Ничего не ставлю. Свежий план: /orders"
+        )
+        return
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:  # noqa: BLE001 — кнопка уже снята, не беда
+        pass
+
+    budget_cents, max_count, auto_minutes = await _order_limits(chat_id)
+    await send(f"Ставлю {len(batch.tickets)} ордер(ов) на CSFloat…")
+    outcome = await order_desk.place(
+        chat_id, batch.tickets, budget_cents=budget_cents, max_count=max_count,
+    )
+
+    lines = ["<b>Ордера на CSFloat</b>"]
+    if outcome.placed:
+        lines.append(f"✅ Поставлено {len(outcome.placed)}:")
+        for t, order in outcome.placed:
+            lines.append(
+                f"• <code>{html_module.escape(t.market_hash_name)}</code> — "
+                f"{_usd(order.price_cents)} (потолок {_usd(t.ceiling_cents)}, "
+                f"прибыль {t.profit_pct:.0f}%)"
+            )
+    if outcome.filled_now:
+        lines.append(f"⚡ Купилось сразу {len(outcome.filled_now)}:")
+        for t in outcome.filled_now:
+            lines.append(
+                f"• <code>{html_module.escape(t.market_hash_name)}</code> — до "
+                f"{_usd(t.price_cents)}. Продавец пришлёт трейд в Steam — прими его"
+            )
+    if outcome.refused:
+        lines.append(f"⏭ Не поставлено {len(outcome.refused)}:")
+        for t, why in outcome.refused:
+            lines.append(
+                f"• <code>{html_module.escape(t.market_hash_name)}</code> — "
+                f"{html_module.escape(why)}"
+            )
+    if outcome.stopped:
+        lines.append(f"⛔ Остановился: {html_module.escape(outcome.stopped)}")
+    lines.append("")
+    lines.append(
+        f"В ботовых ордерах теперь {_usd(outcome.committed_cents)} "
+        f"({outcome.count} шт.) из бюджета {_usd(budget_cents)}. "
+        f"Баланс CSFloat: {_usd(outcome.balance_cents)}."
+    )
+    if outcome.placed:
+        lines.append(
+            f"Сверка со стаканом — раз в {auto_minutes} мин." if auto_minutes
+            else "Автоподдержка выключена: /autoorders 30 — включить."
+        )
+    lines.append("Все ордера: /myorders · снять: /cancelorders")
+    for chunk in _chunk_lines(lines):
+        await send(scan_errors.scrub(chunk), parse_mode="HTML",
+                   disable_web_page_preview=True)
+
+    if outcome.placed and auto_minutes:
+        _schedule_orders_job(context.application.job_queue, chat_id, auto_minutes)
+
+
+async def orders_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки ордеров: поставить план, сверить сейчас, снять."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat.id
+    parts = (query.data or "").split("|", 2)
+    parts += [""] * (3 - len(parts))
+    _, action, arg = parts
+
+    # Отвечаем в чат напрямую, а не ответом на сообщение с кнопкой: кнопку
+    # «Сверить сейчас» могут нажать через пару суток, а на сообщения старше
+    # 48 часов Telegram отвечать уже не даёт.
+    async def send(text: str, **kwargs):
+        return await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+
+    if order_desk.busy(chat_id):
+        await send(
+            "С ордерами уже идёт работа (постановка или сверка) — подожди, "
+            "пока она закончится."
+        )
+        return
+    if action == "place":
+        await _place_batch(query, context, chat_id, arg, send)
+    elif action == "check":
+        await send("Сверяю ботовые ордера со стаканом…")
+        rnd = await _orders_round(chat_id)
+        if not rnd.events and not rnd.problem and rnd.active == 0:
+            await send("Ботовых ордеров нет — сверять нечего.")
+            return
+        lines = _round_lines(rnd, title="Сверка ордеров")
+        if not rnd.events and not rnd.problem:
+            lines.insert(1, "Всё стоит как надо — переставлять нечего.")
+        for chunk in _chunk_lines(lines):
+            await send(chunk, parse_mode="HTML", disable_web_page_preview=True)
+    elif action == "cancel":
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001 — сообщение старое или кнопку уже сняли
+            pass
+        await send("Снимаю ордера…")
+        if arg == "all":
+            result = await order_desk.cancel(chat_id, include_manual=True)
+        elif arg == "bot":
+            result = await order_desk.cancel(chat_id)
+        else:
+            result = await order_desk.cancel(chat_id, ids=[arg])
+        await send("\n".join(_cancel_lines(result)), parse_mode="HTML")
+
+
+def _cancel_lines(result: order_desk.CancelOutcome) -> list[str]:
+    lines = []
+    if result.cancelled:
+        lines.append(f"🗑 Снято {len(result.cancelled)}:")
+        lines += [
+            f"• <code>{html_module.escape(o.market_hash_name or o.order_id)}</code> — "
+            f"{_usd(o.price_cents)}" for o in result.cancelled
+        ]
+    if result.failed:
+        lines.append(f"❌ Не снялось {len(result.failed)}:")
+        lines += [
+            f"• <code>{html_module.escape(o.market_hash_name or o.order_id)}</code> — "
+            f"{html_module.escape(why)}" for o, why in result.failed
+        ]
+    if result.problem:
+        lines.append(f"⚠️ {html_module.escape(scan_errors.scrub(result.problem))}")
+    if not lines:
+        lines.append("Снимать нечего — таких ордеров нет.")
+    return lines
+
+
+async def myorders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/myorders — все ордера на CSFloat: ботовые и ручные, баланс, бюджет."""
+    chat_id = update.effective_chat.id
+    try:
+        snap = await order_desk.snapshot(chat_id)
+    except (CSFloatError, CSFloatRateLimited) as e:
+        await update.message.reply_text(
+            f"⚠️ Ордера с CSFloat не прочитаны: {scan_errors.scrub(str(e))}"
+        )
+        return
+
+    budget_cents, max_count, auto_minutes = await _order_limits(chat_id)
+    registry = snap.registry or {}
+    now = time.time()
+    _myorders_view[chat_id] = [o.order_id for o in snap.orders]
+
+    bot_cents = sum(o.price_cents * o.qty for o in snap.orders if o.order_id in registry)
+    bot_count = sum(1 for o in snap.orders if o.order_id in registry)
+    all_cents = sum(o.price_cents * o.qty for o in snap.orders)
+    lines = [
+        f"<b>Ордера на CSFloat</b> — {len(snap.orders)} шт. на {_usd(all_cents)}",
+        f"Ботовых {bot_count} на {_usd(bot_cents)} из бюджета {_usd(budget_cents)} "
+        f"(лимит {max_count} шт.). Баланс CSFloat: {_usd(snap.balance_cents)}.",
+    ]
+    if snap.registry is None:
+        lines.append("⚠️ Реестр бота не прочитан — какие ордера ботовые, сейчас не видно.")
+    if not snap.orders:
+        lines.append("")
+        lines.append("Ордеров нет. Найти, что поставить: /orders")
+    for i, o in enumerate(snap.orders, 1):
+        entry = registry.get(o.order_id)
+        name = html_module.escape(o.market_hash_name or "ордер с условиями")
+        qty = f" ×{o.qty}" if o.qty > 1 else ""
+        if entry:
+            age_h = (now - float(entry.get("placed_at") or now)) / 3600
+            moved = int(entry.get("reprices") or 0)
+            lines.append(
+                f"{i}. 🤖 <code>{name}</code> — {_usd(o.price_cents)}{qty} · "
+                f"потолок {_usd(entry.get('ceiling'))} · стоит {age_h:.0f} ч"
+                + (f" · переставлен {moved} раз" if moved else "")
+                + (" · ⚠️ обошли выше потолка" if entry.get("outbid_noted") else "")
+            )
+        else:
+            lines.append(
+                f"{i}. ✋ <code>{name}</code> — {_usd(o.price_cents)}{qty} (ручной — "
+                "бот его не трогает)"
+            )
+    next_in = _next_run_in(context.job_queue, f"{ORDERS_JOB_PREFIX}{chat_id}")
+    lines.append("")
+    if auto_minutes:
+        lines.append(
+            f"Сверка со стаканом раз в {auto_minutes} мин"
+            + (f", следующая через {next_in / 60:.0f} мин." if next_in is not None
+               else " — сейчас не запланирована (ботовых ордеров не было).")
+        )
+    else:
+        lines.append("Автоподдержка выключена: /autoorders 30 — включить.")
+    lines.append("Снять: /cancelorders — все ботовые, /cancelorders 2 — один по номеру.")
+
+    keyboard = None
+    if bot_count:
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 Сверить сейчас", callback_data=f"{ORDER_CB}|check|"),
+        ]])
+    chunks = _chunk_lines(lines)
+    for n, chunk in enumerate(chunks):
+        await update.message.reply_text(
+            chunk, parse_mode="HTML", disable_web_page_preview=True,
+            reply_markup=keyboard if n == len(chunks) - 1 else None,
+        )
+
+
+async def cancelorders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /cancelorders — снять ботовые ордера (с подтверждением).
+    /cancelorders 2 — снять второй из последнего /myorders.
+    /cancelorders все — снять вообще все, и ручные тоже (с подтверждением).
+    """
+    chat_id = update.effective_chat.id
+    args = [a.lower() for a in (context.args or [])]
+    if order_desk.busy(chat_id):
+        await update.message.reply_text(
+            "С ордерами уже идёт работа — подожди, пока она закончится."
+        )
+        return
+
+    if args and args[0].isdigit():
+        view = _myorders_view.get(chat_id)
+        index = int(args[0])
+        if not view:
+            await update.message.reply_text(
+                "Номер берётся из списка /myorders — открой его сначала."
+            )
+            return
+        if not 1 <= index <= len(view):
+            await update.message.reply_text(
+                f"В последнем /myorders номера от 1 до {len(view)}."
+            )
+            return
+        result = await order_desk.cancel(chat_id, ids=[view[index - 1]])
+        await update.message.reply_text(
+            "\n".join(_cancel_lines(result)), parse_mode="HTML",
+        )
+        return
+
+    include_manual = bool(args) and args[0] in ("все", "всё", "all")
+    try:
+        snap = await order_desk.snapshot(chat_id)
+    except (CSFloatError, CSFloatRateLimited) as e:
+        await update.message.reply_text(
+            f"⚠️ Ордера с CSFloat не прочитаны: {scan_errors.scrub(str(e))}"
+        )
+        return
+    registry = snap.registry or {}
+    targets = (snap.orders if include_manual
+               else [o for o in snap.orders if o.order_id in registry])
+    if not include_manual and snap.registry is None:
+        await update.message.reply_text(
+            "⚠️ Реестр бота не прочитан — не знаю, какие ордера ботовые. "
+            "Снять конкретный: /myorders, потом /cancelorders <номер>."
+        )
+        return
+    if not targets:
+        await update.message.reply_text(
+            "Снимать нечего: " + ("ордеров на CSFloat нет." if include_manual
+                                  else "ботовых ордеров нет. Все ордера: /myorders")
+        )
+        return
+    total = sum(o.price_cents * o.qty for o in targets)
+    what = "ВСЕ ордера, включая ручные" if include_manual else "все ботовые ордера"
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(
+        f"🗑 Снять {len(targets)} шт. на {_usd(total)}",
+        callback_data=f"{ORDER_CB}|cancel|{'all' if include_manual else 'bot'}",
+    )]])
+    await update.message.reply_text(
+        f"Снять {what}: {len(targets)} шт. на {_usd(total)}?",
+        reply_markup=keyboard,
+    )
+
+
+async def orderbudget(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/orderbudget [$всего] [макс шт] — предохранители настоящих ордеров."""
+    chat_id = update.effective_chat.id
+    args = context.args or []
+    budget_cents, max_count, _ = await _order_limits(chat_id)
+    if not args:
+        await update.message.reply_text(
+            f"<b>Предохранители ордеров</b>\n"
+            f"• всего в ботовых ордерах — не больше <b>{_usd(budget_cents)}</b>\n"
+            f"• ботовых ордеров разом — не больше <b>{max_count}</b>\n"
+            f"• один ордер — не дороже верхней границы /setorders\n\n"
+            f"Задать: <code>/orderbudget 150 15</code> — $150 на всё, до 15 ордеров.\n"
+            f"Бюджет считает и поднятия цен при перестановке: обойдённый ордер не "
+            f"поднимется, если не влезает.",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        new_budget, set_budget = _order_arg(args[0])
+        new_count, set_count = (
+            _order_arg(args[1], integer=True) if len(args) > 1 else (None, False)
+        )
+    except ValueError:
+        await update.message.reply_text("Не разобрал числа. Пример: /orderbudget 150 15")
+        return
+    if set_budget and new_budget < 0:
+        await update.message.reply_text("Бюджет не бывает отрицательным.")
+        return
+    if set_count and new_count < 1:
+        await update.message.reply_text("Ордеров нужно хотя бы 1. Остановить всё: /cancelorders")
+        return
+    if set_budget:
+        await set_order_setting(chat_id, "budget", float(new_budget))
+    if set_count:
+        await set_order_setting(chat_id, "max_count", int(new_count))
+    budget_cents, max_count, _ = await _order_limits(chat_id)
+    await update.message.reply_text(
+        f"Готово: в ботовых ордерах не больше {_usd(budget_cents)}, "
+        f"разом не больше {max_count} шт. Уже стоящие ордера не снимаются — "
+        f"предохранитель действует на новые и на подъём цен."
+    )
+
+
+async def autoorders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/autoorders [минут|выкл|сейчас] — сверка ботовых ордеров со стаканом."""
+    chat_id = update.effective_chat.id
+    args = [a.lower() for a in (context.args or [])]
+    _, _, auto_minutes = await _order_limits(chat_id)
+    jq = context.application.job_queue
+
+    if not args:
+        next_in = _next_run_in(jq, f"{ORDERS_JOB_PREFIX}{chat_id}")
+        state = (
+            f"раз в {auto_minutes} мин"
+            + (f", следующая через {next_in / 60:.0f} мин" if next_in is not None
+               else " (ждёт первой постановки)")
+            if auto_minutes else "выключена"
+        )
+        await update.message.reply_text(
+            f"<b>Автоподдержка ордеров</b>: {state}.\n\n"
+            "Что делает: сверяет ботовые ордера со стаканом. Обошли — встаёт на "
+            "шаг выше, но не выше потолка прибыли и бюджета; переплачиваем — "
+            "снижает; Steam подешевел — снижает до нового потолка; исполнился — "
+            "сообщает. Ручные ордера не трогает.\n\n"
+            "<code>/autoorders 30</code> — раз в 30 мин (от "
+            f"{order_desk.MIN_AUTO_MINUTES})\n"
+            "<code>/autoorders сейчас</code> — сверить прямо сейчас\n"
+            "<code>/autoorders выкл</code> — выключить",
+            parse_mode="HTML",
+        )
+        return
+
+    if args[0] in _OFF_WORDS:
+        await set_order_setting(chat_id, "auto_minutes", 0)
+        _schedule_orders_job(jq, chat_id, 0)
+        await update.message.reply_text(
+            "⏹ Автоподдержка ордеров выключена. Ордера стоят как стоят; "
+            "обойдённые бот больше не переставит. Включить: /autoorders 30"
+        )
+        return
+
+    if args[0] in ("сейчас", "now"):
+        if order_desk.busy(chat_id):
+            await update.message.reply_text("Сверка уже идёт — подожди.")
+            return
+        await update.message.reply_text("Сверяю ботовые ордера со стаканом…")
+        rnd = await _orders_round(chat_id)
+        if not rnd.events and not rnd.problem and rnd.active == 0:
+            await update.message.reply_text("Ботовых ордеров нет — сверять нечего.")
+            return
+        lines = _round_lines(rnd, title="Сверка ордеров")
+        if not rnd.events and not rnd.problem:
+            lines.insert(1, "Всё стоит как надо — переставлять нечего.")
+        for chunk in _chunk_lines(lines):
+            await update.message.reply_text(chunk, parse_mode="HTML",
+                                            disable_web_page_preview=True)
+        return
+
+    try:
+        minutes = float(args[0].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text(
+            "Не разобрал. Примеры: /autoorders 30, /autoorders выкл, /autoorders сейчас"
+        )
+        return
+    if minutes < order_desk.MIN_AUTO_MINUTES:
+        await update.message.reply_text(
+            f"Не чаще раза в {order_desk.MIN_AUTO_MINUTES} мин: каждая сверка — "
+            "запрос к CSFloat на каждый ордер, а квота у ключа общая со сканом."
+        )
+        return
+    await set_order_setting(chat_id, "auto_minutes", int(minutes))
+    _schedule_orders_job(jq, chat_id, int(minutes))
+    await update.message.reply_text(
+        f"Автоподдержка: раз в {int(minutes)} мин. Первая сверка — через "
+        f"{int(minutes)} мин; прямо сейчас: /autoorders сейчас"
+    )
 
 
 async def csfloatapi(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8645,6 +9306,16 @@ async def _status_lines(chat_id: int, jq) -> list[str]:
         budget = csfloat_client.budget_description()
         if budget:
             lines.append(f"  квота CSFloat: {budget}")
+        # Отдельной строкой: общий ли счётчик у ручек ордеров с поиском лотов,
+        # ещё не выяснено (см. csfloat_client._orders_budget).
+        orders_budget = csfloat_client.orders_budget_description()
+        if orders_budget:
+            lines.append(f"  лимит ручек ордеров: {orders_budget}")
+        next_check = _next_run_in(jq, f"{ORDERS_JOB_PREFIX}{chat_id}")
+        if next_check is not None:
+            lines.append(
+                f"  ордера CSFloat: сверка через {_fmt_mins(next_check)} (/myorders)"
+            )
 
     # --- Пороги отбора -----------------------------------------------------
     lines.append("")
@@ -9929,6 +10600,7 @@ _HELP_GROUPS = (
     "Начать",
     "Списки",
     "Арбитраж CSFloat ↔ Steam",
+    "Ордера CSFloat",
     "Площадки",
     "Инвентарь",
     "Служебное",
@@ -10089,7 +10761,7 @@ COMMANDS: tuple[Command, ...] = (
         "Остальные пороги арбитража — /start → Пороги → Арбитраж.",
     ),
     Command(
-        "setorders", setorders, "Пороги ордеров",
+        "setorders", setorders, "Ордера CSFloat",
         "Прибыль, ликвидность и диапазон цены",
         "/setorders — показать текущие пороги\n"
         "/setorders <прибыль%> <шт/нед> <мин$> <макс$> — задать всё разом, "
@@ -10098,16 +10770,48 @@ COMMANDS: tuple[Command, ...] = (
         "Верхняя граница диапазона — заодно потолок на один ордер.",
     ),
     Command(
-        "orders", orders_cmd, "Сухой прогон ордеров",
-        "Какие ордера бот поставил бы сейчас",
-        "/orders — СУХОЙ ПРОГОН. Показывает, какие ордера на покупку бот поставил "
-        "бы прямо сейчас: кандидаты из широкого скана арбитража и из просадок "
-        "(/dips), цена подбирается на цент выше верхнего чужого ордера, но не "
-        "дороже потолка прибыли.\n"
-        "Ничего не покупает и не ставит — отправки ордеров в коде пока нет вовсе.",
+        "orders", orders_cmd, "Ордера CSFloat",
+        "Найти ордера и поставить их",
+        "/orders — план ордеров на покупку: кандидаты из широкого скана "
+        "арбитража, просадок (/dips) и всего каталога в ценовой полосе. Цена — "
+        "на шаг сетки CSFloat выше верхнего чужого ордера, но не дороже потолка "
+        "прибыли. Сам по себе ничего не ставит: под отчётом кнопка «Поставить» "
+        "для планов, прошедших все проверки (живая цена Steam, прочитанный "
+        "стакан, заявка достаёт до рынка). Кнопка живёт 15 минут.",
     ),
     Command(
-        "csfloatapi", csfloatapi, "Что доступно ключу CSFloat",
+        "myorders", myorders, "Ордера CSFloat",
+        "Мои ордера на CSFloat",
+        "/myorders — все ордера на CSFloat: 🤖 поставленные ботом и ✋ ручные, "
+        "баланс, сколько занято из бюджета. Кнопка «Сверить сейчас» — проверить "
+        "стаканы немедленно.",
+    ),
+    Command(
+        "cancelorders", cancelorders, "Ордера CSFloat",
+        "Снять ордера",
+        "/cancelorders — снять все ботовые ордера (с подтверждением)\n"
+        "/cancelorders 2 — снять второй из последнего /myorders\n"
+        "/cancelorders все — снять вообще все, и ручные (с подтверждением)",
+    ),
+    Command(
+        "orderbudget", orderbudget, "Ордера CSFloat",
+        "Бюджет и лимит ордеров",
+        "/orderbudget — показать предохранители\n"
+        "/orderbudget 150 15 — в ботовых ордерах всего не больше $150 и не "
+        "больше 15 штук. Действует и на постановку, и на подъём цен.",
+    ),
+    Command(
+        "autoorders", autoorders, "Ордера CSFloat",
+        None,
+        "/autoorders — как бот поддерживает свои ордера\n"
+        "/autoorders 30 — сверять со стаканом раз в 30 минут: обошли — встать на "
+        "шаг выше в пределах потолка, переплачиваем — снизить, исполнился — "
+        "сообщить\n"
+        "/autoorders сейчас — сверить немедленно\n"
+        "/autoorders выкл — выключить",
+    ),
+    Command(
+        "csfloatapi", csfloatapi, "Служебное",
         "Проверить, какие ручки API открыты",
         "/csfloatapi — дёрнуть ручки CSFloat нашим ключом и показать, что ответил "
         "сервер. Нужно, чтобы понять, можно ли ставить ордера на покупку: в "
@@ -10115,7 +10819,7 @@ COMMANDS: tuple[Command, ...] = (
         "Только чтение — ничего не покупает и не создаёт.",
     ),
     Command(
-        "reset", reset_cooldowns, "Снять паузу после 429",
+        "reset", reset_cooldowns, "Служебное",
         "Снять кулдаун Steam и CSFloat",
         "/reset — снять все паузы после 429: Steam (листинги, цены, инвентарь) и CSFloat.\n"
         "Снимается НАША пауза, а не бан у Steam: если он ещё держится, следующий "
@@ -10346,6 +11050,29 @@ async def _on_startup(app: Application):
         inv_restored += 1
     if inv_restored:
         log.info("inventory: восстановлены джобы слежения для %d чат(ов)", inv_restored)
+
+    # Поддержка ботовых ордеров на CSFloat. Без восстановления ордера после
+    # каждого передеплоя стояли бы брошенными: их обходят, а бот молчит.
+    # Первая сверка — не сразу, а через пару минут: старт и так занят
+    # прогревом, а ордерам минута не горит.
+    orders_restored = 0
+    for chat_id in await all_chat_ids_with_settings():
+        try:
+            _, _, auto_minutes = await _order_limits(chat_id)
+            if not auto_minutes:
+                continue
+            if not await get_bot_orders(chat_id):
+                continue
+        except Exception:
+            # Реестр не прочитался — ордера МОГУТ быть. Сверка разберётся
+            # сама и, если их нет, просто не перепланирует себя.
+            log.warning("orders: chat_id=%s реестр на старте не прочитан", chat_id,
+                        exc_info=True)
+            auto_minutes = order_desk.DEFAULT_AUTO_MINUTES
+        _schedule_orders_job(app.job_queue, chat_id, auto_minutes, delay_minutes=3)
+        orders_restored += 1
+    if orders_restored:
+        log.info("orders: восстановлена поддержка ордеров для %d чат(ов)", orders_restored)
 
     # Срез цен — одна джоба на процесс, а не по чатам: история общая. Первый
     # запуск скоро после старта, чтобы накопление начиналось сразу; повтор от
@@ -10707,6 +11434,8 @@ def _build_application(token: str):
     # были три списка, и справочник от них отставал на треть команд.
     for cmd in COMMANDS:
         app.add_handler(CommandHandler(cmd.name, cmd.handler))
+    # Кнопки ордеров — раньше общего разбора меню: тот ловит любые нажатия.
+    app.add_handler(CallbackQueryHandler(orders_callback, pattern=rf"^{ORDER_CB}\|"))
     app.add_handler(CallbackQueryHandler(menu_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_selection))

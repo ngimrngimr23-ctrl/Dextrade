@@ -66,7 +66,9 @@ Origin/Referer/Sec-Fetch-Site: same-origin. Второе, судя по всем
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import buy_orders
 import envcfg
 from scan_errors import scrub
 import os
@@ -799,6 +801,10 @@ PROBE_PATHS = (
     ("/me", "профиль — принимается ли ключ вообще"),
     ("/me/buy-orders", "ордера на покупку — НЕ документирована"),
     ("/me/offers-timeline", "история сделок — НЕ документирована"),
+    # По этой ручке поддержка ордеров отличает исполненный ордер от снятого
+    # (см. my_recent_purchases) — проверить её стоит до первой покупки.
+    ("/me/trades?role=buyer&state=pending,verified&limit=1",
+     "покупки — по ним бот узнаёт, что ордер исполнился"),
 )
 
 
@@ -863,8 +869,14 @@ async def probe() -> list[tuple[str, str, int | None, str]]:
                         route_used = label
                         headers = dict(resp.headers)
                         # Заодно учим бот остатку квоты: он решает, начинать ли
-                        # широкий скан (см. _orders_scan_target).
-                        _note_budget(headers)
+                        # широкий скан (см. _orders_scan_target). Но только
+                        # по /listings: общий ли счётчик у авторизованных
+                        # ручек, неизвестно, и чужое число испортило бы
+                        # расчёт глубины скана (см. _orders_budget).
+                        if path.startswith("/listings"):
+                            _note_budget(headers)
+                        else:
+                            _note_orders_budget(headers)
                         remaining = _header(headers, "x-ratelimit-remaining")
                         limit = _header(headers, "x-ratelimit-limit")
                         if remaining is not None:
@@ -1562,72 +1574,637 @@ class _BandRun:
         return f"${lo}-{hi}"
 
 
-async def buy_orders_for(
-    session: aiohttp.ClientSession, listing_id: str, *, limit: int = 20
-) -> list[int]:
+# ---------------------------------------------------------------------------
+# Ордера на покупку: стакан, свои ордера, постановка и отмена
+# ---------------------------------------------------------------------------
+#
+# Все эти ручки недокументированы: в официальном csfloat/docs описан только
+# /listings. Пути и поля взяты из открытого клиента
+# github.com/Rushifakami/csfloat_api (create_buy_order, get_my_buy_orders,
+# delete_buy_order, get_buy_orders) и из интерфейса самого CSFloat (файл
+# переводов assets/i18n/en.json: сетка цен, «цена превышает доступный баланс»,
+# «ордер исполнен сразу»). Поэтому ответы здесь разбираются терпимо: их вид мы
+# знаем по чужому коду, а не по договору, и первое же расхождение должно стать
+# строкой в логе, а не падением.
+#
+# МАРШРУТ — ПРЯМОЙ АДРЕС ПЕРВЫМ. Замер /csfloatapi 2026-09-15: ручки с
+# авторизацией (/me, /me/buy-orders) отвечают 200 с прямого адреса Render, а
+# публичная /listings — 429 «disable your VPN». Прокси здесь только запасной,
+# а воркер не используется вовсе: он умеет лишь GET и получил бы ключ.
+
+# Сколько ждать ответа авторизованной ручки. Прямой адрес отвечает за доли
+# секунды, а повисший запрос держит замок чата и всю очередь за ним.
+AUTHED_TIMEOUT_SECONDS = envcfg.env_float("CSFLOAT_AUTHED_TIMEOUT", 20.0)
+
+# Страница списка своих ордеров. Сколько сервер отдаёт за раз, неизвестно,
+# поэтому конец списка ищем по count из ответа, а без него — по пустой
+# странице (см. my_buy_orders).
+MY_ORDERS_PAGE = 50
+MY_ORDERS_MAX_PAGES = 10
+
+# Потолок количества в одном ордере (интерфейс CSFloat: «Max 250»).
+MAX_ORDER_QTY = 250
+
+# Остаток лимита авторизованных ручек — ОТДЕЛЬНО от /listings.
+#
+# Общий ли у них счётчик с поиском лотов, неизвестно. Если не общий, запись в
+# _last_budget испортила бы расчёт глубины широкого скана: тот решил бы, что
+# на скан осталось столько, сколько у ручки ордеров. Первые живые прогоны
+# покажут по логу, один это счётчик или два.
+_orders_budget: dict | None = None
+
+# Вид ответов пишем в лог один раз за процесс: только имена полей и цену,
+# ничего, по чему можно узнать человека. По этой записи будет видно, совпал
+# ли настоящий ответ с тем, как мы его читаем.
+_shapes_logged: set[str] = set()
+
+
+class CSFloatOrderRejected(CSFloatError):
     """
-    Стакан чужих ордеров на покупку по этому лоту. Цены в ЦЕНТАХ, как отдаёт API.
+    CSFloat разобрал запрос и отказал по существу: шаг цены, баланс, лимит.
 
-    Ручка недокументирована: в официальном репозитории csfloat/docs описаны
-    только GET /listings, GET /listings/<id> и POST /listings. Но она отвечает —
-    проверено /csfloatapi на живом ключе, — и без неё нельзя узнать главное:
-    какую цену надо перебить, чтобы наш ордер стоял первым.
-
-    Отсутствие стакана НЕ ошибка: у предмета может не быть ни одного ордера, и
-    это как раз лучший случай. Поэтому на любой сбой возвращаем пустой список —
-    планировщик поймёт его как «соперников нет» и предложит свой потолок.
-
-    ПРЯМОЙ АДРЕС ПЕРВЫМ, прокси только запасным. Это не общее правило для
-    CSFloat, а вывод из замера /csfloatapi 2026-09-15 на живом ключе:
-
-        /me, /me/buy-orders   -> HTTP 200 с прямого адреса Render
-        /listings (публичная) -> HTTP 429 «disable your VPN»
-
-    Ручки с авторизацией CSFloat с датацентрового адреса пускает, а публичный
-    список лотов — нет. Значит стакан незачем гнать через прокси: прямой путь
-    бесплатен, не зависит от провайдера и не тратит трафик. А прокси у нас
-    лежит третий день подряд, и без этой перестановки /orders был бы мёртв
-    вместе с ним.
+    Повторять тот же запрос бессмысленно — менять нужно сам запрос. Отдельный
+    класс, чтобы вызывающий показал человеку ответ CSFloat как есть.
     """
-    url, params = _build_request(
-        f"/listings/{listing_id}/buy-orders", {"limit": str(limit)}
+
+    def __init__(self, message: str, status: int):
+        super().__init__(message)
+        self.status = status
+
+
+class CSFloatUnknownOutcome(CSFloatError):
+    """
+    Запрос на создание ушёл, а ответа нет — ордер МОГ встать.
+
+    Повторять вслепую нельзя: если первый запрос дошёл, повтор поставит второй
+    ордер на те же деньги. Вызывающий сначала смотрит свой список ордеров и
+    только по нему решает, что произошло.
+    """
+
+
+@dataclass(frozen=True)
+class MyBuyOrder:
+    """Наш ордер на CSFloat. Цена в центах."""
+
+    order_id: str
+    market_hash_name: str | None
+    price_cents: int
+    qty: int = 1
+    created_at: str | None = None
+    # С условиями (флоат, паттерн, наклейки) — такой ордер ставили руками, и
+    # ровнять его по стакану простых ордеров нельзя.
+    conditional: bool = False
+
+
+@dataclass(frozen=True)
+class BookOrder:
+    """Ордер из стакана предмета. Цена в центах."""
+
+    price_cents: int
+    qty: int = 1
+    order_id: str | None = None
+    conditional: bool = False
+
+
+@dataclass(frozen=True)
+class Purchase:
+    """Покупка из списка сделок — по ней видно, что ордер исполнился."""
+
+    trade_id: str | None
+    market_hash_name: str | None
+    price_cents: int | None
+    state: str | None
+    created_at: str | None = None
+
+
+# Поля фильтров нового интерфейса ордеров (флоат, паттерн, наклейки, брелоки).
+# Значение должно быть непустым: у простого ордера такие поля, если и
+# приходят, то пустыми.
+_FILTER_MARKERS = (
+    "float", "seed", "sticker", "keychain", "charm", "pattern", "phase",
+    "filter", "condition",
+)
+
+
+def _is_conditional(row: dict) -> bool:
+    """
+    Ордер с условиями — то есть не соперник простому ордеру на имя.
+
+    Ошибиться тут можно в обе стороны, и цена ошибок разная. Принять простой
+    ордер за условный — значит не увидеть соперника и встать по потолку, то
+    есть переплатить на КАЖДОМ ордере. Принять условный за простой — изредка
+    перебить того, кто охотится за редким флоатом. Поэтому правило осторожное:
+    ордер с именем предмета считается простым, пока у него нет явного фильтра.
+    Одно лишь поле expression при живом market_hash_name простым его не
+    отменяет: как CSFloat сериализует простые ордера, мы знаем только по
+    чужому коду.
+    """
+    for key, value in row.items():
+        if value in (None, "", [], {}, False):
+            continue
+        lowered = key.lower()
+        if any(marker in lowered for marker in _FILTER_MARKERS):
+            return True
+    return bool(row.get("expression")) and not row.get("market_hash_name")
+
+
+def _cents_int(value) -> int | None:
+    """Цена в центах из поля ответа. None — поля нет или оно бессмысленно."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            return None
+    if isinstance(value, (int, float)) and value > 0:
+        return int(value)
+    return None
+
+
+class _UnknownShape(CSFloatError):
+    """Ответ пришёл, но не в том виде, в каком мы умеем его читать."""
+
+
+def _rows(data, *keys: str) -> tuple[list[dict], int | None]:
+    """
+    Строки ответа и общее их число, если сервер его назвал.
+
+    Непонятный вид ответа — исключение _UnknownShape, а НЕ пустой список.
+    Пустой список своих ордеров значит «ордеров нет», и поддержка решила бы,
+    что все они исполнились или сняты, и бросила бы их; постановка — что
+    бюджет свободен. Вид ответов мы знаем по чужому коду, поэтому промах тут
+    вполне возможен, и он должен быть громким.
+    """
+    count = None
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        raw_count = data.get("count", data.get("total"))
+        if isinstance(raw_count, int) and not isinstance(raw_count, bool):
+            count = raw_count
+        rows = next(
+            (data[key] for key in keys if isinstance(data.get(key), list)), None
+        )
+        if rows is None:
+            # Знакомого ключа нет. Если в ответе есть ровно один список
+            # объектов — это он, просто под другим именем.
+            lists = [k for k, v in data.items()
+                     if isinstance(v, list) and all(isinstance(r, dict) for r in v)]
+            if len(lists) == 1:
+                log.warning("csfloat: строки ответа под ключом «%s», а не %s",
+                            lists[0], keys)
+                rows = data[lists[0]]
+            elif count == 0:
+                rows = []
+            else:
+                raise _UnknownShape(
+                    f"не понял ответ CSFloat: поля {sorted(data.keys())}"
+                )
+    else:
+        raise _UnknownShape(f"не понял ответ CSFloat: {type(data).__name__}")
+    return [r for r in rows if isinstance(r, dict)], count
+
+
+def _api_message(data) -> str:
+    """Текст отказа CSFloat из тела ответа — то, что стоит показать человеку."""
+    if isinstance(data, dict):
+        for key in ("message", "error", "detail"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return scrub(" ".join(value.split()))[:300]
+    if isinstance(data, str) and data.strip():
+        return scrub(" ".join(data.split()))[:300]
+    return ""
+
+
+def _log_shape(kind: str, row: dict) -> None:
+    if kind in _shapes_logged:
+        return
+    _shapes_logged.add(kind)
+    log.info(
+        "csfloat: вид ответа «%s» — поля %s, price=%r",
+        kind, sorted(row.keys()), row.get("price", row.get("max_price")),
     )
+
+
+def _note_orders_budget(headers: dict) -> None:
+    global _orders_budget
+    remaining = _header(headers, "x-ratelimit-remaining")
+    if remaining is None:
+        return
+    _orders_budget = {
+        "remaining": remaining,
+        "limit": _header(headers, "x-ratelimit-limit"),
+        "seen_at": time.time(),
+    }
+
+
+def orders_budget_description() -> str | None:
+    """Остаток лимита авторизованных ручек по последнему ответу."""
+    if not _orders_budget:
+        return None
+    age_min = (time.time() - _orders_budget["seen_at"]) / 60
+    return (
+        f"{_orders_budget['remaining']} из {_orders_budget['limit'] or '?'}, "
+        f"замер {age_min:.0f} мин назад"
+    )
+
+
+async def _authed(
+    session: aiohttp.ClientSession,
+    method: str,
+    path: str,
+    *,
+    params: dict[str, str] | None = None,
+    body: dict | None = None,
+    repeatable: bool = True,
+) -> tuple[int, object]:
+    """
+    Один запрос к авторизованной ручке. Возвращает (HTTP-код, JSON или текст).
+
+    repeatable=False — для запросов, повтор которых может задвоить действие
+    (создание ордера). Тогда на запасной маршрут уходим, только если первый
+    заведомо не дошёл до CSFloat: отказал прокси, не открылось соединение,
+    пришёл 429 по адресу. Таймаут или обрыв после отправки — это «не знаю,
+    дошло ли», и он превращается в CSFloatUnknownOutcome.
+
+    Квотный 429 общий на ключ, другим маршрутом его не обойти, поэтому он
+    сразу становится CSFloatRateLimited.
+    """
+    if not csfloat_enabled():
+        raise CSFloatError("CSFLOAT_API_KEY не задан")
+
+    url = f"{CSFLOAT_BASE_URL}{path}"
     routes: list[str | None] = [None]
     if CSFLOAT_POOL.enabled():
-        # Запасной маршрут — липкий рабочий логин, а не случайный из пула.
-        routes.append(lane_address())
+        backup = lane_address()
+        if backup:
+            routes.append(backup)
 
-    data = None
+    last_problem = "не пробовали"
     for proxy in routes:
+        label = "прямой адрес" if proxy is None else f"прокси {mask_proxy(proxy)}"
+        await _throttle_all(proxy)
         try:
-            async with session.get(
-                url, params=params, proxy=proxy,
+            async with session.request(
+                method, url, params=params, json=body, proxy=proxy,
                 headers={**_API_HEADERS, "Authorization": CSFLOAT_API_KEY},
+                timeout=aiohttp.ClientTimeout(total=AUTHED_TIMEOUT_SECONDS),
             ) as resp:
-                if resp.status != 200:
-                    log.info(
-                        "csfloat: стакан по лоту %s — HTTP %s через %s",
-                        listing_id, resp.status,
-                        "прямой адрес" if proxy is None else "прокси",
-                    )
-                    continue
-                data = await resp.json(content_type=None)
-            break
-        except Exception as e:  # noqa: BLE001 — пустой стакан безопаснее отказа
-            log.info(
-                "csfloat: стакан по лоту %s не получен через %s (%s)",
-                listing_id, "прямой адрес" if proxy is None else "прокси",
-                scrub(str(e)),
-            )
-    if data is None:
-        return []
+                status = resp.status
+                headers = dict(resp.headers)
+                text = await resp.text()
+        except (aiohttp.ClientHttpProxyError, aiohttp.ClientConnectorError) as e:
+            # До CSFloat запрос не дошёл: отказал прокси или не открылось
+            # соединение. Повтор другим маршрутом безопасен даже для POST.
+            last_problem = f"{label}: {type(e).__name__}"
+            log.info("csfloat: %s %s не дошёл через %s (%s)",
+                     method, path, label, scrub(str(e))[:160])
+            continue
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last_problem = f"{label}: {type(e).__name__} {scrub(str(e))[:120]}"
+            if not repeatable:
+                raise CSFloatUnknownOutcome(
+                    f"CSFloat не ответил на {method} {path} "
+                    f"({type(e).__name__}) — запрос мог пройти"
+                ) from None
+            log.info("csfloat: %s %s оборвался — %s", method, path, last_problem)
+            continue
 
-    rows = data.get("orders", data) if isinstance(data, dict) else data
-    out: list[int] = []
-    for row in rows or []:
-        price = row.get("price") if isinstance(row, dict) else None
-        if isinstance(price, (int, float)) and price > 0:
-            out.append(int(price))
+        _note_orders_budget(headers)
+        try:
+            data = json.loads(text) if text else None
+        except ValueError:
+            data = text
+
+        if status == 429:
+            if _is_quota_429(headers, text):
+                reset_in = _seconds_until_reset(headers)
+                wait = (
+                    f" — окно сбросится через {reset_in / 60:.0f} мин"
+                    if reset_in else ""
+                )
+                raise CSFloatRateLimited(
+                    f"CSFloat: лимит запросов ключа исчерпан{wait}."
+                )
+            # Отказ по репутации адреса: запрос не обработан, другой маршрут
+            # может пройти — и для POST тоже.
+            last_problem = f"{label}: 429 {_api_message(data)[:120]}"
+            log.info("csfloat: %s %s — 429 по адресу через %s", method, path, label)
+            continue
+        if status in (502, 503, 504) and repeatable:
+            last_problem = f"{label}: HTTP {status}"
+            continue
+        if status == 403 and not isinstance(data, dict):
+            # 403 не JSON-ом — это страница-заглушка Cloudflare перед адресом,
+            # а не отказ CSFloat по существу (тот всегда отвечает JSON). До
+            # CSFloat такой запрос не дошёл, поэтому запасной маршрут
+            # безопасен и для постановки. Прежний buy_orders_for уходил на
+            # прокси на любом не-200, и терять это нельзя.
+            last_problem = f"{label}: HTTP 403 не от CSFloat"
+            log.info("csfloat: %s %s — 403-заглушка через %s", method, path, label)
+            continue
+        log.info(
+            "csfloat: %s %s -> HTTP %s через %s (лимит ордеров: %s)",
+            method, path, status, label, orders_budget_description() or "нет данных",
+        )
+        return status, data
+
+    raise CSFloatError(f"CSFloat недоступен ни одним маршрутом ({last_problem})")
+
+
+def _refusal(status: int, data, what: str) -> CSFloatError:
+    """Исключение под ответ, который не 200: что делали и что ответил CSFloat."""
+    message = _api_message(data) or f"HTTP {status}"
+    if status in (401, 403) and "logged in" in message.lower():
+        return CSFloatError(
+            f"CSFloat не увидел ключ ({what}): {message}. Ключ у нас "
+            f"{key_fingerprint()}."
+        )
+    if 400 <= status < 500:
+        return CSFloatOrderRejected(f"{what}: {message}", status)
+    return CSFloatError(f"{what}: CSFloat ответил HTTP {status} — {message}")
+
+
+def _parse_my_order(row: dict) -> MyBuyOrder | None:
+    order_id = row.get("id")
+    price = _cents_int(row.get("price", row.get("max_price")))
+    if order_id in (None, "") or price is None:
+        return None
+    qty = row.get("qty", row.get("quantity"))
+    return MyBuyOrder(
+        order_id=str(order_id),
+        market_hash_name=row.get("market_hash_name") or None,
+        price_cents=price,
+        qty=qty if isinstance(qty, int) and qty > 0 else 1,
+        created_at=row.get("created_at"),
+        conditional=_is_conditional(row),
+    )
+
+
+async def my_buy_orders(session: aiohttp.ClientSession) -> list[MyBuyOrder]:
+    """
+    Все наши ордера на CSFloat — и поставленные ботом, и руками.
+
+    Источник правды — именно этот список, а не память бота: ордер мог
+    исполниться, его могли снять на сайте, бот мог перезапуститься. Без него
+    нельзя ни поставить новый ордер (вдруг на этот предмет уже стоит), ни
+    понять, что ордер исполнился.
+    """
+    out: list[MyBuyOrder] = []
+    seen: set[str] = set()
+    for page in range(MY_ORDERS_MAX_PAGES):
+        status, data = await _authed(
+            session, "GET", "/me/buy-orders",
+            params={"page": str(page), "limit": str(MY_ORDERS_PAGE), "order": "desc"},
+        )
+        if status != 200:
+            raise _refusal(status, data, "список своих ордеров")
+        rows, count = _rows(data, "orders", "data", "items")
+        fresh = 0
+        parsed = 0
+        for row in rows:
+            _log_shape("мои ордера", row)
+            order = _parse_my_order(row)
+            if order is None:
+                continue
+            parsed += 1
+            if order.order_id in seen:
+                continue
+            seen.add(order.order_id)
+            out.append(order)
+            fresh += 1
+        if rows and not parsed:
+            # Строки есть, а ни одной не разобрали — у них другие поля.
+            # Молча вернуть пустой список здесь хуже всего (см. _rows).
+            raise _UnknownShape(
+                f"не понял ордера CSFloat: поля {sorted(rows[0].keys())}"
+            )
+        # Конец списка. По count — если сервер его назвал; иначе по странице,
+        # не принёсшей ничего нового: так не промахнёмся, даже если сервер
+        # отдаёт меньше, чем просили, или вовсе не понимает page.
+        if count is not None and len(out) >= count:
+            break
+        if not rows or fresh == 0:
+            break
+    return out
+
+
+async def create_buy_order(
+    session: aiohttp.ClientSession,
+    market_hash_name: str,
+    price_cents: int,
+    quantity: int = 1,
+) -> MyBuyOrder | None:
+    """
+    Поставить ордер. Возвращает ордер, если сервер его вернул, иначе None.
+
+    None — не провал: CSFloat мог ответить успехом без тела ордера. Тогда
+    вызывающий находит ордер в списке своих (my_buy_orders) по имени и цене.
+
+    Цена должна лежать на сетке CSFloat — проверяем здесь, до отправки:
+    отказ сервера стоит запроса из квоты, а ошибка в цене — наша.
+    """
+    if not buy_orders.is_valid_price(price_cents):
+        raise CSFloatOrderRejected(
+            f"цена ${price_cents / 100:.2f} не на сетке CSFloat "
+            f"(шаг ${buy_orders.price_step(price_cents) / 100:.2f})", 400,
+        )
+    if not 1 <= quantity <= MAX_ORDER_QTY:
+        raise CSFloatOrderRejected(f"количество {quantity} вне 1..{MAX_ORDER_QTY}", 400)
+
+    status, data = await _authed(
+        session, "POST", "/buy-orders",
+        body={
+            "market_hash_name": market_hash_name,
+            "max_price": int(price_cents),
+            "quantity": int(quantity),
+        },
+        repeatable=False,
+    )
+    if status in (200, 201):
+        if isinstance(data, dict):
+            _log_shape("новый ордер", data)
+            row = data.get("order") if isinstance(data.get("order"), dict) else data
+            order = _parse_my_order(row)
+            if order is not None:
+                return order
+        return None
+    if status >= 500:
+        # Ошибка на их стороне ПОСЛЕ приёма запроса — ордер мог и встать.
+        raise CSFloatUnknownOutcome(
+            f"CSFloat ответил HTTP {status} на постановку — ордер мог встать"
+        )
+    raise _refusal(status, data, f"ордер на «{market_hash_name}»")
+
+
+async def cancel_buy_order(session: aiohttp.ClientSession, order_id: str) -> bool:
+    """
+    Снять ордер. True — снят сейчас, False — его уже не было.
+
+    «Уже не было» — не ошибка: ордер исполнился или его сняли на сайте, и
+    цель (ордера нет) достигнута.
+    """
+    status, data = await _authed(session, "DELETE", f"/buy-orders/{order_id}")
+    if status in (200, 204):
+        return True
+    if status == 404:
+        return False
+    raise _refusal(status, data, f"отмена ордера {order_id}")
+
+
+async def account_balance(session: aiohttp.ClientSession) -> int | None:
+    """
+    Доступный баланс CSFloat в центах. None — узнать не вышло.
+
+    Нужен до постановки: CSFloat не принимает ордер дороже доступного баланса
+    («Price exceeds your available balance»), и лучше сказать это человеку
+    заранее, чем собирать отказы.
+
+    Из /me берём ТОЛЬКО баланс. В ответе лежат почта, токены и прочее
+    личное — ни в лог, ни в чат он не попадает.
+    """
+    try:
+        status, data = await _authed(session, "GET", "/me")
+    except CSFloatError as e:
+        log.info("csfloat: баланс не узнали — %s", scrub(str(e)))
+        return None
+    if status != 200 or not isinstance(data, dict):
+        log.info("csfloat: баланс не узнали — HTTP %s", status)
+        return None
+    user = data.get("user") if isinstance(data.get("user"), dict) else data
+    balance = user.get("balance")
+    if isinstance(balance, bool) or not isinstance(balance, (int, float)):
+        return None
+    # Имена полей про лимит ордеров — чтобы узнать, как CSFloat его отдаёт.
+    # Только имена и числа: в этих полях личного нет.
+    limits = {
+        k: v for k, v in user.items()
+        if ("limit" in k.lower() or "buy_order" in k.lower())
+        and isinstance(v, (int, float))
+    }
+    if limits and "профиль" not in _shapes_logged:
+        _shapes_logged.add("профиль")
+        log.info("csfloat: в профиле поля лимитов %s", limits)
+    return int(balance)
+
+
+def _parse_book(data) -> list[BookOrder] | None:
+    """Стакан из ответа. None — ответ не понят (это «не прочитан», а не «пуст»)."""
+    try:
+        rows, _ = _rows(data, "orders", "data", "items")
+    except _UnknownShape as e:
+        log.warning("csfloat: стакан — %s", e)
+        return None
+    out: list[BookOrder] = []
+    for row in rows:
+        _log_shape("стакан", row)
+        price = _cents_int(row.get("price", row.get("max_price")))
+        if price is None:
+            continue
+        qty = row.get("qty", row.get("quantity"))
+        order_id = row.get("id")
+        out.append(BookOrder(
+            price_cents=price,
+            qty=qty if isinstance(qty, int) and qty > 0 else 1,
+            order_id=None if order_id in (None, "") else str(order_id),
+            conditional=_is_conditional(row),
+        ))
+    if rows and not out:
+        log.warning("csfloat: стакан — ни одной цены в строках с полями %s",
+                    sorted(rows[0].keys()))
+        return None
+    return out
+
+
+async def order_book(
+    session: aiohttp.ClientSession, listing_id: str, *, limit: int = 20,
+) -> list[BookOrder] | None:
+    """
+    Стакан ордеров на покупку по предмету этого лота. None — прочитать не вышло.
+
+    None и пустой список — РАЗНЫЕ ответы, и путать их стоило бы денег. Пустой
+    стакан значит «перебивать некого», непрочитанный — «не знаю, кого
+    перебивать». Раньше любой сбой превращался в пустой список, и /orders
+    докладывал «стакан пуст» там, где его просто не прочитали, — а при
+    настоящей постановке это значило бы ставить по потолку вслепую.
+    """
+    try:
+        status, data = await _authed(
+            session, "GET", f"/listings/{listing_id}/buy-orders",
+            params={"limit": str(limit)},
+        )
+    except (CSFloatError, CSFloatRateLimited) as e:
+        log.info("csfloat: стакан по лоту %s не прочитан — %s", listing_id, scrub(str(e)))
+        return None
+    if status != 200:
+        log.info(
+            "csfloat: стакан по лоту %s — HTTP %s: %s",
+            listing_id, status, _api_message(data)[:120],
+        )
+        return None
+    return _parse_book(data)
+
+
+async def buy_orders_for(
+    session: aiohttp.ClientSession, listing_id: str, *, limit: int = 20
+) -> list[int] | None:
+    """
+    Цены ПРОСТЫХ чужих ордеров по лоту, в центах. None — стакан не прочитан.
+
+    Ордера с условиями (флоат, паттерн, наклейки) отбрасываются: они берут
+    только подходящие предметы и с нашим ордером на имя за обычного продавца
+    не соревнуются. Перебивать их — значит переплачивать.
+    """
+    book = await order_book(session, listing_id, limit=limit)
+    if book is None:
+        return None
+    return [o.price_cents for o in book if not o.conditional]
+
+
+async def my_recent_purchases(
+    session: aiohttp.ClientSession, *, limit: int = 30,
+) -> list[Purchase] | None:
+    """
+    Последние сделки, где мы покупатель. None — список получить не вышло.
+
+    Нужны, чтобы отличить исполненный ордер от снятого: оба просто пропадают
+    из списка ордеров, а покупка остаётся в сделках.
+    """
+    try:
+        status, data = await _authed(
+            session, "GET", "/me/trades",
+            params={
+                "role": "buyer", "state": "pending,verified",
+                "limit": str(limit), "page": "0",
+            },
+        )
+    except (CSFloatError, CSFloatRateLimited) as e:
+        log.info("csfloat: сделки не прочитаны — %s", scrub(str(e)))
+        return None
+    if status != 200:
+        log.info("csfloat: сделки — HTTP %s: %s", status, _api_message(data)[:120])
+        return None
+    try:
+        rows, _ = _rows(data, "trades", "data", "items")
+    except _UnknownShape as e:
+        log.warning("csfloat: сделки — %s", e)
+        return None
+    out: list[Purchase] = []
+    for row in rows:
+        _log_shape("сделки", row)
+        contract = row.get("contract") if isinstance(row.get("contract"), dict) else {}
+        item = contract.get("item") if isinstance(contract.get("item"), dict) else {}
+        if not item and isinstance(row.get("item"), dict):
+            item = row["item"]
+        out.append(Purchase(
+            trade_id=None if row.get("id") in (None, "") else str(row.get("id")),
+            market_hash_name=item.get("market_hash_name") or row.get("market_hash_name"),
+            price_cents=_cents_int(contract.get("price", row.get("price"))),
+            state=row.get("state"),
+            created_at=row.get("created_at"),
+        ))
     return out
 
 

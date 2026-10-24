@@ -292,6 +292,18 @@ def _local_defaults_save(data: dict) -> None:
     LOCAL_DEFAULTS_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
+# Чаты, чьи настройки в последний раз прочитать из Upstash не вышло.
+#
+# Блок настроек один на чат, и каждый сеттер работает так: прочитать блок,
+# поменять одно поле, записать блок целиком. Когда чтение падало, оно молча
+# отдавало локальную копию — на Render это почти всегда пустой словарь, — и
+# следом запись уносила в Upstash блок из ОДНОГО поля, стирая все остальные
+# пороги чата. Ровно так однажды уже пропадал вотчлист (см.
+# _degraded_watchlists). /orders пишет сюда метку обхода каталога на каждом
+# прогоне, так что одного сбоя чтения хватило бы, чтобы обнулить всё.
+_degraded_settings: set[int] = set()
+
+
 async def _get_chat_settings(chat_id: int) -> dict:
     """
     Все настройки чата разом (мин$ стикеров, макс наценка, наценка для
@@ -301,9 +313,14 @@ async def _get_chat_settings(chat_id: int) -> dict:
     if REDIS_ENABLED:
         try:
             raw = await _redis_cmd("GET", DEFAULTS_KEY_PREFIX + str(chat_id))
+            _degraded_settings.discard(chat_id)
             return json.loads(raw) if raw else {}
         except Exception:
-            pass
+            log.warning(
+                "настройки чата %s: Upstash не ответил — читаю локальную копию, "
+                "запись поверх неё заблокирована", chat_id, exc_info=True,
+            )
+            _degraded_settings.add(chat_id)
 
     return _local_defaults_load().get(str(chat_id), {})
 
@@ -324,6 +341,14 @@ async def get_all_chat_settings(chat_id: int) -> dict:
 
 
 async def _save_chat_settings(chat_id: int, settings: dict) -> None:
+    if REDIS_ENABLED and chat_id in _degraded_settings:
+        # Блок прочитан не из Upstash, а из локальной копии — записать его
+        # значит стереть всё, чего в копии нет (см. _degraded_settings).
+        raise RuntimeError(
+            "не удалось прочитать настройки из хранилища — сохранять поверх "
+            "неполной копии не буду, иначе сотрутся остальные пороги. "
+            "Попробуй ещё раз через минуту."
+        )
     value = json.dumps(settings, ensure_ascii=False)
 
     if REDIS_ENABLED:
@@ -867,20 +892,95 @@ async def get_order_settings(chat_id: int) -> dict:
         # ценовой полосе их тысячи; без метки каждый прогон разбирал бы одну и
         # ту же верхушку, и остальная полоса не проверялась бы никогда.
         "catalog_cursor": s.get("ord_catalog_cursor") or 0,
+        # Настоящие ордера (см. order_desk): сколько всего денег бот держит в
+        # своих ордерах, сколько ордеров разом и как часто их подправлять.
+        # auto_minutes: None — по умолчанию, 0 — автоподдержка выключена.
+        "budget": s.get("ord_budget"),
+        "max_count": s.get("ord_max_count"),
+        "auto_minutes": s.get("ord_auto_minutes"),
     }
 
 
 async def set_order_setting(chat_id: int, key: str, value) -> None:
-    """key — одно из: min_profit, min_week_volume, min_price, max_price, catalog_cursor."""
+    """
+    key — одно из: min_profit, min_week_volume, min_price, max_price,
+    catalog_cursor, budget, max_count, auto_minutes.
+    """
     allowed = {
         "min_profit", "min_week_volume", "min_price", "max_price",
-        "catalog_cursor",
+        "catalog_cursor", "budget", "max_count", "auto_minutes",
     }
     if key not in allowed:
         raise ValueError(f"неизвестная настройка ордеров: {key}")
     settings = await _get_chat_settings(chat_id)
     settings[f"ord_{key}"] = value
     await _save_chat_settings(chat_id, settings)
+
+
+# ---------------------------------------------------------------------------
+# Ордера на покупку, поставленные ботом
+#
+# Источник правды о самих ордерах — CSFloat (/me/buy-orders): ордер мог
+# исполниться, его могли снять на сайте. Здесь хранится только то, чего
+# CSFloat не знает: какие из ордеров поставил БОТ (их он вправе
+# переставлять и снимать, ручные — нет), до какой цены его можно поднимать и
+# откуда он взялся.
+# ---------------------------------------------------------------------------
+
+BOT_ORDERS_KEY_PREFIX = "botorders:"
+LOCAL_BOT_ORDERS_PATH = Path(__file__).parent / "bot_orders_local.json"
+
+
+class StorageUnavailable(RuntimeError):
+    """Хранилище не ответило, и подменить его ответ пустотой нельзя."""
+
+
+def _local_bot_orders_load() -> dict:
+    if LOCAL_BOT_ORDERS_PATH.exists():
+        try:
+            return json.loads(LOCAL_BOT_ORDERS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+async def get_bot_orders(chat_id: int) -> dict[str, dict]:
+    """
+    Ордера, поставленные ботом: {id ордера на CSFloat: запись}.
+
+    Сбой чтения — исключение StorageUnavailable, а НЕ пустой словарь. Пустой
+    реестр значит «бот ничего не ставил», и с таким ответом постановка решила
+    бы, что бюджет свободен, а поддержка — что ордера бросать некому. Урок
+    тот же, что с вотчлистом: молча подменённый ответ хранилища однажды уже
+    стёр данные.
+    """
+    if REDIS_ENABLED:
+        try:
+            raw = await _redis_cmd("GET", BOT_ORDERS_KEY_PREFIX + str(chat_id))
+        except Exception as e:
+            raise StorageUnavailable(f"хранилище не ответило: {e}") from None
+        if not raw:
+            return {}
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    return _local_bot_orders_load().get(str(chat_id), {})
+
+
+async def save_bot_orders(chat_id: int, orders: dict[str, dict]) -> None:
+    """Записать реестр целиком. Сбой — StorageUnavailable, вызывающий сообщает."""
+    value = json.dumps(orders, ensure_ascii=False)
+    if REDIS_ENABLED:
+        try:
+            await _redis_cmd("SET", BOT_ORDERS_KEY_PREFIX + str(chat_id), value)
+            return
+        except Exception as e:
+            raise StorageUnavailable(f"хранилище не приняло запись: {e}") from None
+    data = _local_bot_orders_load()
+    if orders:
+        data[str(chat_id)] = orders
+    else:
+        data.pop(str(chat_id), None)
+    LOCAL_BOT_ORDERS_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
