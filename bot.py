@@ -183,6 +183,7 @@ import csfloat_client
 import market_prices
 import menu
 import order_desk
+import csfloat_prices
 import steam_history
 import steam_snapshot
 import pricing
@@ -7092,6 +7093,13 @@ class _OrderCandidate(NamedTuple):
     history_weeks_usd: tuple = ()
     # Цену Steam срезала медиана сделок за НЕДЕЛЮ (а не за сутки).
     steam_cut_by_week: bool = False
+    # Цена витрины CSFloat (csfloat_ask_cents) — из прайс-листа csgotrader, а
+    # не из живого поиска (см. csfloat_prices): ей несколько часов, и отчёт
+    # должен это говорить.
+    ask_from_list: bool = False
+    # Порядок внутри своего источника. None — по цене Steam, дороже вперёд;
+    # источник по ценам CSFloat ставит сюда ожидаемую прибыль в центах.
+    rank: float | None = None
 
 
 def _with_history(c: _OrderCandidate, page) -> _OrderCandidate:
@@ -7573,6 +7581,121 @@ async def _order_candidates_from_catalog(chat_id: int, limits: dict) -> list[_Or
     ]
 
 
+# Сколько кандидатов брать из цен CSFloat за прогон.
+ORDERS_CSFLOAT_BATCH = envcfg.env_int("ORDERS_CSFLOAT_BATCH", 30)
+# Предмет, которому /orders отказал, источник по ценам CSFloat не предлагает
+# снова столько часов: список ранжирован, и без паузы каждый прогон разбирал
+# бы одну и ту же верхушку.
+ORDERS_REFUSED_PAUSE_SECONDS = envcfg.env_int("ORDERS_REFUSED_PAUSE_H", 6) * 3600
+_orders_refused_at: dict[str, float] = {}
+
+
+async def _order_candidates_from_csfloat(
+    chat_id: int, limits: dict, price_list,
+) -> list[_OrderCandidate]:
+    """
+    Кандидаты по ценам CSFloat со всего рынка (csfloat_prices): предметы, где
+    ордер на шаг выше верхнего чужого укладывается в потолок прибыли.
+
+    Чем это лучше обхода каталога. Каталог выбирает предметы по одной цене
+    Steam, вслепую к CSFloat, и в прогоне 2026-10-24 из пятнадцати прочитанных
+    стаканов девять оказались «перебить можно только выше потолка». Здесь
+    верхний ордер и нижний лот CSFloat известны по всему рынку заранее, и в
+    финал идут те, у кого выгодный ордер вообще возможен.
+
+    Фильтры Steam — те же, что у каталога: полоса цены, сделки за сутки,
+    ровный месяц, история сходится с ценой. Порядок — по ожидаемой прибыли в
+    долларах, а не в процентах: при лимите бюджета и числа ордеров пятьдесят
+    центов прибыли с доллара занимают место так же, как семь долларов с
+    восьми.
+    """
+    if price_list is None:
+        return []
+    details = await get_csgotrader_price_details()
+    if not details:
+        return []
+    snapshot, _ = await steam_snapshot.current()
+    low, high = limits["low"], limits["high"]
+    max_spread = limits["stability"]
+    cap = int(round(high * 100))
+    now = time.time()
+
+    picked = []
+    skipped = dict(quiet=0, jumpy=0, mismatch=0, costly=0, far=0, recent=0)
+    for name, cf in price_list.prices.items():
+        sp = details.get(name)
+        if sp is None or (cf.top_cents is None and cf.low_cents is None):
+            continue
+        day = sp.windows.get("last_24h")
+        if day is None:
+            skipped["quiet"] += 1
+            continue
+        now_cents = snapshot.price_cents(name) if snapshot else None
+        price = now_cents / 100 if now_cents else day
+        if not (low <= price <= high):
+            continue
+        spread = sp.month_spread_pct
+        if spread is None or spread > max_spread:
+            skipped["jumpy"] += 1
+            continue
+        month_avg = sp.windows.get("last_30d")
+        if now_cents and month_avg and not (
+            buy_orders.HISTORY_RATIO_MIN <= price / month_avg <= buy_orders.HISTORY_RATIO_MAX
+        ):
+            skipped["mismatch"] += 1
+            continue
+        steam_cents = int(round(price * 100))
+        ceiling = min(buy_orders.ceiling_for(steam_cents, limits["profit"]), cap)
+        # Та же цена, что посчитает buy_orders.plan: на шаг выше верхнего, а
+        # без ордеров — по потолку; дотянулись до витрины — по цене лота.
+        order = (buy_orders.above(cf.top_cents) if cf.top_cents
+                 else buy_orders.floor_valid(ceiling))
+        if cf.low_cents and order >= cf.low_cents:
+            order = min(order, max(buy_orders.at_least(cf.low_cents),
+                                   buy_orders.above(cf.top_cents) if cf.top_cents else 0))
+        if order < 1 or order > ceiling:
+            skipped["costly"] += 1
+            continue
+        if cf.low_cents and order / cf.low_cents < ORDERS_MIN_REACH:
+            skipped["far"] += 1
+            continue
+        refused_at = _orders_refused_at.get(name)
+        if refused_at and now - refused_at < ORDERS_REFUSED_PAUSE_SECONDS:
+            skipped["recent"] += 1
+            continue
+        gain = order * buy_orders.profit_pct_at(order, steam_cents) / 100
+        picked.append((gain, name, steam_cents, spread, month_avg, cf))
+
+    picked.sort(key=lambda row: -row[0])
+    batch = picked[:ORDERS_CSFLOAT_BATCH]
+    log.info(
+        "orders: цены CSFloat (%s) — выгодный ордер возможен у %d предмет(ов) в "
+        "полосе $%g-$%g (пропущено: %d без сделок за сутки, %d без ровного "
+        "месяца, %d с историей не по цене, %d где верхний ордер выше потолка, "
+        "%d где заявка ниже витрины в разы, %d отказанных за последние %d ч). "
+        "Цена Steam из снимка: %s. Беру %d",
+        price_list.describe(), len(picked), low, high, skipped["quiet"],
+        skipped["jumpy"], skipped["mismatch"], skipped["costly"], skipped["far"],
+        skipped["recent"], ORDERS_REFUSED_PAUSE_SECONDS // 3600,
+        "да" if snapshot else "нет, средние прайс-листа", len(batch),
+    )
+    return [
+        _OrderCandidate(
+            market_hash_name=name,
+            listing_id=None,
+            steam_price_cents=steam_cents,
+            volume_per_day=None,
+            spread_pct=spread,
+            source="цены CSFloat",
+            csfloat_ask_cents=cf.low_cents,
+            month_avg_cents=int(round(month_avg * 100)) if month_avg else None,
+            ask_from_list=cf.low_cents is not None,
+            rank=gain,
+        )
+        for gain, name, steam_cents, spread, month_avg, cf in batch
+    ]
+
+
 def _order_arg(raw: str, *, integer: bool = False):
     """
     Разобрать одно значение настройки. Прочерк — «не менять», как в /markets.
@@ -7722,7 +7845,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       else buy_orders.DEFAULT_MAX_MONTH_SPREAD_PCT),
     }
     await update.message.reply_text(
-        "Ищу ордера: смотрю арбитраж, просадки и каталог, читаю стаканы…\n"
+        "Ищу ордера: смотрю арбитраж, просадки и цены CSFloat, читаю стаканы…\n"
         "Сам ничего не ставлю — только по кнопке под отчётом."
     )
 
@@ -7748,8 +7871,12 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.warning("orders: прайс-лист не подняли: %s", e)
     warm_took = time.monotonic() - warm_started
     log.info("orders: прайс-лист готов за %.1f с", warm_took)
+    # Цены CSFloat по всему рынку (нижний лот и верхний ордер) — справка из
+    # прайс-листа csgotrader, см. csfloat_prices. Не скачались — работаем
+    # как раньше: каталог вместо отбора по ценам CSFloat.
+    cf_prices = await csfloat_prices.load()
 
-    from_arb = from_dips = from_catalog = scanned = 0
+    from_arb = from_dips = from_catalog = from_csfloat = scanned = 0
     try:
         # Таймаут обязателен: без него команда зависит от того, как быстро
         # отвечает чужая сеть, а она может не отвечать вовсе — и тогда человек
@@ -7801,17 +7928,25 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ордер»: широкий скан показывает лишь то, что прямо сейчас выставлено на
     # CSFloat, а заявку можно поставить на любой предмет. Стоит этот источник
     # ноль запросов — отбор идёт по уже скачанному прайс-листу.
+    # Отбор по ценам CSFloat заменяет обход каталога: те же фильтры Steam,
+    # но в финал идут только предметы, где выгодный ордер вообще возможен.
+    # Каталог — запасной путь, когда прайс-лист CSFloat не скачался.
     try:
-        catalog_found = await _order_candidates_from_catalog(chat_id, limits)
-        from_catalog = len(catalog_found)
-        candidates += catalog_found
+        if cf_prices is not None:
+            csfloat_found = await _order_candidates_from_csfloat(chat_id, limits, cf_prices)
+            from_csfloat = len(csfloat_found)
+            candidates += csfloat_found
+        else:
+            catalog_found = await _order_candidates_from_catalog(chat_id, limits)
+            from_catalog = len(catalog_found)
+            candidates += catalog_found
     except Exception as e:  # noqa: BLE001 — источники независимы
-        log.warning("orders: каталог не дал кандидатов: %s", e)
-        await update.message.reply_text(f"⚠️ Каталог не дал кандидатов: {e}")
+        log.warning("orders: отбор по ценам CSFloat / каталогу упал: %s", e, exc_info=True)
+        await update.message.reply_text(f"⚠️ Отбор кандидатов по ценам не сработал: {e}")
 
     log.info(
-        "orders: chat_id=%s кандидатов — арбитраж %d, просадки %d, каталог %d",
-        chat_id, from_arb, from_dips, from_catalog,
+        "orders: chat_id=%s кандидатов — арбитраж %d, просадки %d, цены CSFloat %d, "
+        "каталог %d", chat_id, from_arb, from_dips, from_csfloat, from_catalog,
     )
 
     if not candidates:
@@ -7844,8 +7979,23 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     #
     # Внутри источника порядок прежний, по убыванию цены.
     by_source: dict[str, list[_OrderCandidate]] = {}
-    for cand in sorted(in_range, key=lambda c: -c.steam_price_cents):
+    for cand in sorted(
+        in_range,
+        key=lambda c: -(c.rank if c.rank is not None else c.steam_price_cents),
+    ):
         by_source.setdefault(cand.source, []).append(cand)
+
+    # Цена витрины CSFloat — у кого её нет (поиск лотов закрыт), из прайс-листа.
+    # По ней решается, не ниже ли заявка витрины в разы и не купит ли она лот
+    # сразу (см. buy_orders.plan, ask_cents).
+    if cf_prices is not None:
+        for queue in by_source.values():
+            for i, cand in enumerate(queue):
+                listed = cf_prices.prices.get(cand.market_hash_name)
+                if cand.csfloat_ask_cents is None and listed and listed.low_cents:
+                    queue[i] = cand._replace(
+                        csfloat_ask_cents=listed.low_cents, ask_from_list=True,
+                    )
 
     ranked: list[_OrderCandidate] = []
     while len(ranked) < ORDERS_PROBE_LIMIT and any(by_source.values()):
@@ -8132,6 +8282,15 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 plans.append((cand._replace(listing_id=listing_id), plan))
 
+    # Отказанных отбор по ценам CSFloat какое-то время не предлагает снова
+    # (см. ORDERS_REFUSED_PAUSE_SECONDS). Кроме отказов из незнания: объём или
+    # история не пришли от Steam — это новость про Steam, а не про предмет.
+    unknown = (buy_orders.UNKNOWN_VOLUME, buy_orders.UNKNOWN_STABILITY)
+    stamp = time.time()
+    for name, why in refused:
+        if why not in unknown:
+            _orders_refused_at[name] = stamp
+
     verified_by_name = {c.market_hash_name: c.steam_verified for c in ranked}
     checked = sum(1 for c in ranked if c.steam_verified)
 
@@ -8146,6 +8305,8 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<i>Снимка цен Steam нет — отбор по средним прайс-листа (обычно на "
             "треть выше рынка). Как загрузить: /steamprices</i>"
         )
+    if cf_prices is not None:
+        lines.append(f"<i>Цены CSFloat: {html_module.escape(cf_prices.describe())}</i>")
     lines.append("")
     # ЧТО ЗНАЧИТ «ЗАЯВКА ДОСТАЁТ ДО РЫНКА».
     #
@@ -8240,22 +8401,25 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if cand.listing_sold:
                 lines.append(
                     "  ℹ️ стакан прочитан по последней продаже: поиск лотов "
-                    "CSFloat закрыт, цену витрины сейчас не знаю"
+                    "CSFloat закрыт"
+                    + ("" if cand.csfloat_ask_cents else ", цену витрины сейчас не знаю")
                 )
+            # Цена витрины из прайс-листа — не живая, ей несколько часов.
+            listed = " (по прайс-листу)" if cand.ask_from_list else ""
             if plan.instant:
                 lines.append(
-                    f"  ⚡ на CSFloat лот за ${cand.csfloat_ask_cents / 100:.2f} — "
+                    f"  ⚡ на CSFloat лот за ${cand.csfloat_ask_cents / 100:.2f}{listed} — "
                     "ордер купит его сразу, ждать продавца не придётся"
                 )
             elif reach is not None and reach < ORDERS_MIN_REACH:
                 lines.append(
-                    f"  ⚠️ на CSFloat просят ${cand.csfloat_ask_cents / 100:.2f} — "
+                    f"  ⚠️ на CSFloat просят ${cand.csfloat_ask_cents / 100:.2f}{listed} — "
                     f"наша заявка ниже витрины в {1 / reach:.0f} раз(а). "
                     f"Прибыль настоящая, но исполнится такое едва ли."
                 )
             elif cand.csfloat_ask_cents:
                 lines.append(
-                    f"  на CSFloat просят ${cand.csfloat_ask_cents / 100:.2f} — "
+                    f"  на CSFloat просят ${cand.csfloat_ask_cents / 100:.2f}{listed} — "
                     f"заявка ниже витрины на {(1 - reach) * 100:.0f}%"
                 )
             lines.append(f"  {_order_links(cand)}")
@@ -8292,7 +8456,8 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             + ("по имени предмета" if via_name and not via_sale
                else "по истории продаж" if via_sale and not via_name
                else "по имени предмета и по истории продаж")
-            + ". Цену витрины CSFloat у них не знаю."
+            + (". Цена витрины — по прайс-листу csgotrader." if cf_prices is not None
+               else ". Цену витрины CSFloat у них не знаю.")
         )
 
     # Объём продаж отдают только два места Steam — priceoverview и график
@@ -8344,8 +8509,10 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("")
     lines.append(
         f"Просмотрено лотов: {scanned}. Кандидатов: арбитраж {from_arb}, "
-        f"просадки {from_dips}, каталог {from_catalog}. "
-        f"В финал вышло {len(ranked)}, свежая цена Steam (до "
+        f"просадки {from_dips}, "
+        + (f"по ценам CSFloat {from_csfloat}. " if cf_prices is not None
+           else f"каталог {from_catalog}. ")
+        + f"В финал вышло {len(ranked)}, свежая цена Steam (до "
         f"{ORDERS_STEAM_MAX_AGE / 60:.0f} мин) у {checked}."
     )
     lines.append(
