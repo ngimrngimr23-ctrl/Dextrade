@@ -879,10 +879,36 @@ async def get_steam_market_price(
             volume = None
 
     return SteamMarketPrice(
-        lowest=_money(data.get("lowest_price")),
-        median=_money(data.get("median_price")),
+        lowest=_usd(data.get("lowest_price"), market_hash_name),
+        median=_usd(data.get("median_price"), market_hash_name),
         volume=volume,
     )
+
+
+# Цена в долларах в том виде, как её пишет Steam: «$1.23», «$1,234.56».
+_USD_PRICE = re.compile(r"\s*\$\s?[\d,]+(?:\.\d{1,2})?\s*(?:USD)?\s*")
+
+
+def _usd(raw, market_hash_name: str) -> float | None:
+    """
+    Цена из priceoverview — только если она в долларах.
+
+    _money читает число из любой валюты: «1 234,56 руб.» он превращает в
+    1234.56 и не может понять, что это рубли. Для стикеров это было терпимо, а
+    для ордеров — нет: от этой цены считается потолок, по которому уходят
+    деньги, и рубли, прочитанные как доллары, поставили бы ордер в десятки
+    раз дороже предмета. Мы просим currency=1, и Steam должен отдавать
+    доллары; если всё же пришло иное — цены нет, а не неверная цена.
+    """
+    if not raw:
+        return None
+    if not _USD_PRICE.fullmatch(str(raw)):
+        log.warning(
+            "priceoverview: цена «%s» по %s не в долларах — не беру",
+            str(raw)[:40], market_hash_name,
+        )
+        return None
+    return _money(raw)
 
 
 async def _price_overview(session: aiohttp.ClientSession, market_hash_name: str) -> float | None:

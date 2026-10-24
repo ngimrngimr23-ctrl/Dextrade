@@ -6870,9 +6870,23 @@ ORDERS_PROBE_LIMIT = envcfg.env_int("ORDERS_PROBE_LIMIT", 30)
 ORDERS_STEAM_VERIFY_LIMIT = envcfg.env_int("ORDERS_STEAM_VERIFY_LIMIT", 25)
 
 # Насколько свежим должен быть ответ Steam, чтобы считать цену подтверждённой.
-# Свежему запросу проставляется возраст 0, поэтому порог нужен маленький — он
-# лишь отделяет «только что спросили» от «лежало в кэше».
-ORDERS_STEAM_FRESH_SECONDS = envcfg.env_float("ORDERS_STEAM_FRESH", 60.0)
+#
+# ТРИДЦАТЬ МИНУТ, А НЕ МИНУТА — и порог теперь заодно граница перезапроса.
+#
+# Раньше было так: кэш цен отдавал запись любой давности (живёт до 12 часов)
+# и НЕ перезапрашивал её, а «подтверждённой» считалась только запись не
+# старше минуты. Между двумя порогами предмет проваливался: настоящая цена
+# Steam часовой давности лежала в кэше, бот её не обновлял и не верил ей —
+# брал оценку из прайс-листа и помечал «🟡 оценка». А с появлением настоящих
+# ордеров такой предмет и поставить нельзя. Попадали туда как раз самые
+# ходовые: всё, что проверили прошлым прогоном или нашли просадки минутой
+# раньше.
+#
+# Теперь записи старше порога перезапрашиваются, а моложе — честно считаются
+# подтверждёнными: это настоящий ответ Steam, просто недавний. Полчаса — то
+# же окно, что у /dips (DIPS_MAX_QUOTE_AGE), и до постановки по кнопке цена
+# доживает не старше трёх четвертей часа.
+ORDERS_STEAM_MAX_AGE = envcfg.env_float("ORDERS_STEAM_MAX_AGE_MIN", 30) * 60
 
 # Насколько низко относительно витрины CSFloat заявка ещё имеет шанс.
 #
@@ -7036,6 +7050,11 @@ class _OrderCandidate(NamedTuple):
     # 2026-09-16 показал «прибыль 163%» при верхнем чужом ордере $9.00:
     # оценка была из прайс-листа, а рынок думал иначе.
     steam_verified: bool = False
+    # Сколько секунд назад Steam назвал эту цену (только у подтверждённых).
+    steam_age_seconds: float | None = None
+    # Нижний лот в Steam, если цену срезала медиана сделок (см.
+    # buy_orders.steam_sale_cents). None — срезать не пришлось.
+    steam_ask_cents: int | None = None
     # Сколько секунд назад измерен объём продаж. None — объёма нет вовсе.
     #
     # Показывается в отчёте НАМЕРЕННО без всякой политики срока годности.
@@ -7196,8 +7215,13 @@ async def _order_candidates_from_dips(chat_id: int) -> list[_OrderCandidate]:
         out.append(_OrderCandidate(
             market_hash_name=dip.market_hash_name,
             listing_id=None,
-            # Продавать будем в Steam по низу стакана — от него и считаем.
-            steam_price_cents=int(round(quote.ask * 100)),
+            # Продавать будем в Steam по низу стакана, но не дороже медианы
+            # сделок — одинокий завышенный лот не цена (см.
+            # buy_orders.steam_sale_cents).
+            steam_price_cents=(
+                buy_orders.steam_sale_cents(quote.ask, quote.median)
+                or int(round(quote.ask * 100))
+            ),
             # Здесь объём настоящий: штук за сутки от Steam priceoverview.
             volume_per_day=quote.volume,
             spread_pct=getattr(found_price, "recent_spread_pct", None),
@@ -7619,34 +7643,39 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fresh: dict[str, LiveQuote] = {}
     if verified_names:
         fresh = await _live_prices_for(
-            chat_id, verified_names, need_volume=True,
-            budget=ORDERS_STEAM_VERIFY_LIMIT,
+            chat_id, verified_names, max_age=ORDERS_STEAM_MAX_AGE,
+            need_volume=True, budget=ORDERS_STEAM_VERIFY_LIMIT,
         )
 
         def _with_live(c: _OrderCandidate) -> _OrderCandidate:
             quote = fresh.get(c.market_hash_name)
             if quote is None or not quote.ask:
                 return c
-            # «Подтверждено живым Steam» ставим ТОЛЬКО за свежий ответ.
+            # «Подтверждено» — это ответ Steam не старше ORDERS_STEAM_MAX_AGE,
+            # и говорим мы именно это, а не «спросили живьём в этом прогоне».
             #
-            # _live_prices_for отдаёт и записи из кэша — в том числе неполные,
-            # когда перезапросить не вышло (Steam на кулдауне). Первая версия
-            # этой проверки помечала такие как подтверждённые просто потому,
-            # что в них была цена, и отчёт врал прямым текстом: «живым Steam
-            # подтверждено 8» рядом с «объём не пришёл, кулдаун ещё 59 мин».
-            # Ничего живого там не происходило.
+            # Первая версия помечала подтверждённой любую запись с ценой, и
+            # отчёт врал: «живым Steam подтверждено 8» рядом с «кулдаун ещё 59
+            # мин» — записи были многочасовые. Вторая требовала возраст до
+            # минуты, но кэш при этом не перезапрашивал — и честная цена
+            # получасовой давности выбрасывалась (см. ORDERS_STEAM_MAX_AGE).
+            # Теперь возраст стоит в отчёте у каждой цены: свежему ответу
+            # проставлен 0, записи из кэша — её настоящий возраст.
             #
-            # Различает их возраст: свежему ответу ставится age 0, записи из
-            # кэша — её настоящий возраст.
-            live = quote.age_seconds <= ORDERS_STEAM_FRESH_SECONDS
+            # Цена для расчёта — не голый нижний лот, а меньшее из него и
+            # медианы сделок (buy_orders.steam_sale_cents): одинокая
+            # завышенная заявка в Steam не должна поднимать нам потолок.
+            live = quote.age_seconds <= ORDERS_STEAM_MAX_AGE
+            sale = buy_orders.steam_sale_cents(quote.ask, quote.median)
+            ask = int(round(quote.ask * 100))
             return c._replace(
-                steam_price_cents=(
-                    int(round(quote.ask * 100)) if live else c.steam_price_cents
-                ),
+                steam_price_cents=sale if live and sale else c.steam_price_cents,
                 volume_per_day=(
                     quote.volume if quote.volume is not None else c.volume_per_day
                 ),
                 steam_verified=live,
+                steam_age_seconds=quote.age_seconds if live else None,
+                steam_ask_cents=ask if live and sale and sale < ask else None,
                 volume_age_seconds=quote.volume_age_seconds,
             )
 
@@ -7654,9 +7683,12 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ages = [c.volume_age_seconds for c in ranked
                 if c.volume_age_seconds is not None]
         log.info(
-            "orders: живым Steam подтверждено %d из %d финалист(ов), объём знаем "
-            "у %d. Возраст замеров объёма: %s",
+            "orders: цена Steam не старше %.0f мин у %d из %d финалист(ов) "
+            "(медиана сделок срезала нижний лот у %d), объём знаем у %d. "
+            "Возраст замеров объёма: %s",
+            ORDERS_STEAM_MAX_AGE / 60,
             sum(1 for c in ranked if c.steam_verified), len(ranked),
+            sum(1 for c in ranked if c.steam_ask_cents is not None),
             sum(1 for c in ranked if c.volume_per_day is not None),
             (f"свежих (<5 мин) {sum(1 for a in ages if a < 300)}, "
              f"до часа {sum(1 for a in ages if 300 <= a < 3600)}, "
@@ -7823,11 +7855,24 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Ордер исполнится по второму, поэтому первое всегда помечаем.
             verified = verified_by_name.get(plan.market_hash_name, False)
             mark = "✅ Steam" if verified else "🟡 Steam (оценка)"
+            # Возраст цены — прямо в строке: «актуальная» должно читаться как
+            # число минут, а не как обещание.
+            steam_age = cand.steam_age_seconds
+            when = ""
+            if verified and steam_age is not None:
+                when = (" (только что)" if steam_age < 60
+                        else f" ({steam_age / 60:.0f} мин назад)")
             lines.append(
                 f"  {label} <b>${plan.price_cents / 100:.2f}</b> · "
-                f"{mark} ${plan.steam_price_cents / 100:.2f} · "
+                f"{mark} ${plan.steam_price_cents / 100:.2f}{when} · "
                 f"прибыль <b>{plan.profit_pct:.0f}%</b> · {rival}"
             )
+            if cand.steam_ask_cents:
+                lines.append(
+                    f"  ℹ️ нижний лот в Steam ${cand.steam_ask_cents / 100:.2f}, но "
+                    f"сделки за сутки шли по ${plan.steam_price_cents / 100:.2f} — "
+                    "считаю по сделкам"
+                )
             age = cand.volume_age_seconds
             if age is not None and age >= ORDERS_VOLUME_NOTE_SECONDS:
                 lines.append(
@@ -7921,7 +7966,8 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(
         f"Просмотрено лотов: {scanned}. Кандидатов: арбитраж {from_arb}, "
         f"просадки {from_dips}, каталог {from_catalog}. "
-        f"В финал вышло {len(ranked)}, живым Steam подтверждено {checked}."
+        f"В финал вышло {len(ranked)}, свежая цена Steam (до "
+        f"{ORDERS_STEAM_MAX_AGE / 60:.0f} мин) у {checked}."
     )
     lines.append(
         f"Пороги: прибыль от {limits['profit']:g}%, "
@@ -7947,8 +7993,9 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # условия, и каждое закрывает свой способ потерять деньги:
     #   * стакан прочитан — иначе цена «по потолку» стоит вслепую и может
     #     переплатить соперникам вдвое;
-    #   * цена Steam подтверждена живым запросом — прайс-лист это медиана
-    #     сделок за сутки, а продавать будем по сегодняшнему стакану;
+    #   * цена Steam свежая (не старше ORDERS_STEAM_MAX_AGE) — прайс-лист
+    #     это средняя сделок за сутки и больше, а продавать будем по
+    #     сегодняшнему стакану;
     #   * заявка достаёт до рынка — лотерейный билет в сто раз ниже витрины
     #     не исполнится и только займёт место в бюджете и лимите.
     tickets: list[order_desk.Ticket] = []
@@ -7958,7 +8005,8 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if plan.market_hash_name in blind:
             why = "стакан не прочитан — не знаю, кого перебивать"
         elif not verified_by_name.get(plan.market_hash_name, False):
-            why = "цена Steam не подтверждена живым запросом"
+            why = (f"цены Steam моложе {ORDERS_STEAM_MAX_AGE / 60:.0f} мин нет — "
+                   "только оценка прайс-листа")
         elif not plan.instant and reach is not None and reach < ORDERS_MIN_REACH:
             why = "заявка ниже витрины в разы — не исполнится"
         else:
@@ -8056,8 +8104,10 @@ async def _offer_order_batch(update, chat_id: int, tickets: list, held: dict[str
     instant = sum(1 for t in tickets if t.instant)
     lines = [
         f"<b>Можно поставить: {len(tickets)} ордер(ов) на {_usd(total)}</b>",
-        "Прошли все проверки: живая цена Steam, прочитанный стакан, заявка "
-        "достаёт до рынка.",
+        f"Прошли все проверки: цена Steam не старше {ORDERS_STEAM_MAX_AGE / 60:.0f} "
+        "мин, прочитанный стакан, заявка достаёт до рынка. Перед постановкой "
+        "стакан перечитаю и встану на шаг выше верхнего ордера, но не выше "
+        "потолка прибыли.",
     ]
     if instant:
         lines.append(
@@ -8205,10 +8255,17 @@ async def _place_batch(query, context, chat_id: int, token: str, send) -> None:
     if outcome.placed:
         lines.append(f"✅ Поставлено {len(outcome.placed)}:")
         for t, order in outcome.placed:
+            # Перед постановкой стакан перечитан (order_desk._price_now), и
+            # цена могла сдвинуться против плана — говорим об этом прямо.
+            moved = (
+                f", в плане было {_usd(t.price_cents)} — стакан сдвинулся"
+                if order.price_cents != t.price_cents else ""
+            )
+            profit = buy_orders.profit_pct_at(order.price_cents, t.steam_price_cents)
             lines.append(
                 f"• <code>{html_module.escape(t.market_hash_name)}</code> — "
                 f"{_usd(order.price_cents)} (потолок {_usd(t.ceiling_cents)}, "
-                f"прибыль {t.profit_pct:.0f}%)"
+                f"прибыль {profit:.0f}%{moved})"
             )
     if outcome.filled_now:
         lines.append(f"⚡ Купилось сразу {len(outcome.filled_now)}:")
@@ -10776,8 +10833,9 @@ COMMANDS: tuple[Command, ...] = (
         "арбитража, просадок (/dips) и всего каталога в ценовой полосе. Цена — "
         "на шаг сетки CSFloat выше верхнего чужого ордера, но не дороже потолка "
         "прибыли. Сам по себе ничего не ставит: под отчётом кнопка «Поставить» "
-        "для планов, прошедших все проверки (живая цена Steam, прочитанный "
-        "стакан, заявка достаёт до рынка). Кнопка живёт 15 минут.",
+        "для планов, прошедших все проверки (цена Steam не старше 30 минут, "
+        "прочитанный стакан, заявка достаёт до рынка); перед постановкой стакан "
+        "перечитывается. Кнопка живёт 15 минут.",
     ),
     Command(
         "myorders", myorders, "Ордера CSFloat",

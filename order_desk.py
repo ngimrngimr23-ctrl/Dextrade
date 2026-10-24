@@ -223,6 +223,48 @@ async def _find_new_order(
     return None
 
 
+async def _price_now(
+    session: aiohttp.ClientSession, t: Ticket,
+) -> tuple[int | None, str]:
+    """
+    Цена ордера по стакану В МОМЕНТ ПОСТАНОВКИ. Возвращает (цена, пояснение).
+
+    План считался по стакану, прочитанному до кнопки, а между ними до
+    пятнадцати минут: соперник мог подняться, и тогда ордер по плановой цене
+    встал бы вторым; или снять ордер — и тогда мы переплатили бы. Поэтому
+    стакан перечитывается, и цена снова ставится на шаг выше верхнего — но
+    не выше потолка, посчитанного по цене Steam.
+
+    Цена None — ставить нельзя, пояснение говорит почему. Не перечитали
+    стакан — ставим по плану: он моложе пятнадцати минут, и человек одобрил
+    именно его.
+
+    Мгновенные планы не трогаем: их цена — витрина CSFloat, а не стакан.
+    """
+    if t.instant or not t.listing_id:
+        return t.price_cents, ""
+    book = await csfloat_client.order_book(session, t.listing_id)
+    if book is None:
+        return t.price_cents, "стакан перед постановкой не прочитан — ставлю по плану"
+    rivals = [b.price_cents for b in book if not b.conditional]
+    if not rivals:
+        return t.price_cents, ""
+    top = max(rivals)
+    want = buy_orders.above(top)
+    if want > t.ceiling_cents:
+        return None, (
+            f"пока ждали кнопку, верхний ордер поднялся до ${top / 100:.2f}: "
+            f"перебить можно только за ${want / 100:.2f}, а потолок "
+            f"${t.ceiling_cents / 100:.2f}"
+        )
+    if want == t.price_cents:
+        return want, ""
+    return want, (
+        f"стакан сдвинулся: верхний ордер ${top / 100:.2f}, ставлю "
+        f"${want / 100:.2f} вместо ${t.price_cents / 100:.2f}"
+    )
+
+
 async def place(
     chat_id: int, tickets: list[Ticket], *, budget_cents: int, max_count: int,
 ) -> PlaceOutcome:
@@ -273,35 +315,43 @@ async def place(
                 if count >= max_count:
                     refused.append((t, f"уже {count} ботовых ордер(ов) — это лимит"))
                     continue
-                if committed + t.price_cents > budget_cents:
+
+                price, moved = await _price_now(session, t)
+                if price is None:
+                    refused.append((t, moved))
+                    continue
+
+                if committed + price > budget_cents:
                     refused.append((
                         t, f"не влезает в бюджет: занято ${committed / 100:.2f} "
                            f"из ${budget_cents / 100:.2f}",
                     ))
                     continue
-                if balance is not None and t.price_cents > balance:
+                if balance is not None and price > balance:
                     refused.append((
                         t, f"дороже доступного баланса CSFloat (${balance / 100:.2f})",
                     ))
                     continue
                 # Последняя проверка самой цены: деньги уходят следующей
                 # строкой, а ошибка расчёта выше — не повод их потратить.
-                if (not 1 <= t.price_cents <= t.ceiling_cents
-                        or not buy_orders.is_valid_price(t.price_cents)):
-                    log.error("orders: цена вне потолка или сетки: %s", t)
+                if (not 1 <= price <= t.ceiling_cents
+                        or not buy_orders.is_valid_price(price)):
+                    log.error("orders: цена %s вне потолка или сетки: %s", price, t)
                     refused.append((t, "цена вне потолка или сетки — ошибка расчёта, не ставлю"))
                     continue
+                if moved:
+                    log.info("orders: «%s» — %s", t.market_hash_name, moved)
 
                 try:
                     order = await csfloat_client.create_buy_order(
-                        session, t.market_hash_name, t.price_cents,
+                        session, t.market_hash_name, price,
                     )
                 except CSFloatOrderRejected as e:
                     refused.append((t, f"CSFloat отказал: {_reason(e)}"))
                     continue
                 except CSFloatUnknownOutcome as e:
                     log.warning("orders: %s — проверяю список", _reason(e))
-                    order = await _find_new_order(session, t.market_hash_name, t.price_cents, known)
+                    order = await _find_new_order(session, t.market_hash_name, price, known)
                     if order is None:
                         refused.append((
                             t, "CSFloat не ответил, и в списке ордера нет — "
@@ -316,7 +366,7 @@ async def place(
                     continue
 
                 if order is None:
-                    order = await _find_new_order(session, t.market_hash_name, t.price_cents, known)
+                    order = await _find_new_order(session, t.market_hash_name, price, known)
                 if order is None:
                     if t.instant:
                         # Ордер дотягивал до витрины — CSFloat купил лот в тот
@@ -325,7 +375,7 @@ async def place(
                         taken.add(t.market_hash_name)
                         log.info(
                             "orders: chat_id=%s ордер на «%s» за $%.2f исполнился сразу",
-                            chat_id, t.market_hash_name, t.price_cents / 100,
+                            chat_id, t.market_hash_name, price / 100,
                         )
                     else:
                         refused.append((
@@ -373,7 +423,9 @@ def _ceiling_now(
     """
     steam = int(entry.get("steam") or 0)
     if cached and cached.get("price") and cached.get("updated_at", 0) > entry.get("placed_at", 0):
-        steam = int(round(float(cached["price"]) * 100))
+        # То же правило, что при постановке: нижний лот, но не дороже медианы
+        # сделок (buy_orders.steam_sale_cents).
+        steam = buy_orders.steam_sale_cents(cached["price"], cached.get("median")) or steam
     stored = int(entry.get("ceiling") or 0)
     # Без цены Steam пересчитать потолок не из чего — остаётся прежний, а не
     # ноль: ноль значил бы «прибыли нет» и снял бы живой ордер.

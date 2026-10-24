@@ -171,6 +171,27 @@ def above(rival_cents: int) -> int:
     return at_least(int(rival_cents) + 1)
 
 
+def steam_sale_cents(ask: float | None, median: float | None) -> int | None:
+    """
+    По какой цене предмет реально продастся в Steam, в центах. None — не знаем.
+
+    Нижний лот (ask) — сколько сейчас стоит купить, а значит и примерно за
+    сколько продашь, встав рядом с ним. Но на тонком предмете нижний лот бывает
+    одинокой завышенной заявкой, по которой никто не покупает, — тогда честнее
+    медиана настоящих сделок за сутки. Берём МЕНЬШЕЕ из двух: ошибка вниз
+    стоит недобранной прибыли, ошибка вверх — убытка на каждом исполненном
+    ордере.
+
+    Обычно меньшее — сам ask: по замеру на двадцати предметах нижний лот ниже
+    медианы сделок примерно на 13% (см. storage.set_steam_price). Медиана
+    срезает цену только там, где нижний лот выбивается вверх.
+    """
+    values = [float(v) for v in (ask, median) if v and float(v) > 0]
+    if not values:
+        return None
+    return int(round(min(values) * 100))
+
+
 def net_after_fee(steam_price_cents: int) -> Decimal:
     """Сколько останется на руках после комиссии Steam, в центах."""
     return Decimal(int(steam_price_cents)) * _FEE
