@@ -265,6 +265,7 @@ def plan(
     spread_basis: str = "сутки, неделя, месяц",
     unknown_spread_reason: str = UNKNOWN_STABILITY,
     month_label: str = "средняя продаж за месяц",
+    volume_label: str | None = None,
 ) -> tuple[OrderPlan | None, str]:
     """
     Решить, ставить ли ордер, и по какой цене.
@@ -293,7 +294,8 @@ def plan(
     spread_basis, unknown_spread_reason, month_label — слова для причин
     отказа: разброс и «средняя за месяц» бывают из прайс-листа (средние за
     сутки, неделю и месяц) и из самих сделок Steam (медианы по неделям), и
-    человеку надо видеть, о каком из них речь.
+    человеку надо видеть, о каком из них речь. volume_label — то же про
+    объём, когда недельный пересчитан из суточного.
     """
     if steam_price_cents <= 0:
         return None, "нет цены Steam — сравнивать не с чем"
@@ -312,6 +314,13 @@ def plan(
         if min_volume_per_week > 0:
             return None, UNKNOWN_VOLUME
     elif volume_per_week < min_volume_per_week:
+        if volume_label:
+            # Объём не измерен за неделю, а пересчитан из суточного — так и
+            # говорим, и отказ тогда не про ликвидность, а про незнание.
+            return None, (
+                f"{volume_label} — при пороге {min_volume_per_week} шт/нед "
+                "не рискую"
+            )
         return None, (
             f"продаётся {volume_per_week} шт/нед при пороге {min_volume_per_week} — "
             "выйти обратно будет не у кого"

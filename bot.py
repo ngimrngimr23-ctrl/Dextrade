@@ -7138,14 +7138,16 @@ async def _steam_histories(names: list[str]) -> dict:
     """
     Страницы предметов с историей сделок — для финалистов /orders.
 
-    Почти всегда без запроса: финалистам цену только что брали с этой же
-    страницы (pricing.get_steam_market_price_retrying), и она лежит в памяти
-    steam_history. Запрос уходит лишь за теми, чья цена пришла из
-    priceoverview или кэша.
+    Страница из памяти годится, если она не старше ORDERS_STEAM_MAX_AGE: по
+    ней же берётся цена. Получить свежую не вышло (пауза после 429) —
+    берём и постарше, до steam_history.CACHE_SECONDS: цену из неё уже не
+    возьмут (см. orders_cmd), а сделки за месяц за пару часов не меняются.
     """
     pages = {}
     for name in names:
-        page = await steam_history.fetch(name)
+        page = await steam_history.fetch(name, max_age=ORDERS_STEAM_MAX_AGE)
+        if page is None:
+            page = steam_history.cached(name, steam_history.CACHE_SECONDS)
         if page is not None:
             pages[name] = page
     wait = steam_cooldown_remaining(scope=steam_history.SCOPE)
@@ -7157,6 +7159,20 @@ async def _steam_histories(names: list[str]) -> dict:
     return pages
 
 
+def _quote_from_page(page) -> LiveQuote | None:
+    """Живая цена со страницы предмета — в том же виде, что из priceoverview."""
+    if page is None or page.lowest_usd is None:
+        return None
+    age = max(0.0, time.time() - page.fetched_at)
+    return LiveQuote(
+        page.lowest_usd,
+        page.median(1) if page.history_usd else None,
+        page.sold(1),
+        age,
+        age if page.has_history else None,
+    )
+
+
 def _plan_inputs(cand: _OrderCandidate, limits: dict) -> dict:
     """
     Всё, что buy_orders.plan берёт у Steam и из настроек, — без стакана.
@@ -7166,11 +7182,23 @@ def _plan_inputs(cand: _OrderCandidate, limits: dict) -> dict:
     Стабильность — по сделкам, если они есть (см. _with_history).
     """
     weekly = cand.sold_week
+    volume_label = None
     if weekly is None and cand.volume_per_day is not None:
         weekly = cand.volume_per_day * 7
+        # Недельный объём здесь — суточный ×7, и отказ должен это говорить:
+        # «продаётся 0 шт/нед» про предмет, который просто не покупали
+        # последние сутки, — неправда.
+        volume_label = (
+            "за последние сутки в Steam ни одной продажи, а сделок за неделю "
+            "Steam не отдал"
+            if cand.volume_per_day == 0 else
+            f"за сутки в Steam продано {cand.volume_per_day} шт (≈{weekly} шт/нед, "
+            "сделок за неделю Steam не отдал)"
+        )
     inputs = dict(
         steam_price_cents=cand.steam_price_cents,
         volume_per_week=weekly,
+        volume_label=volume_label,
         spread_pct=cand.spread_pct,
         min_profit_pct=limits["profit"],
         min_volume_per_week=limits["volume"],
@@ -7848,10 +7876,29 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     verified_names = [c.market_hash_name for c in ranked]
     fresh: dict[str, LiveQuote] = {}
     if verified_names:
-        fresh = await _live_prices_for(
-            chat_id, verified_names, max_age=ORDERS_STEAM_MAX_AGE,
-            need_volume=True, budget=ORDERS_STEAM_VERIFY_LIMIT,
-        )
+        # СНАЧАЛА СТРАНИЦЫ ПРЕДМЕТОВ, ПОТОМ priceoverview.
+        #
+        # Страница отдаёт всё сразу: нижний лот, продажи и медиану за сутки
+        # (то же, что priceoverview), а ещё сделки за месяц — по ним видно
+        # настоящий недельный объём и стабильность по неделям (см.
+        # steam_history). 2026-10-24 её спрашивали ПОСЛЕ тридцати запросов к
+        # priceoverview, и первый же запрос получил 429: объём остался
+        # суточным ×7, и одиннадцать кандидатов получили «продаётся 0 шт/нед»
+        # лишь потому, что за последние сутки их не покупали. Теперь страница
+        # первая, а priceoverview спрашивается только про тех, чью страницу
+        # получить не вышло.
+        pages = await _steam_histories(verified_names)
+        for name, page in pages.items():
+            quote = _quote_from_page(page)
+            if quote is not None and quote.age_seconds <= ORDERS_STEAM_MAX_AGE:
+                fresh[name] = quote
+                await set_steam_price(name, quote.ask, quote.volume, quote.median)
+        rest = [n for n in verified_names if n not in fresh]
+        if rest:
+            fresh.update(await _live_prices_for(
+                chat_id, rest, max_age=ORDERS_STEAM_MAX_AGE,
+                need_volume=True, budget=ORDERS_STEAM_VERIFY_LIMIT,
+            ))
 
         def _with_live(c: _OrderCandidate) -> _OrderCandidate:
             quote = fresh.get(c.market_hash_name)
@@ -7907,15 +7954,8 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         #
         # Обе вещи до сих пор были оценками: объём — суточный из priceoverview
         # ×7, стабильность — разброс средних прайс-листа за сутки, неделю и
-        # месяц. Страница предмета отдаёт сами сделки Steam за месяц (см.
-        # steam_history), и по ним видно и сколько продано за неделю, и как
-        # держалась цена каждую из четырёх недель.
-        #
-        # Только у финалистов со свежей ценой Steam: остальных ставить всё
-        # равно нельзя (см. «что из планов можно ставить» ниже).
-        pages = await _steam_histories(
-            [c.market_hash_name for c in ranked if c.steam_verified]
-        )
+        # месяц. По сделкам со страницы предмета видно и сколько продано за
+        # неделю, и как держалась цена каждую из четырёх недель.
         ranked = [_with_history(c, pages.get(c.market_hash_name)) for c in ranked]
 
     plans: list[tuple[_OrderCandidate, buy_orders.OrderPlan]] = []
