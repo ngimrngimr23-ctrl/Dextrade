@@ -8583,6 +8583,67 @@ async def _owns_updates(bot) -> bool:
     return (info.url or "") == f"{WEBHOOK_BASE_URL}/{_tg_webhook_path}"
 
 
+# Сторож вебхука: как часто проверять и насколько свежей должна быть ошибка
+# доставки, чтобы считать адрес мёртвым.
+WEBHOOK_WATCH_JOB_NAME = "webhook_watch"
+WEBHOOK_WATCH_SECONDS = envcfg.env_int("WEBHOOK_WATCH_SECONDS", 180)
+WEBHOOK_DEAD_AFTER_SECONDS = 600
+
+
+async def webhook_watch_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Вебхук смотрит на копию бота, которой больше нет, — забираем его себе.
+
+    Вебхук ставит та копия, что стартовала последней. 2026-10-24 из трёх
+    сервисов Render удалили два, а вебхук остался на одном из удалённых:
+    живая копия работала, но апдейтов не получала, и бот молчал бы до её
+    перезапуска.
+
+    Мёртвый адрес видно по самому Telegram: getWebhookInfo отдаёт ошибку
+    последней доставки и число недоставленных апдейтов. Свежая ошибка при
+    непустой очереди и чужом адресе — вебхук забираем, и Telegram отдаёт
+    накопленное уже сюда. Живую чужую копию это не задевает: у неё доставки
+    проходят, ошибки нет. Пустой адрес не трогаем — так бывает, когда другая
+    копия работает на long-polling, и вебхук сломал бы ей приём.
+    """
+    try:
+        if not _tg_webhook_path:
+            return
+        mine = f"{WEBHOOK_BASE_URL}/{_tg_webhook_path}"
+        info = await context.bot.get_webhook_info()
+        current = info.url or ""
+        if not current or current == mine:
+            return
+        failed_at = info.last_error_date
+        if failed_at is None:
+            return
+        failed_ts = (
+            float(failed_at) if isinstance(failed_at, (int, float))
+            else failed_at.timestamp()
+        )
+        if time.time() - failed_ts > WEBHOOK_DEAD_AFTER_SECONDS or not info.pending_update_count:
+            return
+        await context.bot.set_webhook(
+            url=mine,
+            secret_token=TG_WEBHOOK_SECRET or None,
+            allowed_updates=Update.ALL_TYPES,
+        )
+        # Только хост: в пути вебхука секрет.
+        log.warning(
+            "webhook: вебхук смотрел на %s, а Telegram туда не доставляет (%s, "
+            "недоставленных %d) — забрал вебхук на эту копию",
+            current.split("/")[2] if current.count("/") >= 2 else "?",
+            scan_errors.scrub(info.last_error_message or "без текста"),
+            info.pending_update_count,
+        )
+    except Exception:  # noqa: BLE001 — проверка вспомогательная, ронять нечего
+        log.warning("webhook: проверка вебхука не удалась", exc_info=True)
+    finally:
+        context.job_queue.run_once(
+            webhook_watch_job, when=WEBHOOK_WATCH_SECONDS, name=WEBHOOK_WATCH_JOB_NAME,
+        )
+
+
 async def orders_maintain_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.data["chat_id"]
     _, _, auto_minutes = await _order_limits(chat_id)
@@ -11647,6 +11708,14 @@ async def _on_startup(app: Application):
     for job in app.job_queue.get_jobs_by_name(HISTORY_JOB_NAME):
         job.schedule_removal()
     app.job_queue.run_once(price_history_job, when=90, name=HISTORY_JOB_NAME)
+
+    # Сторож вебхука (см. webhook_watch_job). На long-polling он ничего не
+    # делает: _tg_webhook_path там пустой.
+    for job in app.job_queue.get_jobs_by_name(WEBHOOK_WATCH_JOB_NAME):
+        job.schedule_removal()
+    app.job_queue.run_once(
+        webhook_watch_job, when=WEBHOOK_WATCH_SECONDS, name=WEBHOOK_WATCH_JOB_NAME,
+    )
 
     # Выгрузка лога в репозиторий — только если настроена. Проверяем ЗДЕСЬ, на
     # старте, а не при первой выгрузке: узнать «репозиторий публичный, писать
