@@ -9666,6 +9666,13 @@ _NAMES_FILE_ROUTES = {
 }
 
 
+def _is_csfloat_table(text: str) -> bool:
+    """Таблица цен CSFloat (cs2_*_csfloat*.csv) — её шапка называет колонки CSFloat."""
+    first = next((line for line in text.lstrip("\ufeff").splitlines() if line.strip()), "")
+    head = first.lower()
+    return "market_hash_name" in head and "csfloat" in head
+
+
 def _names_from_file(text: str) -> list[str] | None:
     """
     Имена предметов из текстового файла — или None, если это не он.
@@ -9684,6 +9691,11 @@ def _names_from_file(text: str) -> list[str] | None:
     names = [line.strip() for line in text.splitlines()]
     names = [n for n in names if n and not n.startswith("#")]
     if not names:
+        return None
+    # Таблица (CSV через «;» или табуляцию) — не список имён: в market_hash_name
+    # таких символов не бывает. Без этой проверки присланная таблица цен ушла бы
+    # в вотчлист целиком — полторы тысячи «предметов» с ценами в названии.
+    if sum(1 for n in names if ";" in n or "\t" in n) >= max(1, len(names) // 2):
         return None
     # У market_hash_name всегда есть степень износа в скобках либо «|» —
     # случайный текстовый файл под это не подойдёт.
@@ -9876,6 +9888,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             if snapshot is not None:
                 await _absorb_steam_snapshot(update, snapshot)
+                return
+            if _is_csfloat_table(text):
+                await update.message.reply_text(
+                    "Это таблица цен CSFloat — боту её присылать не нужно: цены "
+                    "CSFloat он сам скачивает раз в 30 минут из того же "
+                    "прайс-листа (возраст видно в шапке отчёта /orders). "
+                    "Таблица — чтобы смотреть глазами.\n\n"
+                    "Боту нужен только файл цен Steam — "
+                    "cs2_skins_steam_prices_history.csv."
+                )
                 return
 
         # Список имён — это не JSON, и разбирать его как JSON не надо.
