@@ -63,6 +63,7 @@ from urllib.parse import quote
 
 import aiohttp
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -8586,8 +8587,12 @@ async def _owns_updates(bot) -> bool:
 # Сторож вебхука: как часто проверять и насколько свежей должна быть ошибка
 # доставки, чтобы считать адрес мёртвым.
 WEBHOOK_WATCH_JOB_NAME = "webhook_watch"
-WEBHOOK_WATCH_SECONDS = envcfg.env_int("WEBHOOK_WATCH_SECONDS", 180)
+WEBHOOK_WATCH_SECONDS = envcfg.env_int("WEBHOOK_WATCH_SECONDS", 120)
 WEBHOOK_DEAD_AFTER_SECONDS = 600
+# Сколько раз пробовать setWebhook при flood control на старте.
+WEBHOOK_SET_ATTEMPTS = 5
+# Вебхук снят, а апдейты копятся — видели ли это на прошлой проверке.
+_webhook_orphan_seen = False
 
 
 async def webhook_watch_job(context: ContextTypes.DEFAULT_TYPE):
@@ -8603,17 +8608,41 @@ async def webhook_watch_job(context: ContextTypes.DEFAULT_TYPE):
     последней доставки и число недоставленных апдейтов. Свежая ошибка при
     непустой очереди и чужом адресе — вебхук забираем, и Telegram отдаёт
     накопленное уже сюда. Живую чужую копию это не задевает: у неё доставки
-    проходят, ошибки нет. Пустой адрес не трогаем — так бывает, когда другая
-    копия работает на long-polling, и вебхук сломал бы ей приём.
+    проходят, ошибки нет.
+
+    Вебхук снят вовсе — значит, какая-то копия работает на long-polling (она
+    при старте снимает вебхук). Пока она жива, апдейты она и забирает, и
+    очередь пустая — тогда не трогаем. А если очередь растёт две проверки
+    подряд, забирать некому: копию на polling удалили, и вебхук ставим себе.
     """
+    global _webhook_orphan_seen
     try:
         if not _tg_webhook_path:
             return
         mine = f"{WEBHOOK_BASE_URL}/{_tg_webhook_path}"
         info = await context.bot.get_webhook_info()
         current = info.url or ""
-        if not current or current == mine:
+        if current == mine:
+            _webhook_orphan_seen = False
             return
+        if not current:
+            orphan = bool(info.pending_update_count)
+            take = orphan and _webhook_orphan_seen
+            _webhook_orphan_seen = orphan
+            if take:
+                await context.bot.set_webhook(
+                    url=mine,
+                    secret_token=TG_WEBHOOK_SECRET or None,
+                    allowed_updates=Update.ALL_TYPES,
+                )
+                _webhook_orphan_seen = False
+                log.warning(
+                    "webhook: вебхук снят, а апдейты копятся (недоставленных %d) — "
+                    "забирать их некому, поставил вебхук на эту копию",
+                    info.pending_update_count,
+                )
+            return
+        _webhook_orphan_seen = False
         failed_at = info.last_error_date
         if failed_at is None:
             return
@@ -11958,16 +11987,40 @@ async def _run_with_webhook(app, token: str) -> bool:
         except Exception:
             log.exception("webhook: post_init упал — бот поднимется без восстановленного состояния")
 
-    try:
-        await app.bot.set_webhook(
-            url=url,
-            secret_token=TG_WEBHOOK_SECRET or None,
-            allowed_updates=Update.ALL_TYPES,
-        )
-    except Exception:
-        log.exception("webhook: set_webhook не удался, откатываюсь на long-polling")
-        await app.shutdown()
-        return False
+    # Flood control — это «подожди», а не «не выйдет».
+    #
+    # Render передеплоивает все сервисы разом, и 2026-10-24 три копии бота
+    # позвали setWebhook в одну секунду. Третья получила «Flood control
+    # exceeded. Retry in 1 seconds» и откатилась на long-polling, а polling при
+    # старте снимает вебхук — то есть отключила приём апдейтов у остальных.
+    for attempt in range(1, WEBHOOK_SET_ATTEMPTS + 1):
+        try:
+            await app.bot.set_webhook(
+                url=url,
+                secret_token=TG_WEBHOOK_SECRET or None,
+                allowed_updates=Update.ALL_TYPES,
+            )
+            break
+        except RetryAfter as e:
+            if attempt == WEBHOOK_SET_ATTEMPTS:
+                log.exception("webhook: Telegram так и не дал поставить вебхук, "
+                              "откатываюсь на long-polling")
+                await app.shutdown()
+                return False
+            pause = e.retry_after
+            pause = pause.total_seconds() if hasattr(pause, "total_seconds") else float(pause)
+            # Разброс — чтобы копии, получившие отказ вместе, не пришли снова
+            # в одну и ту же секунду.
+            pause += attempt + secrets.randbelow(3000) / 1000
+            log.warning(
+                "webhook: Telegram просит подождать (flood control) — повторю "
+                "через %.1f с, попытка %d из %d", pause, attempt, WEBHOOK_SET_ATTEMPTS,
+            )
+            await asyncio.sleep(pause)
+        except Exception:
+            log.exception("webhook: set_webhook не удался, откатываюсь на long-polling")
+            await app.shutdown()
+            return False
 
     await app.start()
 
