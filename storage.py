@@ -1124,6 +1124,86 @@ async def save_price_history(history: dict) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Снимок цен Steam (см. steam_snapshot): самый дешёвый лот по каждому скину.
+#
+# Пятнадцать тысяч цен — около мегабайта JSON, больше, чем стоит класть в одно
+# значение Upstash, поэтому те же восемь шардов, что у истории цен. Метка
+# (время сбора, сколько цен) лежит отдельно: по ней бот за одну команду
+# понимает, сменился ли снимок, и не перечитывает мегабайт на каждом /orders.
+# ---------------------------------------------------------------------------
+
+STEAM_SNAPSHOT_KEY_PREFIX = "steamsnap:"
+STEAM_SNAPSHOT_META_KEY = "steamsnap:meta"
+LOCAL_STEAM_SNAPSHOT_PATH = Path(__file__).parent / "steam_snapshot_local.json"
+
+
+def _local_snapshot_load() -> dict:
+    if LOCAL_STEAM_SNAPSHOT_PATH.exists():
+        try:
+            return json.loads(LOCAL_STEAM_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+async def save_steam_snapshot(meta: dict, prices: dict[str, list]) -> None:
+    """
+    Записать снимок. Сбой — StorageUnavailable: человек прислал файл и должен
+    узнать, что он не сохранился, а не обнаружить это через сутки.
+
+    Метка пишется ПОСЛЕДНЕЙ: пока шарды не записаны все, читатели видят
+    прежнюю метку и держат прежний снимок, а не смесь двух.
+    """
+    if REDIS_ENABLED:
+        shards: list[dict] = [{} for _ in range(PRICE_HISTORY_SHARDS)]
+        for name, row in prices.items():
+            shards[_history_shard(name)][name] = row
+        try:
+            for i, shard in enumerate(shards):
+                await _redis_cmd(
+                    "SET", f"{STEAM_SNAPSHOT_KEY_PREFIX}{i}",
+                    json.dumps(shard, ensure_ascii=False, separators=(",", ":")),
+                )
+            await _redis_cmd("SET", STEAM_SNAPSHOT_META_KEY, json.dumps(meta))
+        except Exception as e:
+            raise StorageUnavailable(f"снимок цен не записан: {e}") from None
+        return
+    LOCAL_STEAM_SNAPSHOT_PATH.write_text(
+        json.dumps({"meta": meta, "prices": prices}, ensure_ascii=False,
+                   separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+
+async def get_steam_snapshot_meta() -> dict | None:
+    """Метка снимка: время сбора и число цен. Сбой Upstash — исключение наружу."""
+    if REDIS_ENABLED:
+        raw = await _redis_cmd("GET", STEAM_SNAPSHOT_META_KEY)
+        return json.loads(raw) if raw else None
+    return _local_snapshot_load().get("meta")
+
+
+async def get_steam_snapshot() -> tuple[dict, dict[str, list]] | None:
+    """Снимок целиком: (метка, {имя: [цена в центах, лотов]}). None — его нет."""
+    if REDIS_ENABLED:
+        keys = [STEAM_SNAPSHOT_META_KEY] + [
+            f"{STEAM_SNAPSHOT_KEY_PREFIX}{i}" for i in range(PRICE_HISTORY_SHARDS)
+        ]
+        raw = await _redis_cmd("MGET", *keys)
+        if not raw or not raw[0]:
+            return None
+        prices: dict[str, list] = {}
+        for part in raw[1:]:
+            if part:
+                prices.update(json.loads(part))
+        return json.loads(raw[0]), prices
+    data = _local_snapshot_load()
+    if not data.get("meta"):
+        return None
+    return data["meta"], data.get("prices", {})
+
+
 async def all_chat_ids_with_settings() -> list[int]:
     """
     Чаты, у которых вообще есть сохранённые настройки — нужно, чтобы понять,

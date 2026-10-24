@@ -82,6 +82,19 @@ DEFAULT_MAX_ORDER_USD = envcfg.env_float("ORDER_MAX_USD", 20.0)
 # данных 2026-10-24 проходят две трети скинов $1–65 с продажами за сутки.
 DEFAULT_MAX_MONTH_SPREAD_PCT = envcfg.env_float("ORDER_MAX_MONTH_SPREAD_PCT", 10.0)
 
+# Цена в Steam сейчас против средней цены продаж за месяц — при каком
+# отношении история и цена вообще говорят об одном и том же.
+#
+# Средняя обычно выше самого дешёвого лота: в неё попадают экземпляры с
+# наклейками, паттерном, флоатом. Замер 2026-10-24 по 15 748 скинам: лот в
+# среднем 0.77 от средней, половина предметов в 0.64-0.89. Но бывает, что
+# одна дорогая продажа задирает среднюю вдвое (M4A4 | Tornado (MW): лот
+# $21.28, «средняя» за месяц $53.50, отношение 0.40) — и тогда ровные
+# средние ничего не говорят про то, почём предмет продаётся на самом деле.
+# «Стабильность» такого предмета — стабильность чужих дорогих продаж.
+HISTORY_RATIO_MIN = envcfg.env_float("ORDER_HISTORY_RATIO_MIN", 0.5)
+HISTORY_RATIO_MAX = envcfg.env_float("ORDER_HISTORY_RATIO_MAX", 1.3)
+
 # СЕТКА ЦЕН ОРДЕРОВ CSFLOAT: (цена ДО которой действует шаг, шаг), всё в центах.
 #
 # Ввели её против ботов, которые перебивали друг друга по центу («Say goodbye
@@ -242,6 +255,7 @@ def plan(
     max_order_usd: float = DEFAULT_MAX_ORDER_USD,
     ask_cents: int | None = None,
     require_spread: bool = False,
+    month_avg_cents: int | None = None,
 ) -> tuple[OrderPlan | None, str]:
     """
     Решить, ставить ли ордер, и по какой цене.
@@ -262,6 +276,10 @@ def plan(
     spread_pct — разброс цены за месяц (pricing.SteamPrice.month_spread_pct).
     require_spread=True — неизвестный разброс считается отказом: стабильность
     требуют подтвердить, а не предположить.
+
+    month_avg_cents — средняя цена продаж за месяц. Если цена Steam сейчас
+    выбивается из неё сильнее HISTORY_RATIO_MIN/MAX, ровные средние
+    описывают не этот рынок, и стабильность не подтверждена.
     """
     if steam_price_cents <= 0:
         return None, "нет цены Steam — сравнивать не с чем"
@@ -286,6 +304,15 @@ def plan(
 
     if spread_pct is None and require_spread:
         return None, UNKNOWN_STABILITY
+    if month_avg_cents and month_avg_cents > 0:
+        ratio = steam_price_cents / month_avg_cents
+        if not HISTORY_RATIO_MIN <= ratio <= HISTORY_RATIO_MAX:
+            return None, (
+                f"история не сходится с ценой: в Steam сейчас "
+                f"${steam_price_cents / 100:.2f}, а средняя продаж за месяц "
+                f"${month_avg_cents / 100:.2f} — средние задраны или обвалены "
+                "редкими сделками, стабильность по ним не видна"
+            )
     if spread_pct is not None and spread_pct > max_spread_pct:
         return None, (
             f"цена за месяц гуляет на {spread_pct:.0f}% (сутки, неделя, месяц) "

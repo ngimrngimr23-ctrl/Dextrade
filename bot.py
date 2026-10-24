@@ -156,6 +156,7 @@ from storage import (
     get_order_settings,
     set_order_setting,
     get_bot_orders,
+    StorageUnavailable,
     get_steam_price_entry,
     get_watchlist_bundle,
     set_dips_setting,
@@ -181,6 +182,7 @@ import csfloat_client
 import market_prices
 import menu
 import order_desk
+import steam_snapshot
 import pricing
 import dips
 import price_history
@@ -7063,6 +7065,10 @@ class _OrderCandidate(NamedTuple):
     # возраста считать их негодными. Придумывать TTL из головы значит
     # выбрасывать рабочие данные или доверять протухшим, наугад.
     volume_age_seconds: float | None = None
+    # Средняя цена продаж за месяц из прайс-листа, в центах. Нужна для
+    # проверки «история сходится с ценой» (buy_orders.HISTORY_RATIO_MIN/MAX):
+    # ровные средние ничего не стоят, если сама цена из них выбивается.
+    month_avg_cents: int | None = None
 
 
 async def _order_candidates_from_arb(
@@ -7140,6 +7146,7 @@ async def _order_candidates_from_arb(
     # (steam_price_spread_pct) считается сутки против недели и для ордера
     # мал: см. pricing.SteamPrice.month_spread_pct.
     details = await get_csgotrader_price_details() or {}
+    snapshot, _ = await steam_snapshot.current()
     spread_by_name = {
         l.market_hash_name: (
             details[l.market_hash_name].month_spread_pct
@@ -7159,11 +7166,22 @@ async def _order_candidates_from_arb(
         min_steam_volume=settings["min_volume"],
         sticker_max_markup_pct=settings["sticker_markup"],
     )
+    def _month_avg(name: str) -> int | None:
+        sp = details.get(name)
+        avg = sp.windows.get("last_30d") if sp else None
+        return int(round(avg * 100)) if avg else None
+
     return [
         _OrderCandidate(
             market_hash_name=o.market_hash_name,
             listing_id=o.listing_id,
-            steam_price_cents=int(round((o.steam_price or 0) * 100)),
+            # Первая оценка — из снимка рынка Steam, если он есть: средняя
+            # прайс-листа в среднем на треть выше самого дешёвого лота (см.
+            # steam_snapshot). Живой Steam у финалистов всё равно её заменит.
+            steam_price_cents=(
+                (snapshot.price_cents(o.market_hash_name) if snapshot else None)
+                or int(round((o.steam_price or 0) * 100))
+            ),
             # Объём НЕ берём: у лотов CSFloat в steam_volume лежит
             # reference.quantity — запас на витрине, а не продажи в Steam (см.
             # _OrderCandidate.volume_per_day). Настоящий объём спросим у Steam
@@ -7173,6 +7191,7 @@ async def _order_candidates_from_arb(
             source="арбитраж",
             csfloat_ask_cents=int(round(o.csfloat_price * 100)),
             price_confirmed=confirmed_by_name.get(o.market_hash_name),
+            month_avg_cents=_month_avg(o.market_hash_name),
         )
         for o in offers
     ], len(listings)
@@ -7233,6 +7252,11 @@ async def _order_candidates_from_dips(chat_id: int) -> list[_OrderCandidate]:
             volume_per_day=quote.volume,
             spread_pct=getattr(found_price, "month_spread_pct", None),
             source="просадка",
+            month_avg_cents=(
+                int(round(found_price.windows["last_30d"] * 100))
+                if found_price is not None and found_price.windows.get("last_30d")
+                else None
+            ),
         ))
     return out
 
@@ -7313,16 +7337,25 @@ async def _order_candidates_from_catalog(chat_id: int, limits: dict) -> list[_Or
     low, high = limits["low"], limits["high"]
     max_spread = limits["stability"]
 
-    band: list[tuple[str, float, float | None]] = []
-    skipped_quiet = skipped_jumpy = skipped_young = 0
+    # Цена для полосы и первой оценки — из снимка рынка Steam, если он есть
+    # и не старше суток-трёх (см. steam_snapshot). Средняя прайс-листа в
+    # среднем на треть выше самого дешёвого лота, а у части предметов задрана
+    # одной дорогой продажей вдвое: по ней в полосу $1-65 попадали скины,
+    # которые на рынке стоят $20, и живая проверка тратилась на них зря.
+    snapshot, _ = await steam_snapshot.current()
+
+    band: list[tuple[str, float, float | None, float | None]] = []
+    skipped_quiet = skipped_jumpy = skipped_young = skipped_mismatch = 0
+    from_snapshot = 0
     for name, sp in details.items():
-        # Берём именно суточное окно, а не sp.price: наличие last_24h само по
-        # себе означает, что сделки сегодня были. Это единственный признак
-        # ликвидности, доступный бесплатно.
-        price = sp.windows.get("last_24h")
-        if price is None:
+        # Наличие суточного окна само по себе значит, что сделки сегодня были.
+        # Это единственный признак ликвидности, доступный бесплатно.
+        day = sp.windows.get("last_24h")
+        if day is None:
             skipped_quiet += 1
             continue
+        now_cents = snapshot.price_cents(name) if snapshot else None
+        price = now_cents / 100 if now_cents else day
         if not (low <= price <= high):
             continue
         # Стабильность за месяц, а не сутки против недели: ордер исполнится
@@ -7335,7 +7368,16 @@ async def _order_candidates_from_catalog(chat_id: int, limits: dict) -> list[_Or
         if spread > max_spread:
             skipped_jumpy += 1
             continue
-        band.append((name, price, spread))
+        month_avg = sp.windows.get("last_30d")
+        if now_cents and month_avg and not (
+            buy_orders.HISTORY_RATIO_MIN <= price / month_avg <= buy_orders.HISTORY_RATIO_MAX
+        ):
+            # Средние ровные, но сама цена из них выбивается — значит, средние
+            # описывают чужие дорогие (или дешёвые) сделки, а не этот рынок.
+            skipped_mismatch += 1
+            continue
+        from_snapshot += 1 if now_cents else 0
+        band.append((name, price, spread, month_avg))
 
     if not band:
         return []
@@ -7363,9 +7405,10 @@ async def _order_candidates_from_catalog(chat_id: int, limits: dict) -> list[_Or
     log.info(
         "orders: каталог — в полосе $%g-$%g подходят %d предмет(ов) "
         "(пропущено: %d без сделок за сутки, %d без истории за месяц, "
-        "%d с ценой, гуляющей за месяц больше %g%%). Беру %d начиная с %d",
+        "%d с ценой, гуляющей за месяц больше %g%%, %d с историей, не сходящейся с "
+        "ценой). Цена из снимка Steam у %d. Беру %d начиная с %d",
         low, high, len(band), skipped_quiet, skipped_young, skipped_jumpy,
-        max_spread, len(window), cursor,
+        max_spread, skipped_mismatch, from_snapshot, len(window), cursor,
     )
 
     return [
@@ -7378,8 +7421,9 @@ async def _order_candidates_from_catalog(chat_id: int, limits: dict) -> list[_Or
             volume_per_day=None,
             spread_pct=spread,
             source="каталог",
+            month_avg_cents=int(round(month_avg * 100)) if month_avg else None,
         )
-        for name, price, spread in window
+        for name, price, spread, month_avg in window
     ]
 
 
@@ -7849,6 +7893,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ask_cents=cand.csfloat_ask_cents,
                 max_spread_pct=limits["stability"],
                 require_spread=True,
+                month_avg_cents=cand.month_avg_cents,
             )
             if plan is None:
                 refused.append((cand.market_hash_name, why))
@@ -7858,7 +7903,18 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     verified_by_name = {c.market_hash_name: c.steam_verified for c in ranked}
     checked = sum(1 for c in ranked if c.steam_verified)
 
-    lines = ["<b>План ордеров</b> — пока ничего не поставлено", ""]
+    lines = ["<b>План ордеров</b> — пока ничего не поставлено"]
+    snapshot, snapshot_note = await steam_snapshot.current()
+    if snapshot is not None:
+        lines.append(f"<i>Отбор по ценам Steam: {html_module.escape(snapshot.describe())}</i>")
+    elif snapshot_note:
+        lines.append(f"⚠️ <i>{html_module.escape(snapshot_note)}</i>")
+    else:
+        lines.append(
+            "<i>Снимка цен Steam нет — отбор по средним прайс-листа (обычно на "
+            "треть выше рынка). Как загрузить: /steamprices</i>"
+        )
+    lines.append("")
     # ЧТО ЗНАЧИТ «ЗАЯВКА ДОСТАЁТ ДО РЫНКА».
     #
     # Смысл ордера — купить дешевле, чем просят сейчас, и подождать. Но ждать
@@ -7913,6 +7969,14 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{mark} ${plan.steam_price_cents / 100:.2f}{when} · "
                 f"прибыль <b>{plan.profit_pct:.0f}%</b> · {rival}"
             )
+            # Стабильность — у каждой строки: план без неё не попадает в отчёт
+            # вовсе (buy_orders.plan отказывает), и человеку важно видеть,
+            # насколько ровно держится цена, а не только что она «прошла».
+            if cand.spread_pct is not None:
+                lines.append(
+                    f"  📊 цена за месяц ровная: разброс {cand.spread_pct:.0f}% "
+                    f"(порог {limits['stability']:g}%)"
+                )
             if cand.steam_ask_cents:
                 lines.append(
                     f"  ℹ️ нижний лот в Steam ${cand.steam_ask_cents / 100:.2f}, но "
@@ -9124,6 +9188,96 @@ async def _absorb_names_file(update, context, filename: str, names: list[str]) -
     await handler(update, context)
 
 
+async def _snapshot_stability(chat_id: int, snapshot) -> tuple[dict[str, int], float]:
+    """Сколько скинов снимка стабильны за месяц по порогу чата — и сам порог."""
+    saved = await get_order_settings(chat_id)
+    threshold = (saved.get("max_month_spread")
+                 if saved.get("max_month_spread") is not None
+                 else buy_orders.DEFAULT_MAX_MONTH_SPREAD_PCT)
+    details = await get_csgotrader_price_details() or {}
+    counts = {"стабильных": 0, "гуляют": 0, "история не сходится с ценой": 0,
+              "нет истории за месяц": 0}
+    for name, (cents, _) in snapshot.prices.items():
+        sp = details.get(name)
+        spread = sp.month_spread_pct if sp else None
+        month_avg = sp.windows.get("last_30d") if sp else None
+        if spread is None:
+            counts["нет истории за месяц"] += 1
+        elif month_avg and not (buy_orders.HISTORY_RATIO_MIN <= cents / 100 / month_avg
+                                <= buy_orders.HISTORY_RATIO_MAX):
+            counts["история не сходится с ценой"] += 1
+        elif spread <= threshold:
+            counts["стабильных"] += 1
+        else:
+            counts["гуляют"] += 1
+    return counts, threshold
+
+
+def _snapshot_lines(snapshot, counts: dict[str, int], threshold: float) -> list[str]:
+    usable = snapshot.age_hours() <= steam_snapshot.MAX_AGE_HOURS
+    lines = [
+        f"• {html_module.escape(snapshot.describe())}",
+        f"• стабильность за месяц (разброс средних за сутки, неделю и месяц до "
+        f"{threshold:g}%): " + ", ".join(f"{k} {v}" for k, v in counts.items()),
+    ]
+    if usable:
+        lines.append(
+            "• /orders выбирает кандидатов по этим ценам; перед постановкой "
+            "цена всё равно проверяется живым запросом к Steam"
+        )
+        lines.append(
+            f"• годится ещё {steam_snapshot.MAX_AGE_HOURS - snapshot.age_hours():.0f} ч, "
+            "потом бот вернётся к прайс-листу и напомнит"
+        )
+    else:
+        lines.append(
+            f"⚠️ старше {steam_snapshot.MAX_AGE_HOURS:.0f} ч — для отбора не "
+            "используется. Пришли свежий файл"
+        )
+    return lines
+
+
+async def _absorb_steam_snapshot(update, snapshot) -> None:
+    """Принять присланный снимок цен Steam и сказать, что в нём."""
+    chat_id = update.effective_chat.id
+    try:
+        await steam_snapshot.save(snapshot)
+    except StorageUnavailable as e:
+        await update.message.reply_text(
+            f"⚠️ Файл прочитан ({len(snapshot.prices)} цен), но не сохранён: "
+            f"{scan_errors.scrub(str(e))}. Попробуй прислать ещё раз."
+        )
+        return
+    counts, threshold = await _snapshot_stability(chat_id, snapshot)
+    await update.message.reply_text(
+        "\n".join(["✅ <b>Принял снимок цен Steam</b>"]
+                  + _snapshot_lines(snapshot, counts, threshold)),
+        parse_mode="HTML",
+    )
+
+
+async def steamprices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/steamprices — какой снимок цен Steam у бота и насколько он свежий."""
+    chat_id = update.effective_chat.id
+    snapshot = await steam_snapshot.latest()
+    if snapshot is None:
+        await update.message.reply_text(
+            "Снимка цен Steam нет — /orders отбирает кандидатов по средним "
+            "прайс-листа, а они обычно на треть выше рынка.\n\n"
+            "Как загрузить: перешли сюда файл cs2_skins_steam_prices_history.csv "
+            "(полный, со всеми скинами). Бот сам посчитает стабильность цен "
+            "за месяц по каждому."
+        )
+        return
+    counts, threshold = await _snapshot_stability(chat_id, snapshot)
+    await update.message.reply_text(
+        "\n".join(["<b>Снимок цен Steam</b>"]
+                  + _snapshot_lines(snapshot, counts, threshold)
+                  + ["", "Обновить: перешли свежий cs2_skins_steam_prices_history.csv"]),
+        parse_mode="HTML",
+    )
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     document = update.message.document
@@ -9173,6 +9327,21 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if text is None:
                 raise ValueError("не удалось определить кодировку файла")
             text = text.strip()
+
+        # Снимок цен Steam (cs2_skins_steam_prices_history.csv/.json) — ДО
+        # разбора списка имён. В строках снимка есть «|», и разбор списка
+        # принял бы пятнадцать тысяч строк цен за предметы для вотчлиста.
+        if not is_pdf:
+            try:
+                snapshot = steam_snapshot.parse(text)
+            except steam_snapshot.SnapshotError as e:
+                await update.message.reply_text(
+                    f"Похоже на файл цен Steam, но принять его не могу: {e}"
+                )
+                return
+            if snapshot is not None:
+                await _absorb_steam_snapshot(update, snapshot)
+                return
 
         # Список имён — это не JSON, и разбирать его как JSON не надо.
         #
@@ -10944,6 +11113,13 @@ COMMANDS: tuple[Command, ...] = (
         "/cancelorders — снять все ботовые ордера (с подтверждением)\n"
         "/cancelorders 2 — снять второй из последнего /myorders\n"
         "/cancelorders все — снять вообще все, и ручные (с подтверждением)",
+    ),
+    Command(
+        "steamprices", steamprices, "Ордера CSFloat",
+        "Снимок цен Steam",
+        "/steamprices — какой снимок цен Steam у бота, насколько свежий и "
+        "сколько скинов в нём стабильны за месяц. Обновить: переслать боту "
+        "файл cs2_skins_steam_prices_history.csv.",
     ),
     Command(
         "orderbudget", orderbudget, "Ордера CSFloat",
