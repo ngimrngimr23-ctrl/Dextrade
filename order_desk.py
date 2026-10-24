@@ -266,6 +266,26 @@ async def _find_new_order(
     return None
 
 
+async def _book(
+    session: aiohttp.ClientSession, name: str, listing_id: str | None,
+) -> list | None:
+    """
+    Стакан предмета: по имени (номер лота не нужен), а если ручка по имени не
+    ответила — по номеру лота. None — не прочитан.
+
+    Маршрут до CSFloat закрыт — тоже None: здесь, в отличие от /orders, нет
+    очереди из тридцати предметов, которую надо было бы остановить.
+    """
+    try:
+        book = await csfloat_client.order_book_by_name(session, name)
+    except (CSFloatError, CSFloatRateLimited) as e:
+        log.info("orders: стакан «%s» не прочитан — %s", name, _reason(e))
+        return None
+    if book is None and listing_id:
+        book = await csfloat_client.order_book(session, listing_id)
+    return book
+
+
 async def _price_now(
     session: aiohttp.ClientSession, t: Ticket,
 ) -> tuple[int | None, str]:
@@ -284,9 +304,9 @@ async def _price_now(
 
     Мгновенные планы не трогаем: их цена — витрина CSFloat, а не стакан.
     """
-    if t.instant or not t.listing_id:
+    if t.instant:
         return t.price_cents, ""
-    book = await csfloat_client.order_book(session, t.listing_id)
+    book = await _book(session, t.market_hash_name, t.listing_id)
     if book is None:
         return t.price_cents, "стакан перед постановкой не прочитан — ставлю по плану"
     rivals = [b.price_cents for b in book if not b.conditional]
@@ -590,10 +610,8 @@ async def _maintain(
                 name = entry.get("name") or order.market_hash_name or "?"
                 now = time.time()
 
-                book = None
                 listing_id = entry.get("listing_id")
-                if listing_id:
-                    book = await csfloat_client.order_book(session, listing_id)
+                book = await _book(session, name, listing_id)
                 if book is None:
                     # Лот, по которому читали стакан, мог уйти — ищем другой
                     # по имени. Это /listings, то есть через прокси.

@@ -1606,6 +1606,27 @@ MY_ORDERS_MAX_PAGES = 10
 # Потолок количества в одном ордере (интерфейс CSFloat: «Max 250»).
 MAX_ORDER_QTY = 250
 
+# Пауза прямого маршрута после 429 «по адресу» (не по квоте).
+#
+# Такой отказ значит, что CSFloat закрыл адрес Render, и каждый новый запрос
+# с него закрытие только продлевает. 2026-10-24 /orders спросил историю
+# продаж у тридцати предметов подряд, по секунде на каждый, — все тридцать
+# получили 429. Отдельно для запросов с ключом и без: анонимную историю
+# продаж CSFloat может резать по адресу, не трогая ручки с ключом.
+DIRECT_PAUSE_AFTER_429_SECONDS = envcfg.env_int("CSFLOAT_DIRECT_PAUSE_SECONDS", 300)
+_direct_paused_until: dict[bool, float] = {False: 0.0, True: 0.0}
+
+# Стакан по имени предмета — тем же запросом, каким его показывает сам сайт
+# CSFloat в окне создания ордера (main-*.js, getSimilarOrders: POST
+# buy-orders/similar-orders, limit=10). Лимит берём тот же, что у сайта:
+# больший сервер может и не принять.
+SIMILAR_ORDERS_LIMIT = 10
+# Если ручка отвечает «нет такой» или «нельзя», спрашивать её на каждом
+# предмете бессмысленно — на несколько часов возвращаемся к стакану по лоту.
+NAME_BOOK_PAUSE_SECONDS = envcfg.env_int("CSFLOAT_NAME_BOOK_PAUSE_MIN", 360) * 60
+_name_book_paused_until = 0.0
+_name_book_refusal = ""
+
 # Остаток лимита авторизованных ручек — ОТДЕЛЬНО от /listings.
 #
 # Общий ли у них счётчик с поиском лотов, неизвестно. Если не общий, запись в
@@ -1706,6 +1727,14 @@ def _is_conditional(row: dict) -> bool:
         lowered = key.lower()
         if any(marker in lowered for marker in _FILTER_MARKERS):
             return True
+    # Новый интерфейс складывает фильтры во вложенный hybrid_properties
+    # (min_float, paint_seeds, applied_stickers…) — так их читает сам сайт
+    # (main-*.js, fromOrder). У простого ордера он пустой или из пустых полей.
+    hybrid = row.get("hybrid_properties")
+    if isinstance(hybrid, dict) and any(
+        value not in (None, "", [], {}, False) for value in hybrid.values()
+    ):
+        return True
     return bool(row.get("expression")) and not row.get("market_hash_name")
 
 
@@ -1844,13 +1873,27 @@ async def _authed(
     # (история продаж), и повторное кодирование превратило бы %20 в %2520 —
     # на этом уже обжигались в steam_client.
     url = yarl.URL(f"{CSFLOAT_BASE_URL}{path}", encoded=True)
-    routes: list[str | None] = [None]
+    routes: list[str | None] = []
+    # Что случилось на каждом маршруте — в итоговую ошибку идут все, а не
+    # последний: «прокси отказал» без «а прямой получил 429» прячет главное.
+    problems: list[str] = []
+    # Прямой адрес на паузе после 429 — не трогаем его, но в итоговой ошибке
+    # говорим об этом: «прокси отказал» без этой оговорки читается так,
+    # будто прямой адрес пробовали и он цел.
+    direct_note = ""
+    paused = _direct_paused_until[anonymous] - time.time()
+    if paused > 0:
+        direct_note = (
+            f"прямой адрес CSFloat закрыл (429), пауза ещё "
+            f"{max(1, round(paused / 60))} мин"
+        )
+    else:
+        routes.append(None)
     if CSFLOAT_POOL.enabled():
         backup = lane_address()
         if backup:
             routes.append(backup)
 
-    last_problem = "не пробовали"
     for proxy in routes:
         label = "прямой адрес" if proxy is None else f"прокси {mask_proxy(proxy)}"
         await _throttle_all(proxy)
@@ -1869,18 +1912,18 @@ async def _authed(
         except (aiohttp.ClientHttpProxyError, aiohttp.ClientConnectorError) as e:
             # До CSFloat запрос не дошёл: отказал прокси или не открылось
             # соединение. Повтор другим маршрутом безопасен даже для POST.
-            last_problem = f"{label}: {type(e).__name__}"
+            problems.append(f"{label}: {type(e).__name__}")
             log.info("csfloat: %s %s не дошёл через %s (%s)",
                      method, path, label, scrub(str(e))[:160])
             continue
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            last_problem = f"{label}: {type(e).__name__} {scrub(str(e))[:120]}"
+            problems.append(f"{label}: {type(e).__name__} {scrub(str(e))[:120]}")
             if not repeatable:
                 raise CSFloatUnknownOutcome(
                     f"CSFloat не ответил на {method} {path} "
                     f"({type(e).__name__}) — запрос мог пройти"
                 ) from None
-            log.info("csfloat: %s %s оборвался — %s", method, path, last_problem)
+            log.info("csfloat: %s %s оборвался — %s", method, path, problems[-1])
             continue
 
         _note_orders_budget(headers)
@@ -1901,11 +1944,23 @@ async def _authed(
                 )
             # Отказ по репутации адреса: запрос не обработан, другой маршрут
             # может пройти — и для POST тоже.
-            last_problem = f"{label}: 429 {_api_message(data)[:120]}"
-            log.info("csfloat: %s %s — 429 по адресу через %s", method, path, label)
+            message = _api_message(data)[:160]
+            problems.append(f"{label}: 429 {message}".rstrip())
+            if proxy is None:
+                _direct_paused_until[anonymous] = time.time() + DIRECT_PAUSE_AFTER_429_SECONDS
+                log.warning(
+                    "csfloat: %s %s — 429 по адресу через прямой адрес (%s); "
+                    "прямой маршрут%s на паузе %d мин",
+                    method, path, message or "без текста",
+                    " без ключа" if anonymous else "",
+                    DIRECT_PAUSE_AFTER_429_SECONDS // 60,
+                )
+            else:
+                log.info("csfloat: %s %s — 429 по адресу через %s (%s)",
+                         method, path, label, message or "без текста")
             continue
         if status in (502, 503, 504) and repeatable:
-            last_problem = f"{label}: HTTP {status}"
+            problems.append(f"{label}: HTTP {status}")
             continue
         if status == 403 and not isinstance(data, dict):
             # 403 не JSON-ом — это страница-заглушка Cloudflare перед адресом,
@@ -1913,7 +1968,7 @@ async def _authed(
             # CSFloat такой запрос не дошёл, поэтому запасной маршрут
             # безопасен и для постановки. Прежний buy_orders_for уходил на
             # прокси на любом не-200, и терять это нельзя.
-            last_problem = f"{label}: HTTP 403 не от CSFloat"
+            problems.append(f"{label}: HTTP 403 не от CSFloat")
             log.info("csfloat: %s %s — 403-заглушка через %s", method, path, label)
             continue
         log.info(
@@ -1922,7 +1977,11 @@ async def _authed(
         )
         return status, data
 
-    raise CSFloatError(f"CSFloat недоступен ни одним маршрутом ({last_problem})")
+    if direct_note:
+        problems.insert(0, direct_note)
+    raise CSFloatError(
+        f"CSFloat недоступен ни одним маршрутом ({'; '.join(problems) or 'не пробовали'})"
+    )
 
 
 def _refusal(status: int, data, what: str) -> CSFloatError:
@@ -2101,16 +2160,16 @@ async def account_balance(session: aiohttp.ClientSession) -> int | None:
     return int(balance)
 
 
-def _parse_book(data) -> list[BookOrder] | None:
+def _parse_book(data, kind: str = "стакан") -> list[BookOrder] | None:
     """Стакан из ответа. None — ответ не понят (это «не прочитан», а не «пуст»)."""
     try:
         rows, _ = _rows(data, "orders", "data", "items")
     except _UnknownShape as e:
-        log.warning("csfloat: стакан — %s", e)
+        log.warning("csfloat: %s — %s", kind, e)
         return None
     out: list[BookOrder] = []
     for row in rows:
-        _log_shape("стакан", row)
+        _log_shape(kind, row)
         price = _cents_int(row.get("price", row.get("max_price")))
         if price is None:
             continue
@@ -2123,10 +2182,79 @@ def _parse_book(data) -> list[BookOrder] | None:
             conditional=_is_conditional(row),
         ))
     if rows and not out:
-        log.warning("csfloat: стакан — ни одной цены в строках с полями %s",
-                    sorted(rows[0].keys()))
+        log.warning("csfloat: %s — ни одной цены в строках с полями %s",
+                    kind, sorted(rows[0].keys()))
         return None
     return out
+
+
+def direct_pause_remaining(anonymous: bool = False) -> float:
+    """Сколько ещё прямой маршрут на паузе после 429 по адресу (0 — не на паузе)."""
+    return max(0.0, _direct_paused_until[anonymous] - time.time())
+
+
+def name_book_note() -> str | None:
+    """Почему стакан по имени сейчас не спрашиваем. None — спрашиваем."""
+    if time.time() < _name_book_paused_until:
+        return _name_book_refusal
+    return None
+
+
+async def order_book_by_name(
+    session: aiohttp.ClientSession, market_hash_name: str,
+    *, limit: int = SIMILAR_ORDERS_LIMIT,
+) -> list[BookOrder] | None:
+    """
+    Стакан ордеров на покупку по ИМЕНИ предмета — без номера лота.
+
+    Зачем. Ручка стакана по лоту (/listings/<id>/buy-orders) требует номер
+    лота, а номер брался из поиска /listings. Поиск же живёт только через
+    прокси, и когда их провайдер отказывает (2026-10-24: 403 на каждом
+    логине), /orders не читал ни одного стакана. Запасной путь через историю
+    продаж CSFloat тоже упёрся: адрес Render получил 429 и на ней.
+
+    Сам сайт CSFloat в окне создания ордера показывает чужие ордера на
+    предмет, не зная никакого лота: POST buy-orders/similar-orders с
+    {market_hash_name, hybrid_properties} (main-*.js, getSimilarOrders).
+    Простому ордеру на имя фильтры не нужны — hybrid_properties пустой, ровно
+    как у сайта, когда фильтры не выбраны. Ручка с ключом, а такие с адреса
+    Render отвечают (/me, /me/buy-orders — замер 2026-09-15).
+
+    None — ручка ответила не так: отказ, непонятный ответ. Тогда стакан
+    читается по номеру лота, как раньше. Исключение (CSFloatError,
+    CSFloatRateLimited) — до CSFloat не достучаться ни одним маршрутом: по
+    нему вызывающий понимает, что спрашивать дальше бесполезно.
+    """
+    global _name_book_paused_until, _name_book_refusal
+    if name_book_note() is not None:
+        return None
+    status, data = await _authed(
+        session, "POST", "/buy-orders/similar-orders",
+        params={"limit": str(limit)},
+        body={"market_hash_name": market_hash_name, "hybrid_properties": {}},
+    )
+    if status != 200:
+        message = _api_message(data)[:160] or "без текста"
+        if status in (401, 403, 404, 405):
+            # Ручки нет или она не для ключа — это про ручку, а не про
+            # предмет, и на следующем предмете ответ будет тем же.
+            _name_book_paused_until = time.time() + NAME_BOOK_PAUSE_SECONDS
+            _name_book_refusal = f"HTTP {status}: {message}"
+            log.warning(
+                "csfloat: стакан по имени не дают (%s) — %d ч читаю стакан "
+                "по номеру лота", _name_book_refusal, NAME_BOOK_PAUSE_SECONDS // 3600,
+            )
+        else:
+            log.info("csfloat: стакан по имени «%s» — HTTP %s: %s",
+                     market_hash_name, status, message)
+        return None
+    book = _parse_book(data, "стакан по имени")
+    if book is not None:
+        log.info(
+            "csfloat: стакан по имени «%s» — ордеров %d, из них простых %d",
+            market_hash_name, len(book), sum(1 for o in book if not o.conditional),
+        )
+    return book
 
 
 async def order_book(

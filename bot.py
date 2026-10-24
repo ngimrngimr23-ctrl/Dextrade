@@ -182,6 +182,7 @@ import csfloat_client
 import market_prices
 import menu
 import order_desk
+import steam_history
 import steam_snapshot
 import pricing
 import dips
@@ -5614,10 +5615,11 @@ async def _dips_scan_body(send, chat_id: int, saved: dict, *, quiet: bool = Fals
         # выдавать ширину стакана за скидку: ~13% даром на каждом предмете
         # (см. LiveQuote). Заявка остаётся ценой покупки, но не мерой дешевизны.
         #
-        # Медиана есть только у priceoverview. Когда он на кулдауне, цена
-        # приходит запасным путём из листингов (pricing._lowest_price_from_listings),
-        # и там ни медианы, ни объёма — то есть проверить нечем ровно так же,
-        # как если бы ответа не было вовсе. Поэтому и ведём себя так же, как в
+        # Медиана есть у priceoverview и у страницы предмета (steam_history,
+        # первый запасной путь). Когда недоступны оба, цена приходит из
+        # листингов (pricing._lowest_price_from_listings), и там ни медианы,
+        # ни объёма — то есть проверить нечем ровно так же, как если бы ответа
+        # не было вовсе. Поэтому и ведём себя так же, как в
         # ветке выше: с включённым фильтром молчим, с выключенным показываем
         # оценку. Раньше эта ветка отвергала находку безусловно, и выключенный
         # фильтр не спасал — непоследовательность, из-за которой команда
@@ -6788,6 +6790,7 @@ _SCOPE_NAMES = {
     "listings": "листинги — вотчлист, /scan, /scanall",
     "pricing": "цены — арбитраж, /dips, /markets",
     "inventory": "инвентарь — /inv",
+    "history": "страница предмета — объём продаж и стабильность для /orders",
 }
 
 # Приписка к сообщениям об отказе из-за кулдауна. Одной строкой и в одном
@@ -7074,6 +7077,115 @@ class _OrderCandidate(NamedTuple):
     # csfloat_client.recent_sale_listing_id). Цены витрины у такого
     # кандидата нет, и ссылку «лот» показывать незачем — он продан.
     listing_sold: bool = False
+    # СДЕЛКИ STEAM СО СТРАНИЦЫ ПРЕДМЕТА (steam_history) — см. _with_history.
+    # Продано за последние 7 дней: настоящий недельный объём, а не суточный ×7.
+    sold_week: int | None = None
+    # История сделок прочитана — тогда стабильность считается по ней, а не по
+    # средним прайс-листа.
+    history: bool = False
+    # Разброс медиан сделок по четырём неделям, %. None при history=True —
+    # была неделя без продаж.
+    history_spread_pct: float | None = None
+    # Медианы сделок по неделям в долларах, от последней к ранним, — для
+    # отчёта. Пусто, если график не в долларах.
+    history_weeks_usd: tuple = ()
+    # Цену Steam срезала медиана сделок за НЕДЕЛЮ (а не за сутки).
+    steam_cut_by_week: bool = False
+
+
+def _with_history(c: _OrderCandidate, page) -> _OrderCandidate:
+    """
+    Кандидат с объёмом и стабильностью по сделкам Steam (steam_history.ItemPage).
+
+    Что меняется:
+      • sold_week — продано за 7 дней; buy_orders.plan берёт его вместо
+        суточного объёма ×7;
+      • стабильность — разброс медиан сделок по четырём неделям вместо
+        разброса средних прайс-листа: в средних одна продажа с дорогими
+        наклейками задирает цену вдвое, медиана её не замечает;
+      • средняя за месяц для сверки «история сходится с ценой» — медиана
+        сделок за четыре недели; график не в долларах — сверки нет, сравнивать
+        доллары не с чем;
+      • цена Steam — не выше медианы сделок за неделю: одинокий нижний лот не
+        должен поднимать потолок ордера (то же правило, что с медианой за
+        сутки, см. buy_orders.steam_sale_cents).
+    """
+    if page is None or not page.has_history:
+        return c
+    changes: dict = dict(
+        sold_week=page.sold(7),
+        history=True,
+        history_spread_pct=page.month_spread_pct(),
+        month_avg_cents=None,
+    )
+    if page.history_usd:
+        changes["history_weeks_usd"] = tuple(page.weekly_medians())
+        month = page.median(28)
+        if month:
+            changes["month_avg_cents"] = int(round(month * 100))
+        week = page.median(7)
+        if week and c.steam_verified:
+            week_cents = int(round(week * 100))
+            if 0 < week_cents < c.steam_price_cents:
+                changes["steam_ask_cents"] = c.steam_ask_cents or c.steam_price_cents
+                changes["steam_price_cents"] = week_cents
+                changes["steam_cut_by_week"] = True
+    return c._replace(**changes)
+
+
+async def _steam_histories(names: list[str]) -> dict:
+    """
+    Страницы предметов с историей сделок — для финалистов /orders.
+
+    Почти всегда без запроса: финалистам цену только что брали с этой же
+    страницы (pricing.get_steam_market_price_retrying), и она лежит в памяти
+    steam_history. Запрос уходит лишь за теми, чья цена пришла из
+    priceoverview или кэша.
+    """
+    pages = {}
+    for name in names:
+        page = await steam_history.fetch(name)
+        if page is not None:
+            pages[name] = page
+    wait = steam_cooldown_remaining(scope=steam_history.SCOPE)
+    log.info(
+        "orders: история сделок Steam прочитана у %d из %d финалист(ов)%s",
+        len(pages), len(names),
+        f", страница предмета на паузе ещё {wait / 60:.0f} мин" if wait > 0 else "",
+    )
+    return pages
+
+
+def _plan_inputs(cand: _OrderCandidate, limits: dict) -> dict:
+    """
+    Всё, что buy_orders.plan берёт у Steam и из настроек, — без стакана.
+
+    Объём — продано за 7 дней по сделкам Steam, а если их не прочитали —
+    суточный объём, переведённый в недельный тем же способом, что и /dips.
+    Стабильность — по сделкам, если они есть (см. _with_history).
+    """
+    weekly = cand.sold_week
+    if weekly is None and cand.volume_per_day is not None:
+        weekly = cand.volume_per_day * 7
+    inputs = dict(
+        steam_price_cents=cand.steam_price_cents,
+        volume_per_week=weekly,
+        spread_pct=cand.spread_pct,
+        min_profit_pct=limits["profit"],
+        min_volume_per_week=limits["volume"],
+        max_order_usd=limits["high"],
+        max_spread_pct=limits["stability"],
+        require_spread=True,
+        month_avg_cents=cand.month_avg_cents,
+    )
+    if cand.history:
+        inputs.update(
+            spread_pct=cand.history_spread_pct,
+            spread_basis="медианы сделок Steam по неделям",
+            unknown_spread_reason=buy_orders.HISTORY_GAP,
+            month_label="медиана сделок Steam за 4 недели",
+        )
+    return inputs
 
 
 async def _order_candidates_from_arb(
@@ -7790,6 +7902,21 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
              f"самый старый {max(ages) / 3600:.1f} ч") if ages else "замеров нет",
         )
 
+        # СДЕЛКИ STEAM ЗА МЕСЯЦ — недельный объём и стабильность по неделям.
+        #
+        # Обе вещи до сих пор были оценками: объём — суточный из priceoverview
+        # ×7, стабильность — разброс средних прайс-листа за сутки, неделю и
+        # месяц. Страница предмета отдаёт сами сделки Steam за месяц (см.
+        # steam_history), и по ним видно и сколько продано за неделю, и как
+        # держалась цена каждую из четырёх недель.
+        #
+        # Только у финалистов со свежей ценой Steam: остальных ставить всё
+        # равно нельзя (см. «что из планов можно ставить» ниже).
+        pages = await _steam_histories(
+            [c.market_hash_name for c in ranked if c.steam_verified]
+        )
+        ranked = [_with_history(c, pages.get(c.market_hash_name)) for c in ranked]
+
     plans: list[tuple[_OrderCandidate, buy_orders.OrderPlan]] = []
     refused: list[tuple[str, str]] = []
     # Предметы, у которых стакан прочитать не вышло. Ордер по ним считается —
@@ -7803,52 +7930,24 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # прогон 2026-09-15 выдал восемь одинаковых абзацев отказа на пол-экрана,
     # потратив на них по восемь попыток каждый. Одного ответа достаточно:
     # если дверь закрыта, она закрыта для всех десяти предметов.
+    #
+    # route_down — про поиск лотов (/listings), book_down — про ручки с
+    # ключом, через которые читается стакан. Это разные двери: поиск с адреса
+    # Render CSFloat не пускает никогда, а ручки с ключом — пускают.
     route_down: str | None = None
-    # Скольким кандидатам стакан прочитан по номеру последней продажи.
+    book_down: str | None = None
+    # История продаж CSFloat (номер проданного лота) — без ключа, и CSFloat
+    # режет её по адресу отдельно от ручек с ключом.
+    sale_down = False
+    # Скольким кандидатам стакан прочитан по имени предмета и по номеру
+    # последней продажи.
+    via_name = 0
     via_sale = 0
+    # Сколько кандидатов прошли всё, что от CSFloat не зависит.
+    passed = 0
 
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
         for cand in ranked:
-            listing_id = cand.listing_id
-            if listing_id is None and route_down is None:
-                try:
-                    # САМЫЙ ДЕШЁВЫЙ лот, а не самый свежий. По умолчанию
-                    # поиск сортирует по новизне, и «на CSFloat просят $X»
-                    # показывало цену случайного лота — а по ней решается,
-                    # достаёт ли заявка до рынка и не купит ли она лот сразу.
-                    lots, _ = await csfloat_client.fetch_listings_page(
-                        session, limit=1, sort_by="lowest_price",
-                        market_hash_name=cand.market_hash_name,
-                    )
-                except (CSFloatRateLimited, CSFloatError) as e:
-                    route_down = scan_errors.reason(e)
-                    log.info(
-                        "orders: CSFloat не отвечает (%s) — дальше считаю без стаканов",
-                        route_down,
-                    )
-                else:
-                    if lots:
-                        listing_id = lots[0].listing_id
-                        # Тот же запрос отдаёт и цену продавца — берём, она
-                        # решает, исполнима ли заявка вообще.
-                        cand = cand._replace(
-                            csfloat_ask_cents=int(round(lots[0].price * 100))
-                        )
-            if listing_id is None:
-                # Поиск закрыт (прокси отказывают, прямой адрес CSFloat не
-                # пускает) или лотов сейчас нет. Стакан нужен про ПРЕДМЕТ, а
-                # не про лот, — берём номер последней продажи из истории: эта
-                # ручка публичная и с адреса Render открыта.
-                sold_id = await csfloat_client.recent_sale_listing_id(
-                    session, cand.market_hash_name,
-                )
-                if sold_id:
-                    listing_id = sold_id
-                    cand = cand._replace(listing_sold=True)
-                    via_sale += 1
-                elif route_down is None:
-                    blind[cand.market_hash_name] = "на CSFloat ни лотов, ни продаж"
-
             # Два независимых источника цены Steam разошлись — считать по
             # такой цене прибыль нельзя.
             #
@@ -7879,40 +7978,113 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ))
                 continue
 
-            if listing_id is None:
-                # Стакан недоступен, но план от него не зависит: потолок цены
+            # СНАЧАЛА ВСЁ, ЧТО ОТ CSFLOAT НЕ ЗАВИСИТ.
+            #
+            # Объём, стабильность и прибыль считаются по Steam, а стакан меняет
+            # только цену: без него план встаёт по потолку, с ним — на шаг выше
+            # соперника. Значит, кто не проходит без стакана, не пройдёт и со
+            # стаканом, и спрашивать про него CSFloat незачем. Раньше
+            # спрашивали: 2026-10-24 тридцать кандидатов с неизвестным объёмом
+            # потратили по запросу истории продаж каждый, и адрес бота получил
+            # 429 на всех тридцати.
+            inputs = _plan_inputs(cand, limits)
+            draft, why = buy_orders.plan(
+                cand.market_hash_name, ask_cents=cand.csfloat_ask_cents, **inputs,
+            )
+            if draft is None:
+                refused.append((cand.market_hash_name, why))
+                continue
+            passed += 1
+
+            listing_id = cand.listing_id
+            if listing_id is None and route_down is None:
+                try:
+                    # САМЫЙ ДЕШЁВЫЙ лот, а не самый свежий. По умолчанию
+                    # поиск сортирует по новизне, и «на CSFloat просят $X»
+                    # показывало цену случайного лота — а по ней решается,
+                    # достаёт ли заявка до рынка и не купит ли она лот сразу.
+                    lots, _ = await csfloat_client.fetch_listings_page(
+                        session, limit=1, sort_by="lowest_price",
+                        market_hash_name=cand.market_hash_name,
+                    )
+                except (CSFloatRateLimited, CSFloatError) as e:
+                    route_down = scan_errors.reason(e)
+                    log.info(
+                        "orders: поиск лотов CSFloat закрыт (%s) — цену витрины "
+                        "дальше не знаю", route_down,
+                    )
+                else:
+                    if lots:
+                        listing_id = lots[0].listing_id
+                        # Тот же запрос отдаёт и цену продавца — берём, она
+                        # решает, исполнима ли заявка вообще.
+                        cand = cand._replace(
+                            csfloat_ask_cents=int(round(lots[0].price * 100))
+                        )
+
+            # СТАКАН — сначала по имени предмета: номер лота для этого не
+            # нужен (см. csfloat_client.order_book_by_name), а значит, не
+            # нужен и поиск, который без прокси не работает.
+            rivals: list[int] | None = None
+            book_read = False
+            if book_down is None:
+                try:
+                    book = await csfloat_client.order_book_by_name(
+                        session, cand.market_hash_name,
+                    )
+                except (CSFloatRateLimited, CSFloatError) as e:
+                    book_down = scan_errors.reason(e)
+                    log.info(
+                        "orders: CSFloat не отвечает на ручки с ключом (%s) — "
+                        "дальше считаю без стаканов", book_down,
+                    )
+                else:
+                    if book is not None:
+                        rivals = [o.price_cents for o in book if not o.conditional]
+                        book_read = True
+                        via_name += 1
+
+            # Ручка по имени не ответила — по номеру лота, как раньше.
+            if not book_read and book_down is None:
+                if listing_id is None and not sale_down:
+                    # Поиск закрыт или лотов сейчас нет. Стакан нужен про
+                    # ПРЕДМЕТ, а не про лот, — годится и номер последней
+                    # продажи из истории.
+                    sold_id = await csfloat_client.recent_sale_listing_id(
+                        session, cand.market_hash_name,
+                    )
+                    if sold_id:
+                        listing_id = sold_id
+                        cand = cand._replace(listing_sold=True)
+                        via_sale += 1
+                    elif csfloat_client.direct_pause_remaining(anonymous=True) > 0:
+                        # Историю закрыли по адресу — у следующих предметов
+                        # ответ будет тем же, а каждый вопрос продлевает отказ.
+                        sale_down = True
+                    elif route_down is None:
+                        blind[cand.market_hash_name] = "на CSFloat ни лотов, ни продаж"
+                if listing_id is not None:
+                    rivals = await csfloat_client.buy_orders_for(session, listing_id)
+                    book_read = rivals is not None
+
+            if not book_read:
+                # Стакан не прочитан, но план от него не зависит: потолок цены
                 # считается от цены Steam и порога прибыли, а чужие ордера
-                # нужны лишь чтобы встать на шаг выше верхнего. Нет их —
-                # ставим по потолку, это самый выгодный из возможных ордеров.
+                # нужны лишь чтобы встать на шаг выше верхнего. Такой план —
+                # «столько мы готовы дать», и ставить его на деньги нельзя
+                # (см. «что из планов можно ставить» ниже).
+                #
+                # Раньше непрочитанный стакан молча превращался в пустой
+                # список — и отчёт писал «стакан пуст», то есть «перебивать
+                # некого», про стакан, которого никто не видел.
                 blind.setdefault(cand.market_hash_name, "стакан не прочитан")
                 rivals = None
-            else:
-                rivals = await csfloat_client.buy_orders_for(session, listing_id)
-                if rivals is None:
-                    # Лот есть, а стакан не отдали. Раньше это молча
-                    # превращалось в пустой список — и отчёт писал «стакан
-                    # пуст», то есть «перебивать некого», про стакан, которого
-                    # никто не видел. Для настоящей постановки это ордер по
-                    # потолку вслепую.
-                    blind[cand.market_hash_name] = "стакан не прочитан"
-            # Объём у нас суточный (окно last_24h прайс-листа), а порог
-            # недельный — переводим тем же способом, что и /dips.
-            weekly = (
-                None if cand.volume_per_day is None else cand.volume_per_day * 7
-            )
+
             plan, why = buy_orders.plan(
                 cand.market_hash_name,
-                steam_price_cents=cand.steam_price_cents,
-                volume_per_week=weekly,
-                spread_pct=cand.spread_pct,
                 rival_orders_cents=rivals,
-                min_profit_pct=limits["profit"],
-                min_volume_per_week=limits["volume"],
-                max_order_usd=limits["high"],
                 ask_cents=cand.csfloat_ask_cents,
-                max_spread_pct=limits["stability"],
-                require_spread=True,
-                month_avg_cents=cand.month_avg_cents,
+                **inputs,
             )
             if plan is None:
                 refused.append((cand.market_hash_name, why))
@@ -7991,15 +8163,29 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Стабильность — у каждой строки: план без неё не попадает в отчёт
             # вовсе (buy_orders.plan отказывает), и человеку важно видеть,
             # насколько ровно держится цена, а не только что она «прошла».
-            if cand.spread_pct is not None:
+            if cand.history and cand.history_spread_pct is not None:
+                # Медианы сделок по неделям — слева направо от ранней к
+                # последней, как читается график.
+                weeks = " → ".join(
+                    f"${w:.2f}" for w in reversed(cand.history_weeks_usd) if w
+                )
+                lines.append(
+                    f"  📊 цена за месяц ровная: разброс {cand.history_spread_pct:.0f}% "
+                    f"(порог {limits['stability']:g}%)"
+                    + (f", сделки Steam по неделям {weeks}" if weeks else "")
+                )
+            elif cand.spread_pct is not None:
                 lines.append(
                     f"  📊 цена за месяц ровная: разброс {cand.spread_pct:.0f}% "
-                    f"(порог {limits['stability']:g}%)"
+                    f"(порог {limits['stability']:g}%, по средним прайс-листа)"
                 )
+            if cand.sold_week is not None:
+                lines.append(f"  📦 в Steam продано за 7 дней: {cand.sold_week} шт")
             if cand.steam_ask_cents:
+                period = "неделю" if cand.steam_cut_by_week else "сутки"
                 lines.append(
                     f"  ℹ️ нижний лот в Steam ${cand.steam_ask_cents / 100:.2f}, но "
-                    f"сделки за сутки шли по ${plan.steam_price_cents / 100:.2f} — "
+                    f"сделки за {period} шли по ${plan.steam_price_cents / 100:.2f} — "
                     "считаю по сделкам"
                 )
             age = cand.volume_age_seconds
@@ -8035,7 +8221,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         lines.append("Ни одного ордера не поставил бы.")
 
-    if route_down:
+    if blind:
         # Сколько ИМЕННО кандидатов осталось без стакана, и отдельной строкой —
         # техническая причина.
         #
@@ -8044,42 +8230,53 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # стояли в предложении про стаканы — и читались как «134 кандидата, у
         # 126 нет стакана». Именно так это и прочли. Кандидатов в том прогоне
         # было восемь.
+        #
+        # Считаем только прошедших проверку Steam: остальным стакан не
+        # читали намеренно — им отказано раньше и по другой причине.
         lines.append("")
-        if via_sale:
-            lines.append(
-                f"✅ Поиск лотов закрыт, но у {via_sale} кандидат(ов) стакан "
-                "прочитан по истории продаж — их можно ставить."
-            )
         lines.append(
-            f"🟡 Стакан не прочитан у {len(blind)} из {len(ranked)} кандидат(ов) — "
-            "это «не знаем, кого перебивать», а НЕ «ордер плохой». Цена у них "
-            "стоит по потолку прибыли: столько мы готовы дать, а не столько "
-            "нужно, чтобы стоять первым."
+            f"🟡 Стакан не прочитан у {len(blind)} из {passed} кандидат(ов), "
+            "прошедших проверку Steam, — это «не знаем, кого перебивать», а НЕ "
+            "«ордер плохой». Цена у них стоит по потолку прибыли: столько мы "
+            "готовы дать, а не столько нужно, чтобы стоять первым."
         )
+        cause = book_down or route_down
+        if cause:
+            lines.append(f"<i>Причина: {html_module.escape(cause)}</i>")
+    if (via_name or via_sale) and route_down:
+        lines.append("")
         lines.append(
-            f"<i>Причина (про пул прокси, не про кандидатов): "
-            f"{html_module.escape(route_down)}</i>"
+            f"✅ Поиск лотов CSFloat закрыт, но стакан прочитан у "
+            f"{via_name + via_sale} кандидат(ов) — "
+            + ("по имени предмета" if via_name and not via_sale
+               else "по истории продаж" if via_sale and not via_name
+               else "по имени предмета и по истории продаж")
+            + ". Цену витрины CSFloat у них не знаю."
         )
 
-    # Объём продаж есть только у Steam priceoverview, а тот регулярно лежит под
-    # 429 — и тогда отказ «объём неизвестен» это новость про Steam, а не про
-    # предмет. Без этой строки человек читает её как «предмет неликвидный» и
-    # идёт крутить пороги, которые тут ни при чём.
+    # Объём продаж отдают только два места Steam — priceoverview и график
+    # сделок на странице предмета, — и оба бывают под 429. Тогда отказ «объём
+    # неизвестен» это новость про Steam, а не про предмет. Без этой строки
+    # человек читает её как «предмет неликвидный» и идёт крутить пороги,
+    # которые тут ни при чём. Пишем, что с каждым из двух, — иначе непонятно,
+    # ждать или нет.
     no_volume = sum(1 for _, why in refused if why == buy_orders.UNKNOWN_VOLUME)
     if no_volume:
+        waits = []
         wait = steam_cooldown_remaining(scope="pricing")
+        if wait > 0:
+            waits.append(f"priceoverview на паузе ещё {wait / 60:.0f} мин")
+        page_wait = steam_cooldown_remaining(scope=steam_history.SCOPE)
+        if page_wait > 0:
+            waits.append(f"страница предмета на паузе ещё {page_wait / 60:.0f} мин")
         lines.append("")
-        note = (
-            f"⚠️ Объём продаж не пришёл у {no_volume} предмет(ов). Его отдаёт "
-            "только Steam priceoverview"
+        lines.append(
+            f"⚠️ Объём продаж не пришёл у {no_volume} предмет(ов): Steam не "
+            "ответил ни через priceoverview, ни страницей предмета"
+            + (f" ({', '.join(waits)})" if waits else "")
+            + ". Не ждать: <code>/setorders - 0 - -</code> выключит проверку "
+            "ликвидности совсем."
         )
-        note += (
-            f", а он на кулдауне ещё {wait / 60:.0f} мин — проще подождать."
-            if wait > 0 else
-            " — в кэше остались записи без него, они обновятся сами."
-        )
-        lines.append(note + " Не ждать: <code>/setorders - 0 - -</code> "
-                     "выключит проверку ликвидности совсем.")
 
     if refused:
         lines.append("")
@@ -8097,10 +8294,11 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  {html_module.escape(shown)}")
 
     log.info(
-        "orders: chat_id=%s итог — планов %d, отказов %d, без стакана %d, "
-        "стакан по истории продаж %d%s",
-        chat_id, len(plans), len(refused), len(blind), via_sale,
-        f", маршрут закрыт: {route_down}" if route_down else "",
+        "orders: chat_id=%s итог — планов %d, отказов %d, прошли проверку Steam "
+        "%d, без стакана %d, стакан по имени %d, по истории продаж %d%s%s",
+        chat_id, len(plans), len(refused), passed, len(blind), via_name, via_sale,
+        f", поиск закрыт: {route_down}" if route_down else "",
+        f", ручки с ключом закрыты: {book_down}" if book_down else "",
     )
     lines.append("")
     lines.append(
@@ -8163,7 +8361,10 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         held[why] = held.get(why, 0) + 1
     if plans:
-        await _offer_order_batch(update, chat_id, tickets, held, route_down=route_down)
+        await _offer_order_batch(
+            update, chat_id, tickets, held,
+            route_down=route_down, book_down=book_down,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -8220,7 +8421,7 @@ def _usd(cents: int | None) -> str:
 
 async def _offer_order_batch(
     update, chat_id: int, tickets: list, held: dict[str, int], *,
-    route_down: str | None = None,
+    route_down: str | None = None, book_down: str | None = None,
 ) -> None:
     """Сообщение с кнопкой «Поставить» под отчётом /orders."""
     held_lines = [
@@ -8229,18 +8430,25 @@ async def _offer_order_batch(
     ]
     if not tickets:
         lines = ["<b>Ставить нечего</b> — ни один план не прошёл проверки:"] + held_lines
-        if route_down:
-            # Самая частая причина «нечего» — не рынок, а закрытый поиск лотов:
-            # без лота не прочитать стакан, а вслепую бот не ставит. Говорим
-            # это прямо, иначе «стакан не прочитан» читается как беда с
-            # предметами.
-            lines += [
-                "",
-                "Главная причина — поиск лотов CSFloat сейчас закрыт (прокси "
-                "отказывают, прямой адрес CSFloat не пускает; подробности выше), "
-                "а по истории продаж стакан тоже не прочитался. Без стакана бот "
-                "не ставит. Проверь прокси: /proxycheck и кабинет провайдера.",
-            ]
+        blind_held = any(why.startswith("стакан не прочитан") for why in held)
+        if blind_held and (book_down or route_down):
+            # Самая частая причина «нечего» — не рынок, а закрытый CSFloat:
+            # без стакана бот не ставит. Говорим это прямо, иначе «стакан не
+            # прочитан» читается как беда с предметами.
+            if book_down:
+                cause = (
+                    "CSFloat не отвечает боту даже на запросы с ключом — "
+                    f"{html_module.escape(book_down)}. Обычно это проходит само "
+                    "за несколько минут; если нет — CSFloat закрыл адрес бота, "
+                    "и помогут только живые прокси (/proxycheck)."
+                )
+            else:
+                cause = (
+                    "поиск лотов CSFloat закрыт (прокси отказывают, прямой адрес "
+                    "CSFloat не пускает), а стакан ни по имени предмета, ни по "
+                    "истории продаж не прочитался. Проверь прокси: /proxycheck."
+                )
+            lines += ["", f"Главная причина — {cause}"]
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
         return
 

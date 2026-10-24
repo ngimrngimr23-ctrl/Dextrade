@@ -47,6 +47,7 @@ from steam_client import (
 )
 
 from http_session import get_session
+import steam_history
 
 log = logging.getLogger("steam_bot.pricing")
 
@@ -562,6 +563,15 @@ PRICE_REQUEST_INTERVAL = envcfg.env_float("PRICE_REQUEST_INTERVAL", 6.0)
 # объём продаж, и как только прямой адрес отлежится, всё вернётся к нему само.
 PRICE_FALLBACK_TO_LISTINGS = os.environ.get("PRICE_FALLBACK_TO_LISTINGS", "1") not in ("0", "false", "no")
 
+# Первый запасной путь — страница предмета (steam_history): она отдаёт не
+# только нижний лот, но и продажи за сутки, то есть подменяет priceoverview
+# целиком. /render/ остаётся вторым — на случай, если и страница на паузе.
+PRICE_FALLBACK_TO_ITEM_PAGE = os.environ.get("PRICE_FALLBACK_TO_ITEM_PAGE", "1") not in ("0", "false", "no")
+
+# Насколько старую страницу предмета можно выдать за живую цену. Нижний лот —
+# скоропортящееся число; две минуты — это «тот же прогон», не больше.
+ITEM_PAGE_PRICE_MAX_AGE = envcfg.env_int("ITEM_PAGE_PRICE_MAX_AGE", 120)
+
 
 class RateLimited(Exception):
     """Внутренний маркер: Steam ответил 429 либо мы на кулдауне после недавнего 429."""
@@ -802,17 +812,48 @@ async def get_steam_market_price_retrying(
             # Адрес уже помечен в _get_with_retry, следующий заход возьмёт другой.
             continue
 
-    # priceoverview недоступен — берём цену из листингов.
+    # priceoverview недоступен — берём цену со страницы предмета, а если и
+    # она не ответила — из листингов.
     #
-    # Это не «ещё одна попытка того же», а ДРУГОЙ эндпоинт с другим лимитом:
+    # Это не «ещё одна попытка того же», а ДРУГИЕ эндпоинты с другим лимитом:
     # /render/ у Steam режется несопоставимо мягче. 2026-08-27 это было видно
     # в одном логе — все проверки цены получали 429, а вотчлист в те же часы
     # собирал листинги с HTTP 200 и с того же прямого адреса.
+    #
+    # Страница предмета идёт первой, потому что отдаёт ещё и объём продаж.
+    # Без него /orders 2026-10-24 отказал всем тридцати финалистам при
+    # свежих ценах из /render/: «объём продаж неизвестен».
+    if PRICE_FALLBACK_TO_ITEM_PAGE:
+        from_page = await _price_from_item_page(market_hash_name)
+        if from_page is not None:
+            return from_page
     if PRICE_FALLBACK_TO_LISTINGS:
         listed = await _lowest_price_from_listings(market_hash_name)
         if listed is not None:
             return listed
     raise RateLimited()
+
+
+async def _price_from_item_page(market_hash_name: str) -> SteamMarketPrice | None:
+    """
+    Нижний лот, продажи и медиана за сутки — со страницы предмета.
+
+    Те же три числа, что у priceoverview (см. steam_history): нижний лот — из
+    витрины на странице, продано и медиана — из графика продаж за последние
+    сутки. Сделок за сутки не было — объём ноль, как и у priceoverview, а не
+    «неизвестно»; графика на странице нет — вот тогда неизвестно.
+    """
+    page = await steam_history.fetch(market_hash_name, max_age=ITEM_PAGE_PRICE_MAX_AGE)
+    if page is None or page.lowest_usd is None:
+        return None
+    volume = page.sold(1)
+    median = page.median(1) if page.history_usd else None
+    log.info(
+        "цена со страницы предмета: %s — $%.2f, продано за сутки %s "
+        "(priceoverview недоступен)",
+        market_hash_name, page.lowest_usd, "?" if volume is None else volume,
+    )
+    return SteamMarketPrice(lowest=page.lowest_usd, median=median, volume=volume)
 
 
 async def _lowest_price_from_listings(market_hash_name: str) -> SteamMarketPrice | None:

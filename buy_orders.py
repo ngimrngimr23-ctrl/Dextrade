@@ -240,6 +240,12 @@ def ceiling_for(steam_price_cents: int, min_profit_pct: float) -> int:
 # файлах живёт ровно до первой правки формулировки.
 UNKNOWN_VOLUME = "объём продаж неизвестен — на деньгах не гадаем"
 UNKNOWN_STABILITY = "нет истории цен за месяц — стабильность не проверить"
+# То же «не проверить», но по другой причине: история сделок Steam есть, и в
+# ней была неделя без единой продажи — сравнивать ту неделю не с чем.
+HISTORY_GAP = (
+    "за последний месяц в Steam была неделя без единой продажи — "
+    "стабильность цены не проверить"
+)
 
 
 def plan(
@@ -256,6 +262,9 @@ def plan(
     ask_cents: int | None = None,
     require_spread: bool = False,
     month_avg_cents: int | None = None,
+    spread_basis: str = "сутки, неделя, месяц",
+    unknown_spread_reason: str = UNKNOWN_STABILITY,
+    month_label: str = "средняя продаж за месяц",
 ) -> tuple[OrderPlan | None, str]:
     """
     Решить, ставить ли ордер, и по какой цене.
@@ -280,6 +289,11 @@ def plan(
     month_avg_cents — средняя цена продаж за месяц. Если цена Steam сейчас
     выбивается из неё сильнее HISTORY_RATIO_MIN/MAX, ровные средние
     описывают не этот рынок, и стабильность не подтверждена.
+
+    spread_basis, unknown_spread_reason, month_label — слова для причин
+    отказа: разброс и «средняя за месяц» бывают из прайс-листа (средние за
+    сутки, неделю и месяц) и из самих сделок Steam (медианы по неделям), и
+    человеку надо видеть, о каком из них речь.
     """
     if steam_price_cents <= 0:
         return None, "нет цены Steam — сравнивать не с чем"
@@ -291,7 +305,8 @@ def plan(
         #
         # Отдельная дверь нужна потому, что объёма может не быть по причине,
         # не имеющей отношения к предмету: Steam отдаёт его только через
-        # priceoverview, а тот регулярно лежит под 429. В такие часы отказ
+        # priceoverview и график сделок на странице предмета, а они бывают под
+        # 429. В такие часы отказ
         # «объём неизвестен» — это новость про Steam, а не про ликвидность,
         # и человеку должно быть чем её обойти, если он понимает, на что идёт.
         if min_volume_per_week > 0:
@@ -303,19 +318,19 @@ def plan(
         )
 
     if spread_pct is None and require_spread:
-        return None, UNKNOWN_STABILITY
+        return None, unknown_spread_reason
     if month_avg_cents and month_avg_cents > 0:
         ratio = steam_price_cents / month_avg_cents
         if not HISTORY_RATIO_MIN <= ratio <= HISTORY_RATIO_MAX:
             return None, (
                 f"история не сходится с ценой: в Steam сейчас "
-                f"${steam_price_cents / 100:.2f}, а средняя продаж за месяц "
-                f"${month_avg_cents / 100:.2f} — средние задраны или обвалены "
-                "редкими сделками, стабильность по ним не видна"
+                f"${steam_price_cents / 100:.2f}, а {month_label} "
+                f"${month_avg_cents / 100:.2f} — цена выбилась из своей "
+                "истории, и ровный месяц про неё сейчас ничего не говорит"
             )
     if spread_pct is not None and spread_pct > max_spread_pct:
         return None, (
-            f"цена за месяц гуляет на {spread_pct:.0f}% (сутки, неделя, месяц) "
+            f"цена за месяц гуляет на {spread_pct:.0f}% ({spread_basis}) "
             f"при пороге {max_spread_pct:g}% — продавать через неделю будем "
             "неизвестно почём"
         )
