@@ -899,17 +899,20 @@ async def get_order_settings(chat_id: int) -> dict:
         "budget": s.get("ord_budget"),
         "max_count": s.get("ord_max_count"),
         "auto_minutes": s.get("ord_auto_minutes"),
+        # Разброс цены за месяц, % (см. pricing.SteamPrice.month_spread_pct).
+        "max_month_spread": s.get("ord_max_month_spread"),
     }
 
 
 async def set_order_setting(chat_id: int, key: str, value) -> None:
     """
     key — одно из: min_profit, min_week_volume, min_price, max_price,
-    catalog_cursor, budget, max_count, auto_minutes.
+    catalog_cursor, budget, max_count, auto_minutes, max_month_spread.
     """
     allowed = {
         "min_profit", "min_week_volume", "min_price", "max_price",
         "catalog_cursor", "budget", "max_count", "auto_minutes",
+        "max_month_spread",
     }
     if key not in allowed:
         raise ValueError(f"неизвестная настройка ордеров: {key}")

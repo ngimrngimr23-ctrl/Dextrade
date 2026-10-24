@@ -249,6 +249,9 @@ CSGOTRADER_WINDOWS = ("last_24h", "last_7d", "last_30d", "last_90d")
 # именно окно ему нужно, решает bot.ARB_PRICE_WINDOW, а не этот список.
 CSGOTRADER_RECENT_WINDOWS = ("last_24h", "last_7d")
 
+# Окна для «стабильна ли цена за месяц» (см. SteamPrice.month_spread_pct).
+CSGOTRADER_MONTH_WINDOWS = ("last_24h", "last_7d", "last_30d")
+
 
 def _load_csgotrader_cache() -> tuple[dict, float] | None:
     """Содержимое дискового кэша прайс-листа. Читается один раз на версию файла (см. _read_json_memo)."""
@@ -294,6 +297,23 @@ class SteamPrice(NamedTuple):
         """
         recent = [self.windows[w] for w in CSGOTRADER_RECENT_WINDOWS if w in self.windows]
         return self._spread(recent)
+
+    @property
+    def month_spread_pct(self) -> float | None:
+        """
+        Разброс между средними за сутки, неделю и месяц — «стабильна ли цена
+        за месяц». None — какого-то из трёх окон нет, и о месяце судить не по
+        чему.
+
+        Нужен ордерам. Ордер стоит часами, исполнившись, ещё неделю ждёт
+        защиты трейда, и только потом предмет можно продать в Steam. Сутки
+        против недели (recent_spread_pct) тут мало: цена может неделю стоять
+        ровно после месячного обвала. Покупать под перепродажу через неделю
+        имеет смысл то, что держит цену весь месяц.
+        """
+        if not all(w in self.windows for w in CSGOTRADER_MONTH_WINDOWS):
+            return None
+        return self._spread(self.windows[w] for w in CSGOTRADER_MONTH_WINDOWS)
 
     @staticmethod
     def _spread(values) -> float | None:

@@ -7136,9 +7136,16 @@ async def _order_candidates_from_arb(
     )
     log.info("orders: широкий скан принёс %d лотов", len(listings))
     await _fill_steam_prices(listings)
-    # Разброс окон живёт на лоте, а не на оффере — забираем по имени.
+    # Стабильность цены за МЕСЯЦ — из прайс-листа по имени. Разброс на лоте
+    # (steam_price_spread_pct) считается сутки против недели и для ордера
+    # мал: см. pricing.SteamPrice.month_spread_pct.
+    details = await get_csgotrader_price_details() or {}
     spread_by_name = {
-        l.market_hash_name: l.steam_price_spread_pct for l in listings
+        l.market_hash_name: (
+            details[l.market_hash_name].month_spread_pct
+            if l.market_hash_name in details else None
+        )
+        for l in listings
     }
     # Сошлись ли прайс-лист и справка CSFloat — независимая проверка цены,
     # которая уже посчитана в _fill_steam_prices и до сих пор пропадала зря.
@@ -7224,10 +7231,18 @@ async def _order_candidates_from_dips(chat_id: int) -> list[_OrderCandidate]:
             ),
             # Здесь объём настоящий: штук за сутки от Steam priceoverview.
             volume_per_day=quote.volume,
-            spread_pct=getattr(found_price, "recent_spread_pct", None),
+            spread_pct=getattr(found_price, "month_spread_pct", None),
             source="просадка",
         ))
     return out
+
+
+def _stability_line(spread) -> str:
+    """Строка про месячную стабильность цены для /setorders."""
+    return (
+        f"цена за месяц гуляет не больше <b>{spread:g}%</b> (разброс средних "
+        "за сутки, неделю и месяц)"
+    )
 
 
 def _volume_line(volume) -> str:
@@ -7279,8 +7294,9 @@ async def _order_candidates_from_catalog(chat_id: int, limits: dict) -> list[_Or
       * вне ценовой полосы;
       * нет суточного окна — предмет сегодня не торговался вовсе, ставить на
         него заявку значит ждать неизвестно чего;
-      * окна суток и недели разъезжаются сильнее порога — цена такая, что
-        считать от неё прибыль бессмысленно.
+      * цена гуляет за месяц сильнее порога (разброс средних за сутки,
+        неделю и месяц) или месячной истории нет вовсе — купить такой предмет
+        под перепродажу через неделю значит гадать, почём продашь.
 
     Всё остальное — ликвидность и чужие ордера — требует живых запросов, и
     ими занимается общий конвейер /orders по короткому списку.
@@ -7295,10 +7311,10 @@ async def _order_candidates_from_catalog(chat_id: int, limits: dict) -> list[_Or
         return []
 
     low, high = limits["low"], limits["high"]
-    max_spread = buy_orders.DEFAULT_MAX_SPREAD_PCT
+    max_spread = limits["stability"]
 
     band: list[tuple[str, float, float | None]] = []
-    skipped_quiet = skipped_jumpy = 0
+    skipped_quiet = skipped_jumpy = skipped_young = 0
     for name, sp in details.items():
         # Берём именно суточное окно, а не sp.price: наличие last_24h само по
         # себе означает, что сделки сегодня были. Это единственный признак
@@ -7309,8 +7325,14 @@ async def _order_candidates_from_catalog(chat_id: int, limits: dict) -> list[_Or
             continue
         if not (low <= price <= high):
             continue
-        spread = sp.recent_spread_pct
-        if spread is not None and spread > max_spread:
+        # Стабильность за месяц, а не сутки против недели: ордер исполнится
+        # через часы, а продать предмет в Steam можно будет лишь через неделю
+        # защиты трейда (см. pricing.SteamPrice.month_spread_pct).
+        spread = sp.month_spread_pct
+        if spread is None:
+            skipped_young += 1
+            continue
+        if spread > max_spread:
             skipped_jumpy += 1
             continue
         band.append((name, price, spread))
@@ -7325,7 +7347,9 @@ async def _order_candidates_from_catalog(chat_id: int, limits: dict) -> list[_Or
     cursor = int(limits.get("cursor") or 0) % len(band)
     window = band[cursor:cursor + ORDERS_CATALOG_BATCH]
     if len(window) < ORDERS_CATALOG_BATCH:
-        window += band[:ORDERS_CATALOG_BATCH - len(window)]
+        # Хвост полосы короче партии — добираем с начала, но не дальше метки:
+        # при полосе меньше партии иначе те же предметы шли по второму кругу.
+        window += band[:min(ORDERS_CATALOG_BATCH - len(window), cursor)]
     try:
         await set_order_setting(
             chat_id, "catalog_cursor", (cursor + len(window)) % len(band)
@@ -7338,9 +7362,10 @@ async def _order_candidates_from_catalog(chat_id: int, limits: dict) -> list[_Or
 
     log.info(
         "orders: каталог — в полосе $%g-$%g подходят %d предмет(ов) "
-        "(пропущено: %d без сделок за сутки, %d со скачущей ценой). "
-        "Беру %d начиная с %d",
-        low, high, len(band), skipped_quiet, skipped_jumpy, len(window), cursor,
+        "(пропущено: %d без сделок за сутки, %d без истории за месяц, "
+        "%d с ценой, гуляющей за месяц больше %g%%). Беру %d начиная с %d",
+        low, high, len(band), skipped_quiet, skipped_young, skipped_jumpy,
+        max_spread, len(window), cursor,
     )
 
     return [
@@ -7394,6 +7419,7 @@ async def setorders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     volume = _now("min_week_volume", buy_orders.DEFAULT_MIN_VOLUME_PER_WEEK)
     low = _now("min_price", 0.0)
     high = _now("max_price", buy_orders.DEFAULT_MAX_ORDER_USD)
+    stability = _now("max_month_spread", buy_orders.DEFAULT_MAX_MONTH_SPREAD_PCT)
 
     args = context.args or []
     if not args:
@@ -7401,9 +7427,11 @@ async def setorders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<b>Пороги ордеров</b>\n"
             f"• прибыль от <b>{profit:g}%</b> (после комиссии Steam)\n"
             f"• {_volume_line(volume)}\n"
-            f"• цена предмета <b>${low:g}–${high:g}</b>\n\n"
-            "Задать всё разом: <code>/setorders 25 20 5 300</code>\n"
-            "Оставить прежним — прочерк: <code>/setorders 25 - - 300</code>\n\n"
+            f"• цена предмета <b>${low:g}–${high:g}</b>\n"
+            f"• {_stability_line(stability)}\n\n"
+            "Задать всё разом: <code>/setorders 25 20 5 300 10</code>\n"
+            "Оставить прежним — прочерк: <code>/setorders 25 - - 300</code>\n"
+            "Пятое число (разброс за месяц, %) можно не писать.\n\n"
             "Верхняя граница — заодно потолок на один ордер.\n"
             "Бюджет и число ордеров: /orderbudget\n"
             "Найти и поставить: /orders",
@@ -7411,10 +7439,11 @@ async def setorders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if len(args) != 4:
+    if len(args) not in (4, 5):
         await update.message.reply_text(
-            "Нужно четыре значения: прибыль%, шт/нед, мин$, макс$\n"
-            "Например: /setorders 25 20 5 300\n"
+            "Нужно четыре значения: прибыль%, шт/нед, мин$, макс$ — и пятым, "
+            "по желанию, разброс цены за месяц %\n"
+            "Например: /setorders 25 20 5 300 10\n"
             "Прочерк оставляет значение прежним: /setorders 25 - - 300"
         )
         return
@@ -7424,9 +7453,18 @@ async def setorders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_volume, set_volume = _order_arg(args[1], integer=True)
         new_low, set_low = _order_arg(args[2])
         new_high, set_high = _order_arg(args[3])
+        new_stability, set_stability = (
+            _order_arg(args[4]) if len(args) == 5 else (None, False)
+        )
     except ValueError:
         await update.message.reply_text(
-            "Не разобрал числа. Пример: /setorders 25 20 5 300"
+            "Не разобрал числа. Пример: /setorders 25 20 5 300 10"
+        )
+        return
+    if set_stability and new_stability <= 0:
+        await update.message.reply_text(
+            "Разброс за месяц должен быть больше нуля: ровно стоящих цен не "
+            "бывает, и ноль отсеет всё."
         )
         return
 
@@ -7452,12 +7490,15 @@ async def setorders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await set_order_setting(chat_id, "min_price", new_low)
     if set_high:
         await set_order_setting(chat_id, "max_price", new_high)
+    if set_stability:
+        await set_order_setting(chat_id, "max_month_spread", new_stability)
 
     await update.message.reply_text(
         "<b>Пороги ордеров обновлены</b>\n"
         f"• прибыль от <b>{(new_profit if set_profit else profit):g}%</b>\n"
         f"• {_volume_line(new_volume if set_volume else volume)}\n"
-        f"• цена предмета <b>${final_low:g}–${final_high:g}</b>\n\n"
+        f"• цена предмета <b>${final_low:g}–${final_high:g}</b>\n"
+        f"• {_stability_line(new_stability if set_stability else stability)}\n\n"
         "Проверить на живом рынке: /orders",
         parse_mode="HTML",
     )
@@ -7486,6 +7527,9 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "low": saved.get("min_price") or 0.0,
         "high": saved.get("max_price") or buy_orders.DEFAULT_MAX_ORDER_USD,
         "cursor": saved.get("catalog_cursor") or 0,
+        "stability": (saved.get("max_month_spread")
+                      if saved.get("max_month_spread") is not None
+                      else buy_orders.DEFAULT_MAX_MONTH_SPREAD_PCT),
     }
     await update.message.reply_text(
         "Ищу ордера: смотрю арбитраж, просадки и каталог, читаю стаканы…\n"
@@ -7803,6 +7847,8 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 min_volume_per_week=limits["volume"],
                 max_order_usd=limits["high"],
                 ask_cents=cand.csfloat_ask_cents,
+                max_spread_pct=limits["stability"],
+                require_spread=True,
             )
             if plan is None:
                 refused.append((cand.market_hash_name, why))
@@ -7973,7 +8019,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Пороги: прибыль от {limits['profit']:g}%, "
         f"продаж от {limits['volume']:g} шт/нед, "
         f"цена ${limits['low']:g}–${limits['high']:g}, "
-        f"разброс до {buy_orders.DEFAULT_MAX_SPREAD_PCT:g}%. Менять: /setorders"
+        f"цена за месяц гуляет не больше {limits['stability']:g}%. Менять: /setorders"
     )
     # Режем на куски. Telegram не обрезает длинные сообщения, а отказывается их
     # принимать с «Message is too long», и отчёт пропал бы целиком.
@@ -10867,10 +10913,12 @@ COMMANDS: tuple[Command, ...] = (
         "setorders", setorders, "Ордера CSFloat",
         "Прибыль, ликвидность и диапазон цены",
         "/setorders — показать текущие пороги\n"
-        "/setorders <прибыль%> <шт/нед> <мин$> <макс$> — задать всё разом, "
-        "например /setorders 25 20 5 300\n"
+        "/setorders <прибыль%> <шт/нед> <мин$> <макс$> [разброс за месяц %] — "
+        "задать всё разом, например /setorders 25 20 5 300 10\n"
         "Прочерк оставляет значение прежним: /setorders 25 - - 300\n"
-        "Верхняя граница диапазона — заодно потолок на один ордер.",
+        "Верхняя граница диапазона — заодно потолок на один ордер. Разброс за "
+        "месяц — насколько расходятся средние цены Steam за сутки, неделю и "
+        "месяц; по умолчанию 10%.",
     ),
     Command(
         "orders", orders_cmd, "Ордера CSFloat",

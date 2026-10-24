@@ -77,6 +77,10 @@ DEFAULT_MIN_PROFIT_PCT = envcfg.env_float("ORDER_MIN_PROFIT_PCT", 20.0)
 DEFAULT_MIN_VOLUME_PER_WEEK = envcfg.env_int("ORDER_MIN_WEEK_VOLUME", 21)
 DEFAULT_MAX_SPREAD_PCT = envcfg.env_float("ORDER_MAX_SPREAD_PCT", 15.0)
 DEFAULT_MAX_ORDER_USD = envcfg.env_float("ORDER_MAX_USD", 20.0)
+# Насколько может гулять цена за месяц: разброс средних за сутки, неделю и
+# месяц (pricing.SteamPrice.month_spread_pct). Десять процентов на живых
+# данных 2026-10-24 проходят две трети скинов $1–65 с продажами за сутки.
+DEFAULT_MAX_MONTH_SPREAD_PCT = envcfg.env_float("ORDER_MAX_MONTH_SPREAD_PCT", 10.0)
 
 # СЕТКА ЦЕН ОРДЕРОВ CSFLOAT: (цена ДО которой действует шаг, шаг), всё в центах.
 #
@@ -222,6 +226,7 @@ def ceiling_for(steam_price_cents: int, min_profit_pct: float) -> int:
 # чтобы объяснить, ОТКУДА взялось незнание, — а сверка по литералу в двух
 # файлах живёт ровно до первой правки формулировки.
 UNKNOWN_VOLUME = "объём продаж неизвестен — на деньгах не гадаем"
+UNKNOWN_STABILITY = "нет истории цен за месяц — стабильность не проверить"
 
 
 def plan(
@@ -236,6 +241,7 @@ def plan(
     max_spread_pct: float = DEFAULT_MAX_SPREAD_PCT,
     max_order_usd: float = DEFAULT_MAX_ORDER_USD,
     ask_cents: int | None = None,
+    require_spread: bool = False,
 ) -> tuple[OrderPlan | None, str]:
     """
     Решить, ставить ли ордер, и по какой цене.
@@ -252,6 +258,10 @@ def plan(
     ask_cents — самый дешёвый лот на CSFloat, если известен. Нужен, чтобы не
     предлагать больше, чем просит продавец: такая заявка исполнится сразу,
     и всё, что сверх цены лота, — переплата.
+
+    spread_pct — разброс цены за месяц (pricing.SteamPrice.month_spread_pct).
+    require_spread=True — неизвестный разброс считается отказом: стабильность
+    требуют подтвердить, а не предположить.
     """
     if steam_price_cents <= 0:
         return None, "нет цены Steam — сравнивать не с чем"
@@ -274,10 +284,13 @@ def plan(
             "выйти обратно будет не у кого"
         )
 
+    if spread_pct is None and require_spread:
+        return None, UNKNOWN_STABILITY
     if spread_pct is not None and spread_pct > max_spread_pct:
         return None, (
-            f"цена скачет: окна расходятся на {spread_pct:.0f}% при пороге "
-            f"{max_spread_pct:.0f}% — прибыль от такой цены воображаемая"
+            f"цена за месяц гуляет на {spread_pct:.0f}% (сутки, неделя, месяц) "
+            f"при пороге {max_spread_pct:g}% — продавать через неделю будем "
+            "неизвестно почём"
         )
 
     # Два ограничения сверху, и они РАЗНЫЕ по смыслу. Первое — где кончается
