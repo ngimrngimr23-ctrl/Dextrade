@@ -37,6 +37,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 import logging
 import time
@@ -57,8 +58,10 @@ from csfloat_client import (
 from scan_errors import scrub
 from storage import (
     StorageUnavailable,
+    acquire_lock,
     get_bot_orders,
     get_steam_prices_batch,
+    release_lock,
     save_bot_orders,
 )
 
@@ -110,6 +113,46 @@ def _lock(chat_id: int) -> asyncio.Lock:
 
 def busy(chat_id: int) -> bool:
     return _lock(chat_id).locked()
+
+
+# Сколько держится общий замок, если копия, взявшая его, умрёт, не отпустив.
+# С запасом против самой долгой операции — сверки десятка ордеров по
+# секунде на запрос, — но не так долго, чтобы упавшая копия надолго
+# заблокировала остальные.
+LOCK_TTL_SECONDS = envcfg.env_int("ORDER_LOCK_TTL", 600)
+
+OTHER_COPY = (
+    "с ордерами сейчас работает другая копия бота — жду, пока она закончит. "
+    "Если копий на Render несколько, лишние стоит удалить"
+)
+
+
+class _NoLock(Exception):
+    """Общий замок не взят: занят другой копией или хранилище не ответило."""
+
+
+@contextlib.asynccontextmanager
+async def _guard(chat_id: int):
+    """
+    Замок своего процесса и общий замок всех копий бота (storage.acquire_lock).
+
+    Свой — чтобы постановка и сверка в одном процессе не шли разом. Общий —
+    потому что копий бывает несколько (деплой Render держит старую и новую
+    вместе; бывали и лишние сервисы), а у каждой свой asyncio.Lock.
+    """
+    async with _lock(chat_id):
+        name = f"orders:{chat_id}"
+        try:
+            token = await acquire_lock(name, LOCK_TTL_SECONDS)
+        except StorageUnavailable as e:
+            raise _NoLock(f"общий замок ордеров не взят: {_reason(e)}") from None
+        if token is None:
+            log.info("orders: chat_id=%s замок у другой копии бота", chat_id)
+            raise _NoLock(OTHER_COPY)
+        try:
+            yield
+        finally:
+            await release_lock(name, token)
 
 
 class Ticket(NamedTuple):
@@ -265,7 +308,7 @@ async def _price_now(
     )
 
 
-async def place(
+async def _place(
     chat_id: int, tickets: list[Ticket], *, budget_cents: int, max_count: int,
 ) -> PlaceOutcome:
     """
@@ -280,7 +323,7 @@ async def place(
     filled_now: list[Ticket] = []
     refused: list[tuple[Ticket, str]] = []
 
-    async with _lock(chat_id):
+    async with _guard(chat_id):
         try:
             registry = await get_bot_orders(chat_id)
         except StorageUnavailable as e:
@@ -450,7 +493,7 @@ def _rivals(book: list, order_id: str, own_price: int) -> list[int]:
     return prices
 
 
-async def maintain(
+async def _maintain(
     chat_id: int,
     *,
     min_profit_pct: float,
@@ -467,7 +510,7 @@ async def maintain(
     events: list[Event] = []
     checked = blind = 0
 
-    async with _lock(chat_id):
+    async with _guard(chat_id):
         try:
             registry = await get_bot_orders(chat_id)
         except StorageUnavailable as e:
@@ -700,7 +743,7 @@ async def snapshot(chat_id: int) -> Snapshot:
     return Snapshot(orders, registry, balance)
 
 
-async def cancel(
+async def _cancel(
     chat_id: int, *, ids: list[str] | None = None, include_manual: bool = False,
 ) -> CancelOutcome:
     """
@@ -710,7 +753,7 @@ async def cancel(
     """
     cancelled: list[MyBuyOrder] = []
     failed: list[tuple[MyBuyOrder, str]] = []
-    async with _lock(chat_id):
+    async with _guard(chat_id):
         try:
             registry: dict[str, dict] | None = await get_bot_orders(chat_id)
         except StorageUnavailable as e:
@@ -754,3 +797,41 @@ async def cancel(
             except StorageUnavailable as e:
                 return CancelOutcome(cancelled, failed, f"реестр не записан: {_reason(e)}")
     return CancelOutcome(cancelled, failed, None)
+
+
+async def place(
+    chat_id: int, tickets: list[Ticket], *, budget_cents: int, max_count: int,
+) -> PlaceOutcome:
+    """Поставить ордера (см. _place) под замком всех копий бота."""
+    try:
+        return await _place(chat_id, tickets, budget_cents=budget_cents, max_count=max_count)
+    except _NoLock as e:
+        return PlaceOutcome([], [], [], str(e), 0, 0, None)
+
+
+async def maintain(
+    chat_id: int,
+    *,
+    min_profit_pct: float,
+    max_order_cents: int,
+    budget_cents: int,
+    limit: int = MAINTAIN_PER_ROUND,
+) -> Round:
+    """Прогон поддержки (см. _maintain) под замком всех копий бота."""
+    try:
+        return await _maintain(
+            chat_id, min_profit_pct=min_profit_pct, max_order_cents=max_order_cents,
+            budget_cents=budget_cents, limit=limit,
+        )
+    except _NoLock as e:
+        return Round([], 0, 0, 0, 0, str(e))
+
+
+async def cancel(
+    chat_id: int, *, ids: list[str] | None = None, include_manual: bool = False,
+) -> CancelOutcome:
+    """Снять ордера (см. _cancel) под замком всех копий бота."""
+    try:
+        return await _cancel(chat_id, ids=ids, include_manual=include_manual)
+    except _NoLock as e:
+        return CancelOutcome([], [], str(e))

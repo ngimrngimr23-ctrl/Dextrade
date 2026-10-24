@@ -8023,7 +8023,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         held[why] = held.get(why, 0) + 1
     if plans:
-        await _offer_order_batch(update, chat_id, tickets, held)
+        await _offer_order_batch(update, chat_id, tickets, held, route_down=route_down)
 
 
 # ---------------------------------------------------------------------------
@@ -8078,18 +8078,30 @@ def _usd(cents: int | None) -> str:
     return "—" if cents is None else f"${cents / 100:.2f}"
 
 
-async def _offer_order_batch(update, chat_id: int, tickets: list, held: dict[str, int]) -> None:
+async def _offer_order_batch(
+    update, chat_id: int, tickets: list, held: dict[str, int], *,
+    route_down: str | None = None,
+) -> None:
     """Сообщение с кнопкой «Поставить» под отчётом /orders."""
     held_lines = [
         f"• {html_module.escape(why)} — {n} шт."
         for why, n in sorted(held.items(), key=lambda kv: -kv[1])
     ]
     if not tickets:
-        await update.message.reply_text(
-            "\n".join(["<b>Ставить нечего</b> — ни один план не прошёл проверки:"]
-                      + held_lines),
-            parse_mode="HTML",
-        )
+        lines = ["<b>Ставить нечего</b> — ни один план не прошёл проверки:"] + held_lines
+        if route_down:
+            # Самая частая причина «нечего» — не рынок, а закрытый поиск лотов:
+            # без лота не прочитать стакан, а вслепую бот не ставит. Говорим
+            # это прямо, иначе «стакан не прочитан» читается как беда с
+            # предметами.
+            lines += [
+                "",
+                "Главная причина — поиск лотов CSFloat сейчас закрыт (прокси "
+                "отказывают, прямой адрес CSFloat не пускает; подробности выше). "
+                "Без лота бот не может прочитать стакан, а вслепую не ставит. "
+                "Проверь прокси: /proxycheck и кабинет провайдера.",
+            ]
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
         return
 
     budget_cents, max_count, auto_minutes = await _order_limits(chat_id)
@@ -8197,10 +8209,44 @@ def _round_lines(rnd: order_desk.Round, *, title: str) -> list[str]:
     return lines
 
 
+async def _owns_updates(bot) -> bool:
+    """
+    Эта ли копия бота принимает апдейты Telegram.
+
+    Зачем. 2026-10-24 в логах нашлись три сервиса Render с одним и тем же
+    ботом: каждый при старте ставит вебхук на себя, апдейты получает
+    последний, а фоновые задания крутятся во всех трёх. Для ордеров это
+    тройной расход квоты CSFloat и тройные сообщения — поэтому сверку делает
+    только та копия, на которую сейчас смотрит вебхук. Одновременную работу
+    с ордерами двух копий закрывает ещё и общий замок (order_desk._guard),
+    это — про то, чтобы лишние копии не работали вовсе.
+
+    На long-polling копия заведомо одна: второго читателя getUpdates Telegram
+    не пускает. Не смогли спросить Telegram — считаем, что наша: от
+    одновременной работы и так защищает замок.
+    """
+    if not _tg_webhook_path:
+        return True
+    try:
+        info = await bot.get_webhook_info()
+    except Exception:  # noqa: BLE001 — см. докстринг
+        log.warning("orders: не узнал, на кого смотрит вебхук", exc_info=True)
+        return True
+    return (info.url or "") == f"{WEBHOOK_BASE_URL}/{_tg_webhook_path}"
+
+
 async def orders_maintain_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.data["chat_id"]
     _, _, auto_minutes = await _order_limits(chat_id)
     rnd = None
+    if not await _owns_updates(context.bot):
+        log.info(
+            "orders: chat_id=%s эта копия бота апдейты не получает (вебхук "
+            "смотрит на другую) — сверку ордеров пропускаю", chat_id,
+        )
+        if auto_minutes:
+            _schedule_orders_job(context.job_queue, chat_id, auto_minutes)
+        return
     try:
         rnd = await _orders_round(chat_id)
         log.info(

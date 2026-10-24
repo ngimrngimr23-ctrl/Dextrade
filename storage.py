@@ -20,6 +20,7 @@ GiftSatteliteAdapter (Upstash + локальный fallback).
 
 import json
 import os
+import secrets
 import time
 import zlib
 import logging
@@ -964,6 +965,58 @@ async def get_bot_orders(chat_id: int) -> dict[str, dict]:
         data = json.loads(raw)
         return data if isinstance(data, dict) else {}
     return _local_bot_orders_load().get(str(chat_id), {})
+
+
+# ---------------------------------------------------------------------------
+# Замок на все копии бота разом
+#
+# asyncio.Lock держит только свой процесс. А копий бывает несколько: Render
+# при каждом деплое несколько секунд держит старую и новую вместе, а
+# 2026-10-24 в логах нашлись три разных сервиса с одним ботом. Для ордеров
+# это опасно по-настоящему: две копии, переставляющие один ордер разом, —
+# это два новых ордера на одни деньги. Поэтому всё, что меняет ордера, берёт
+# ещё и этот замок — один на всех, в Upstash.
+# ---------------------------------------------------------------------------
+
+LOCK_KEY_PREFIX = "lock:"
+
+# Снять замок, только если он всё ещё наш: чужой (наш истёк, его взяла
+# другая копия) трогать нельзя. Одной командой, чтобы между проверкой и
+# удалением никто не вклинился.
+_RELEASE_SCRIPT = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+    "return redis.call('del', KEYS[1]) else return 0 end"
+)
+
+
+async def acquire_lock(name: str, ttl_seconds: int) -> str | None:
+    """
+    Взять замок. Возвращает метку владельца или None — замок у другой копии.
+
+    Без Upstash замок только локальный: хранилища, общего для копий, нет, а
+    копия с локальным файлом одна. Сбой Upstash — StorageUnavailable: не
+    знать, свободно ли, хуже, чем знать, что занято.
+    """
+    token = secrets.token_hex(8)
+    if not REDIS_ENABLED:
+        return token
+    try:
+        result = await _redis_cmd(
+            "SET", LOCK_KEY_PREFIX + name, token, "NX", "PX", str(int(ttl_seconds * 1000)),
+        )
+    except Exception as e:
+        raise StorageUnavailable(f"замок не взят — хранилище не ответило: {e}") from None
+    return token if result == "OK" else None
+
+
+async def release_lock(name: str, token: str) -> None:
+    """Отпустить свой замок. Не вышло — истечёт сам по сроку."""
+    if not REDIS_ENABLED:
+        return
+    try:
+        await _redis_cmd("EVAL", _RELEASE_SCRIPT, "1", LOCK_KEY_PREFIX + name, token)
+    except Exception:
+        log.warning("замок %s не отпущен — истечёт сам", name, exc_info=True)
 
 
 async def save_bot_orders(chat_id: int, orders: dict[str, dict]) -> None:
