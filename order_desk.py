@@ -48,6 +48,7 @@ import aiohttp
 import buy_orders
 import csfloat_client
 import envcfg
+import steam_snapshot
 from csfloat_client import (
     CSFloatError,
     CSFloatOrderRejected,
@@ -476,19 +477,24 @@ async def _place(
 
 def _ceiling_now(
     entry: dict, cached: dict | None, *, min_profit_pct: float, max_order_cents: int,
+    month_median_cents: int | None = None,
 ) -> int:
     """
     Потолок ордера на сейчас: не выше того, что был при постановке.
 
-    Опускают его две вещи: свежая цена Steam ниже прежней и пороги, которые
-    человек поменял после постановки (прибыль, лимит на ордер). Поднять его
-    не может ничто — для этого нужна новая живая проверка, то есть /orders.
+    Опускают его три вещи: свежая цена Steam ниже прежней, медиана сделок
+    Steam за месяц ниже неё (нижний лот при постановке мог быть пиком — см.
+    bot._with_month_median) и пороги, которые человек поменял после
+    постановки (прибыль, лимит на ордер). Поднять его не может ничто — для
+    этого нужна новая живая проверка, то есть /orders.
     """
     steam = int(entry.get("steam") or 0)
     if cached and cached.get("price") and cached.get("updated_at", 0) > entry.get("placed_at", 0):
         # То же правило, что при постановке: нижний лот, но не дороже медианы
         # сделок (buy_orders.steam_sale_cents).
         steam = buy_orders.steam_sale_cents(cached["price"], cached.get("median")) or steam
+    if month_median_cents and month_median_cents > 0:
+        steam = min(steam, month_median_cents) if steam > 0 else month_median_cents
     stored = int(entry.get("ceiling") or 0)
     # Без цены Steam пересчитать потолок не из чего — остаётся прежний, а не
     # ноль: ноль значил бы «прибыли нет» и снял бы живой ордер.
@@ -603,6 +609,9 @@ async def _maintain(
             except Exception:  # noqa: BLE001 — без кэша потолок просто прежний
                 log.warning("orders: кэш цен Steam не прочитан", exc_info=True)
                 cached_prices = {}
+            # Медианы сделок за месяц — из снимка (страницу предмета Steam с
+            # адреса бота не отдаёт). Нет снимка — потолок без медианы.
+            snapshot, _ = await steam_snapshot.current()
 
             queue = sorted(registry.items(), key=lambda kv: kv[1].get("checked_at", 0))
             for oid, entry in queue[:limit]:
@@ -643,19 +652,36 @@ async def _maintain(
                     blind += 1
                     continue
 
+                # Последняя известная медиана остаётся в реестре: снимок
+                # стареет за трое суток, а потолок без неё вернулся бы к
+                # нижнему лоту при постановке — к тому самому пику.
+                measured = snapshot.month_median(name) if snapshot else None
+                if measured is not None:
+                    entry["month_median"] = measured[0]
+                median = entry.get("month_median")
                 ceiling = _ceiling_now(
                     entry, cached_prices.get(name),
                     min_profit_pct=min_profit_pct, max_order_cents=max_order_cents,
+                    month_median_cents=median,
                 )
                 decision = buy_orders.reprice(
                     current_cents=order.price_cents,
                     ceiling_cents=ceiling,
                     rivals_cents=_rivals(book, oid, order.price_cents),
                 )
+                why = decision.why
+                if median and order.price_cents > ceiling and ceiling < _ceiling_now(
+                    entry, cached_prices.get(name),
+                    min_profit_pct=min_profit_pct, max_order_cents=max_order_cents,
+                ):
+                    # Потолок опустила медиана за месяц — в уведомлении скажем,
+                    # почему ордер вдруг подешевел.
+                    why += f" (медиана сделок Steam за месяц ${median / 100:.2f})"
                 log.info(
-                    "orders: chat_id=%s «%s» $%.2f, потолок $%.2f — %s: %s",
+                    "orders: chat_id=%s «%s» $%.2f, потолок $%.2f%s — %s: %s",
                     chat_id, name, order.price_cents / 100, ceiling / 100,
-                    decision.action, decision.why,
+                    f" (медиана за месяц ${median / 100:.2f})" if median else "",
+                    decision.action, why,
                 )
 
                 if decision.action == buy_orders.KEEP:
@@ -695,7 +721,7 @@ async def _maintain(
                         "проверь сделки на CSFloat",
                     ))
                 elif decision.action == buy_orders.CANCEL:
-                    events.append(Event(CANCELLED, name, decision.why))
+                    events.append(Event(CANCELLED, name, why))
                 else:
                     new = None
                     problem = None
@@ -731,7 +757,7 @@ async def _maintain(
                         events.append(Event(
                             kind, name,
                             f"${order.price_cents / 100:.2f} → "
-                            f"${new.price_cents / 100:.2f}: {decision.why}",
+                            f"${new.price_cents / 100:.2f}: {why}",
                         ))
                         log.info(
                             "orders: chat_id=%s ордер на «%s» переставлен %s -> %s ($%.2f)",

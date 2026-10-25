@@ -240,6 +240,9 @@ def ceiling_for(steam_price_cents: int, min_profit_pct: float) -> int:
 # файлах живёт ровно до первой правки формулировки.
 UNKNOWN_VOLUME = "объём продаж неизвестен — на деньгах не гадаем"
 UNKNOWN_STABILITY = "нет истории цен за месяц — стабильность не проверить"
+# Цена Steam для расчёта — не выше медианы сделок за месяц: нижний лот бывает
+# пиком. Медианы нет — не знаем, не пик ли перед нами.
+UNKNOWN_MONTH_MEDIAN = "медиана сделок Steam за месяц неизвестна — от пиков цены не считаю"
 # То же «не проверить», но по другой причине: история сделок Steam есть, и в
 # ней была неделя без единой продажи — сравнивать ту неделю не с чем.
 HISTORY_GAP = (
@@ -266,6 +269,8 @@ def plan(
     unknown_spread_reason: str = UNKNOWN_STABILITY,
     month_label: str = "средняя продаж за месяц",
     volume_label: str | None = None,
+    month_median_cents: int | None = None,
+    require_month_median: bool = False,
 ) -> tuple[OrderPlan | None, str]:
     """
     Решить, ставить ли ордер, и по какой цене.
@@ -296,6 +301,10 @@ def plan(
     сутки, неделю и месяц) и из самих сделок Steam (медианы по неделям), и
     человеку надо видеть, о каком из них речь. volume_label — то же про
     объём, когда недельный пересчитан из суточного.
+
+    month_median_cents — медиана сделок Steam за месяц. Цену Steam ею режет
+    вызывающий (её же видно в отчёте); здесь только require_month_median=True:
+    без медианы не знаем, не пик ли нижний лот, и отказываем.
     """
     if steam_price_cents <= 0:
         return None, "нет цены Steam — сравнивать не с чем"
@@ -325,6 +334,9 @@ def plan(
             f"продаётся {volume_per_week} шт/нед при пороге {min_volume_per_week} — "
             "выйти обратно будет не у кого"
         )
+
+    if require_month_median and not month_median_cents:
+        return None, UNKNOWN_MONTH_MEDIAN
 
     if spread_pct is None and require_spread:
         return None, unknown_spread_reason

@@ -33,6 +33,13 @@ Actions (проверено: 12 из 12). Без объёма /orders отказ
 priceoverview отвечает, поэтому продажи за сутки по кандидатам собираются там
 же, где снимок, и приходят в том же файле. У каждой строки своё время замера:
 объём снят позже цен. Старше VOLUME_MAX_AGE_HOURS он не используется.
+
+МЕДИАНА СДЕЛОК ЗА МЕСЯЦ (необязательная колонка «медиана_30д_$»). Нижний лот
+бывает пиком: 2026-10-25 бот считал FAMAS | Bad Trip (Well-Worn) от $55.32, а
+медиана 778 сделок за 30 дней была $51.39. Медиану снимают там же и тогда же,
+что и объём, — из истории продаж на странице предмета, — поэтому время замера
+у них общее («объём_снят_utc») и срок годности тот же. Цена с комиссией, как и
+всё в снимке: столько платил покупатель.
 """
 
 from __future__ import annotations
@@ -69,6 +76,7 @@ _LISTINGS_COLUMNS = ("лотов_на_рынке", "listings")
 _TIME_COLUMNS = ("снято_utc", "collected_at_utc")
 _VOLUME_COLUMNS = ("продано_за_сутки", "steam_sold_24h")
 _VOLUME_TIME_COLUMNS = ("объём_снят_utc", "volume_collected_at_utc")
+_MEDIAN_COLUMNS = ("медиана_30д_$", "steam_median_30d_usd")
 
 
 class SnapshotError(ValueError):
@@ -80,6 +88,8 @@ class Snapshot(NamedTuple):
     prices: dict[str, tuple[int, int | None]]    # имя -> (цена в центах, лотов)
     # имя -> (продано за сутки, когда замерено) — только у тех, кого опросили.
     volumes: dict[str, tuple[int, float]] | None = None
+    # имя -> (медиана сделок за 30 дней в центах, когда замерено).
+    medians: dict[str, tuple[int, float]] | None = None
 
     def age_hours(self, now: float | None = None) -> float:
         return max(0.0, ((now or time.time()) - self.collected_at) / 3600)
@@ -90,13 +100,11 @@ class Snapshot(NamedTuple):
 
     def volume(self, name: str, now: float | None = None) -> tuple[int, float] | None:
         """(продано за сутки, возраст замера в секундах). None — нет или устарел."""
-        row = (self.volumes or {}).get(name)
-        if row is None:
-            return None
-        age = max(0.0, (now or time.time()) - row[1])
-        if age > VOLUME_MAX_AGE_HOURS * 3600:
-            return None
-        return row[0], age
+        return _fresh((self.volumes or {}).get(name), now)
+
+    def month_median(self, name: str, now: float | None = None) -> tuple[int, float] | None:
+        """(медиана сделок за 30 дней в центах, возраст замера в секундах). None — нет или устарела."""
+        return _fresh((self.medians or {}).get(name), now)
 
     def describe(self) -> str:
         stamp = time.strftime("%d.%m %H:%M", time.gmtime(self.collected_at))
@@ -106,7 +114,19 @@ class Snapshot(NamedTuple):
             newest = max(at for _, at in self.volumes.values())
             text += (f", продажи за сутки у {len(self.volumes)} (замер "
                      f"{time.strftime('%d.%m %H:%M', time.gmtime(newest))} UTC)")
+        if self.medians:
+            text += f", медиана сделок за месяц у {len(self.medians)}"
         return text
+
+
+def _fresh(row: tuple[int, float] | None, now: float | None) -> tuple[int, float] | None:
+    """Значение из истории продаж и его возраст — если не старше VOLUME_MAX_AGE_HOURS."""
+    if row is None:
+        return None
+    age = max(0.0, (now or time.time()) - row[1])
+    if age > VOLUME_MAX_AGE_HOURS * 3600:
+        return None
+    return row[0], age
 
 
 def _number(raw: str) -> float | None:
@@ -156,9 +176,11 @@ def _from_csv(text: str) -> Snapshot | None:
     time_i = _column(header, _TIME_COLUMNS)
     volume_i = _column(header, _VOLUME_COLUMNS)
     volume_time_i = _column(header, _VOLUME_TIME_COLUMNS)
+    median_i = _column(header, _MEDIAN_COLUMNS)
 
     prices: dict[str, tuple[int, int | None]] = {}
     volumes: dict[str, tuple[int, float]] = {}
+    medians: dict[str, tuple[int, float]] = {}
     collected_at = None
     for row in rows[1:]:
         if len(row) <= max(name_i, price_i):
@@ -181,8 +203,15 @@ def _from_csv(text: str) -> Snapshot | None:
             sold_at = _parse_time(row[volume_time_i])
             if sold is not None and sold >= 0 and sold_at is not None:
                 volumes[name] = (int(sold), sold_at)
+        # Медиана — с тем же временем замера: без него тоже не берём.
+        if (median_i is not None and volume_time_i is not None
+                and len(row) > max(median_i, volume_time_i)):
+            median = _number(row[median_i])
+            median_at = _parse_time(row[volume_time_i])
+            if median is not None and median > 0 and median_at is not None:
+                medians[name] = (int(round(median * 100)), median_at)
     return _checked(prices, collected_at, has_time_column=time_i is not None,
-                    volumes=volumes)
+                    volumes=volumes, medians=medians)
 
 
 def _from_json(text: str) -> Snapshot | None:
@@ -195,6 +224,7 @@ def _from_json(text: str) -> Snapshot | None:
     items = data["items"]
     prices: dict[str, tuple[int, int | None]] = {}
     volumes: dict[str, tuple[int, float]] = {}
+    medians: dict[str, tuple[int, float]] = {}
     if isinstance(items, list):          # формат merge_history.py
         pairs = ((r.get("name"), r) for r in items if isinstance(r, dict))
     elif isinstance(items, dict):        # формат сборщика
@@ -213,13 +243,18 @@ def _from_json(text: str) -> Snapshot | None:
         sold, sold_at = row.get("sold_24h"), _parse_time(row.get("volume_collected_at_utc"))
         if isinstance(sold, int) and not isinstance(sold, bool) and sold >= 0 and sold_at:
             volumes[name] = (sold, sold_at)
+        median = row.get("median_30d_usd")
+        if (isinstance(median, (int, float)) and not isinstance(median, bool)
+                and median > 0 and sold_at):
+            medians[name] = (int(round(median * 100)), sold_at)
     if not prices:
         return None
     return _checked(prices, _parse_time(data.get("collected_at_utc")), has_time_column=True,
-                    volumes=volumes)
+                    volumes=volumes, medians=medians)
 
 
-def _checked(prices, collected_at, *, has_time_column: bool, volumes=None) -> Snapshot:
+def _checked(prices, collected_at, *, has_time_column: bool, volumes=None,
+             medians=None) -> Snapshot:
     if len(prices) < MIN_ITEMS:
         raise SnapshotError(
             f"в файле всего {len(prices)} цен — это не снимок рынка. Пришли полный "
@@ -240,7 +275,9 @@ def _checked(prices, collected_at, *, has_time_column: bool, volumes=None) -> Sn
     now = time.time()
     volumes = {name: row for name, row in (volumes or {}).items()
                if name in prices and row[1] <= now + 3600}
-    return Snapshot(collected_at, prices, volumes or None)
+    medians = {name: row for name, row in (medians or {}).items()
+               if name in prices and row[1] <= now + 3600}
+    return Snapshot(collected_at, prices, volumes or None, medians or None)
 
 
 def parse(text: str) -> Snapshot | None:
@@ -262,12 +299,21 @@ async def save(snapshot: Snapshot) -> None:
     """Сохранить снимок в хранилище (StorageUnavailable — наружу)."""
     global _cached, _cached_stamp
     volumes = snapshot.volumes or {}
+    medians = snapshot.medians or {}
+
+    def stored(name: str, row: tuple) -> list:
+        # [цена, лотов] или [цена, лотов, продано за сутки, когда замерено,
+        # медиана за месяц] — у объёма и медианы время замера общее.
+        sold, median = volumes.get(name), medians.get(name)
+        if sold is None and median is None:
+            return list(row)
+        return list(row) + [sold[0] if sold else None, (sold or median)[1],
+                            median[0] if median else None]
+
     await save_steam_snapshot(
         {"collected_at": snapshot.collected_at, "count": len(snapshot.prices),
          "uploaded_at": time.time()},
-        # [цена, лотов] или [цена, лотов, продано за сутки, когда замерено]
-        {name: list(row) + list(volumes.get(name, ()))
-         for name, row in snapshot.prices.items()},
+        {name: stored(name, row) for name, row in snapshot.prices.items()},
     )
     _cached = snapshot
     _cached_stamp = None   # своя загрузка: метку подтянет первый же latest()
@@ -319,6 +365,8 @@ async def latest() -> Snapshot | None:
         {name: (int(row[0]), row[1] if len(row) > 1 else None) for name, row in raw.items()},
         {name: (int(row[2]), float(row[3])) for name, row in raw.items()
          if len(row) >= 4 and row[2] is not None and row[3] is not None} or None,
+        {name: (int(row[4]), float(row[3])) for name, row in raw.items()
+         if len(row) >= 5 and row[4] is not None and row[3] is not None} or None,
     )
     _cached_stamp = _stamp(meta)
     return _cached

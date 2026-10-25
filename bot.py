@@ -7104,6 +7104,15 @@ class _OrderCandidate(NamedTuple):
     # Объём продаж — из файла снимка, а не от живого Steam: с адресов
     # дата-центров Steam объём не отдаёт (см. steam_snapshot).
     volume_from_snapshot: bool = False
+    # МЕДИАНА СДЕЛОК STEAM ЗА 30 ДНЕЙ, в центах (см. _with_month_median): цена
+    # Steam для расчёта не выше неё. None — медианы нет, и план не строится.
+    month_median_cents: int | None = None
+    # Сколько секунд назад медиана измерена и откуда — из файла снимка или со
+    # страницы предмета.
+    month_median_age_seconds: float | None = None
+    month_median_from_snapshot: bool = False
+    # Цену Steam срезала медиана за МЕСЯЦ: нижний лот был выше неё.
+    steam_cut_by_month: bool = False
 
 
 def _with_snapshot_volume(c: _OrderCandidate, snapshot) -> _OrderCandidate:
@@ -7120,6 +7129,44 @@ def _with_snapshot_volume(c: _OrderCandidate, snapshot) -> _OrderCandidate:
         return c
     sold, age = known
     return c._replace(volume_per_day=sold, volume_age_seconds=age, volume_from_snapshot=True)
+
+
+def _with_month_median(c: _OrderCandidate, page, snapshot) -> _OrderCandidate:
+    """
+    Цена Steam — не выше медианы сделок за 30 дней.
+
+    Нижний лот бывает пиком: 2026-10-25 бот считал FAMAS | Bad Trip
+    (Well-Worn) от $55.32 и показал прибыль 38%, а медиана 778 сделок за
+    месяц была $51.39 — по ней прибыль ≈28%. Медианы за сутки и за неделю
+    такой пик не срезают: на коротком окне он и есть весь рынок.
+
+    Медиана — со страницы предмета, если её прочитали, иначе из снимка
+    (steam_snapshot: с адреса Render страницу Steam не отдаёт). Нет ни там, ни
+    там — month_median_cents остаётся None, и buy_orders.plan откажет: не
+    знаем, не пик ли перед нами.
+    """
+    median = age = None
+    from_snapshot = False
+    if page is not None and page.has_history and page.history_usd:
+        value = page.median(30)
+        if value:
+            median = int(round(value * 100))
+            age = max(0.0, time.time() - page.fetched_at)
+    if not median and snapshot is not None:
+        known = snapshot.month_median(c.market_hash_name)
+        if known is not None:
+            (median, age), from_snapshot = known, True
+    if not median:
+        return c
+    changes: dict = dict(month_median_cents=median, month_median_age_seconds=age,
+                         month_median_from_snapshot=from_snapshot)
+    if median < c.steam_price_cents:
+        changes.update(
+            steam_ask_cents=c.steam_ask_cents or c.steam_price_cents,
+            steam_price_cents=median,
+            steam_cut_by_month=True,
+        )
+    return c._replace(**changes)
 
 
 def _with_history(c: _OrderCandidate, page) -> _OrderCandidate:
@@ -7234,6 +7281,9 @@ def _plan_inputs(cand: _OrderCandidate, limits: dict) -> dict:
         max_spread_pct=limits["stability"],
         require_spread=True,
         month_avg_cents=cand.month_avg_cents,
+        # Цену уже срезал _with_month_median; без медианы — отказ.
+        month_median_cents=cand.month_median_cents,
+        require_month_median=True,
     )
     if cand.history:
         inputs.update(
@@ -7523,9 +7573,16 @@ async def _order_candidates_from_catalog(
     # одной дорогой продажей вдвое: по ней в полосу $1-65 попадали скины,
     # которые на рынке стоят $20, и живая проверка тратилась на них зря.
     snapshot, _ = await steam_snapshot.current()
+    # Как у отбора по ценам CSFloat: в снимке есть медианы за месяц — без неё
+    # предмет в финале получит отказ, и место ему не отдаём.
+    now = time.time()
+    with_medians = snapshot is not None and any(
+        snapshot.month_median(n, now) for n in snapshot.medians or ()
+    )
 
-    band: list[tuple[str, float, float | None, float | None]] = []
+    band: list[tuple[str, float, float | None, float | None, float]] = []
     skipped_quiet = skipped_jumpy = skipped_young = skipped_mismatch = skipped_ordered = 0
+    skipped_no_median = 0
     from_snapshot = 0
     for name, sp in details.items():
         # Наличие суточного окна само по себе значит, что сделки сегодня были.
@@ -7559,8 +7616,15 @@ async def _order_candidates_from_catalog(
             # описывают чужие дорогие (или дешёвые) сделки, а не этот рынок.
             skipped_mismatch += 1
             continue
+        median = snapshot.month_median(name, now) if snapshot else None
+        if median is None and with_medians:
+            skipped_no_median += 1
+            continue
         from_snapshot += 1 if now_cents else 0
-        band.append((name, price, spread, month_avg))
+        # Цена для оценки — не выше медианы сделок за месяц (см.
+        # _with_month_median); полосу и порядок обхода она не меняет.
+        estimate = min(price, median[0] / 100) if median else price
+        band.append((name, price, spread, month_avg, estimate))
 
     if not band:
         return []
@@ -7589,17 +7653,18 @@ async def _order_candidates_from_catalog(
         "orders: каталог — в полосе $%g-$%g подходят %d предмет(ов) "
         "(пропущено: %d без сделок за сутки, %d без истории за месяц, "
         "%d с ценой, гуляющей за месяц больше %g%%, %d с историей, не сходящейся с "
-        "ценой, %d с уже стоящим ордером). Цена из снимка Steam у %d. Беру %d "
-        "начиная с %d",
+        "ценой, %d с уже стоящим ордером, %d без медианы за месяц в снимке). Цена "
+        "из снимка Steam у %d. Беру %d начиная с %d",
         low, high, len(band), skipped_quiet, skipped_young, skipped_jumpy,
-        max_spread, skipped_mismatch, skipped_ordered, from_snapshot, len(window), cursor,
+        max_spread, skipped_mismatch, skipped_ordered, skipped_no_median, from_snapshot,
+        len(window), cursor,
     )
 
     return [
         _OrderCandidate(
             market_hash_name=name,
             listing_id=None,
-            steam_price_cents=int(round(price * 100)),
+            steam_price_cents=int(round(estimate * 100)),
             # Объём спросим живым Steam по короткому списку — в прайс-листе
             # его нет ни у одного источника.
             volume_per_day=None,
@@ -7607,7 +7672,7 @@ async def _order_candidates_from_catalog(
             source="каталог",
             month_avg_cents=int(round(month_avg * 100)) if month_avg else None,
         )
-        for name, price, spread, month_avg in window
+        for name, price, spread, month_avg, estimate in window
     ]
 
 
@@ -7649,10 +7714,17 @@ async def _order_candidates_from_csfloat(
     max_spread = limits["stability"]
     cap = int(round(high * 100))
     now = time.time()
+    # Снимок с медианами за месяц: кому медианы нет, тот в финале получит
+    # отказ (buy_orders.UNKNOWN_MONTH_MEDIAN) — место в финале ему не отдаём.
+    # Снимок без медиан (старый файл) никого не отсеивает: отчёт скажет, что
+    # прислать.
+    with_medians = snapshot is not None and any(
+        snapshot.month_median(n, now) for n in snapshot.medians or ()
+    )
 
     picked = []
     skipped = dict(quiet=0, jumpy=0, mismatch=0, costly=0, far=0, recent=0, thin=0,
-                   ordered=0)
+                   ordered=0, no_median=0)
     for name, cf in price_list.prices.items():
         sp = details.get(name)
         if sp is None or (cf.top_cents is None and cf.low_cents is None):
@@ -7678,7 +7750,15 @@ async def _order_candidates_from_csfloat(
         ):
             skipped["mismatch"] += 1
             continue
+        median = snapshot.month_median(name, now) if snapshot else None
+        if median is None and with_medians:
+            skipped["no_median"] += 1
+            continue
         steam_cents = int(round(price * 100))
+        if median is not None:
+            # Нижний лот бывает пиком — прибыль считаем не выше медианы
+            # сделок за месяц (см. _with_month_median).
+            steam_cents = min(steam_cents, median[0])
         ceiling = min(buy_orders.ceiling_for(steam_cents, limits["profit"]), cap)
         # Та же цена, что посчитает buy_orders.plan: на шаг выше верхнего, а
         # без ордеров — по потолку; дотянулись до витрины — по цене лота.
@@ -7713,12 +7793,14 @@ async def _order_candidates_from_csfloat(
         "полосе $%g-$%g (пропущено: %d без сделок за сутки, %d без ровного "
         "месяца, %d с историей не по цене, %d где верхний ордер выше потолка, "
         "%d где заявка ниже витрины в разы, %d отказанных за последние %d ч, "
-        "%d с малыми продажами по снимку, %d с уже стоящим ордером). Цена Steam "
-        "из снимка: %s. Беру %d, объём из снимка у %d",
+        "%d с малыми продажами по снимку, %d с уже стоящим ордером, %d без медианы "
+        "за месяц в снимке). Цена Steam из снимка: %s. Беру %d, объём из снимка у %d",
         price_list.describe(), len(picked), low, high, skipped["quiet"],
         skipped["jumpy"], skipped["mismatch"], skipped["costly"], skipped["far"],
         skipped["recent"], ORDERS_REFUSED_PAUSE_SECONDS // 3600, skipped["thin"],
-        skipped["ordered"], "да" if snapshot else "нет, средние прайс-листа", len(batch),
+        skipped["ordered"], skipped["no_median"],
+        ("да, не выше медианы за месяц" if with_medians else "да, медиан нет")
+        if snapshot else "нет, средние прайс-листа", len(batch),
         sum(1 for row in batch if row[6] is not None),
     )
     return [
@@ -8179,6 +8261,17 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.info("orders: объём продаж из снимка у %d из %d финалист(ов)",
                      from_file, len(ranked))
 
+        # Цена Steam — не выше медианы сделок за месяц: нижний лот бывает пиком.
+        ranked = [_with_month_median(c, pages.get(c.market_hash_name), volume_snapshot)
+                  for c in ranked]
+        log.info(
+            "orders: медиана сделок Steam за месяц известна у %d из %d финалист(ов) "
+            "(из снимка у %d), срезала цену у %d",
+            sum(1 for c in ranked if c.month_median_cents), len(ranked),
+            sum(1 for c in ranked if c.month_median_from_snapshot),
+            sum(1 for c in ranked if c.steam_cut_by_month),
+        )
+
     plans: list[tuple[_OrderCandidate, buy_orders.OrderPlan]] = []
     refused: list[tuple[str, str]] = []
     # Предметы, у которых стакан прочитать не вышло. Ордер по ним считается —
@@ -8366,7 +8459,8 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Отказанных отбор по ценам CSFloat какое-то время не предлагает снова
     # (см. ORDERS_REFUSED_PAUSE_SECONDS). Кроме отказов из незнания: объём или
     # история не пришли от Steam — это новость про Steam, а не про предмет.
-    unknown = (buy_orders.UNKNOWN_VOLUME, buy_orders.UNKNOWN_STABILITY)
+    unknown = (buy_orders.UNKNOWN_VOLUME, buy_orders.UNKNOWN_STABILITY,
+               buy_orders.UNKNOWN_MONTH_MEDIAN)
     stamp = time.time()
     for name, why in refused:
         if why not in unknown:
@@ -8479,12 +8573,32 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             if cand.sold_week is not None:
                 lines.append(f"  📦 в Steam продано за 7 дней: {cand.sold_week} шт")
-            if cand.steam_ask_cents:
+            # Откуда медиана за месяц и сколько ей — как у объёма из снимка.
+            median_from = ""
+            if cand.month_median_cents:
+                median_age = cand.month_median_age_seconds or 0
+                median_from = (
+                    "со страницы Steam" if not cand.month_median_from_snapshot
+                    else f"из снимка, замер {median_age / 3600:.0f} ч назад"
+                    if median_age >= 3600 else "из снимка, замер меньше часа назад"
+                )
+            if cand.steam_cut_by_month:
+                lines.append(
+                    f"  ℹ️ {'нижний лот в Steam' if verified else 'оценка цены Steam'} "
+                    f"${cand.steam_ask_cents / 100:.2f} выше медианы сделок за месяц — "
+                    f"считаю по медиане ${plan.steam_price_cents / 100:.2f} ({median_from})"
+                )
+            elif cand.steam_ask_cents:
                 period = "неделю" if cand.steam_cut_by_week else "сутки"
                 lines.append(
                     f"  ℹ️ нижний лот в Steam ${cand.steam_ask_cents / 100:.2f}, но "
                     f"сделки за {period} шли по ${plan.steam_price_cents / 100:.2f} — "
                     "считаю по сделкам"
+                )
+            if cand.month_median_cents and not cand.steam_cut_by_month:
+                lines.append(
+                    f"  📉 медиана сделок Steam за месяц "
+                    f"${cand.month_median_cents / 100:.2f} ({median_from}) — цена не выше неё"
                 )
             age = cand.volume_age_seconds
             if cand.volume_from_snapshot and age is not None:
@@ -8583,6 +8697,25 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             + (f" ({', '.join(waits)})" if waits else "")
             + ". Не ждать: <code>/setorders - 0 - -</code> выключит проверку "
             "ликвидности совсем."
+        )
+
+    # Медиану за месяц с адреса бота не взять (страницу предмета Steam не
+    # отдаёт) — она приходит в снимке. Отказ из-за неё — новость про снимок.
+    no_median = sum(1 for _, why in refused if why == buy_orders.UNKNOWN_MONTH_MEDIAN)
+    if no_median:
+        if snapshot is None:
+            where = "снимка цен Steam нет"
+        elif not snapshot.medians:
+            where = "в снимке нет колонки «медиана_30д_$»"
+        else:
+            where = (f"в снимке её у них нет или замер старше "
+                     f"{steam_snapshot.VOLUME_MAX_AGE_HOURS:.0f} ч")
+        lines.append("")
+        lines.append(
+            f"⚠️ Медианы сделок за месяц нет у {no_median} предмет(ов): страницу "
+            f"предмета Steam с адреса бота не отдаёт, а {where}. Без медианы "
+            "цену не считаю — нижний лот бывает пиком. Свежий снимок с медианами: "
+            "/steamprices"
         )
 
     if refused:
@@ -9907,6 +10040,17 @@ def _snapshot_lines(snapshot, counts: dict[str, int], threshold: float) -> list[
                 "берёт их, когда живой Steam объём не отдаёт, и сразу отсеивает "
                 "малопродаваемые (годятся "
                 f"{steam_snapshot.VOLUME_MAX_AGE_HOURS:.0f} ч от замера)"
+            )
+        if snapshot.medians:
+            lines.append(
+                f"• медиана сделок за месяц — у {len(snapshot.medians)} предметов: "
+                "/orders и поддержка ордеров считают цену Steam не выше неё (годится "
+                f"{steam_snapshot.VOLUME_MAX_AGE_HOURS:.0f} ч от замера)"
+            )
+        else:
+            lines.append(
+                "• ⚠️ медиан сделок за месяц в файле нет (колонка «медиана_30д_$») — "
+                "без них /orders планов не строит: нижний лот бывает пиком"
             )
         lines.append(
             f"• годится ещё {steam_snapshot.MAX_AGE_HOURS - snapshot.age_hours():.0f} ч, "
