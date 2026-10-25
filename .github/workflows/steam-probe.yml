@@ -1,0 +1,75 @@
+# Разовая проверка: отдаёт ли Steam машинам GitHub Actions страницы НОВОГО
+# рынка (страница группы предмета), а в них — историю продаж за месяц.
+# Старую страницу с bMarketOptOut=1 и priceoverview отсюда Steam не отдаёт
+# (2026-10-25, 12 из 12 — 429). Запуск только вручную.
+name: steam-probe
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: group pages
+        shell: python3 {0}
+        run: |
+          import json, re, subprocess, time, urllib.parse
+          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+          SSR = re.compile(r'<script[^>]*id="valve-ssr-data"[^>]*>(.*?)</script>', re.S)
+          names = [
+              "Sawed-Off | The Kraken (Field-Tested)", "M4A4 | Royal Paladin (Well-Worn)",
+              "StatTrak™ MP9 | Starlight Protector (Battle-Scarred)",
+              "StatTrak™ Desert Eagle | Ocean Drive (Well-Worn)", "Five-SeveN | Angry Mob (Minimal Wear)",
+              "StatTrak™ AK-47 | Nightwish (Battle-Scarred)", "FAMAS | Bad Trip (Well-Worn)",
+              "Dust II Pin", "Guardian Elite Pin", "Souvenir M4A4 | Hellish (Well-Worn)",
+              "★ Hydra Gloves | Rattler (Well-Worn)", "USP-S | Printstream (Well-Worn)",
+              "M4A4 | Full Throttle (Field-Tested)", "FAMAS | Commemoration (Minimal Wear)",
+              "ESL One Cologne 2014 Legends", "★ Survival Knife | Blue Steel (Minimal Wear)",
+              "AK-47 | Redline (Field-Tested)", "AWP | Asiimov (Field-Tested)",
+              "USP-S | Cyrex (Factory New)", "Tec-9 | Cracked Opal (Factory New)",
+          ]
+          strikes = 0
+          started = time.time()
+          for i, name in enumerate(names, 1):
+              url = "https://steamcommunity.com/market/listings/730/" + urllib.parse.quote(name, safe="")
+              t = time.time()
+              out = subprocess.run(
+                  ["curl", "-sSL", "--compressed", "--max-time", "60", "-A", UA,
+                   "-H", "Accept-Language: en-US,en;q=0.9", "-o", "page.html",
+                   "-w", "%{http_code} %{num_redirects} %{size_download} %{url_effective}", url],
+                  capture_output=True, text=True).stdout.split(" ", 3)
+              code, redirects, size, final = (out + ["", "", "", ""])[:4]
+              html = open("page.html", encoding="utf-8", errors="replace").read() if code else ""
+              note = ""
+              m = SSR.search(html)
+              if m:
+                  try:
+                      data = json.loads(m.group(1))
+                      queries = json.loads(data["renderContext"]["queryData"])["queries"]
+                      hist = {q["queryKey"][3]: (q.get("state") or {}).get("data") or {}
+                              for q in queries
+                              if (q.get("queryKey") or [])[:2] == ["market", "pricehistory"]}
+                      mine = hist.get(name) or {}
+                      month = [p for p in mine.get("prices") or [] if p["time"] >= t - 30 * 86400]
+                      note = (f"ssr variants={len(hist)} currency={mine.get('ecurrency')} "
+                              f"month_points={len(month)} sold30={sum(int(p['purchases']) for p in month)}")
+                  except Exception as e:  # noqa: BLE001
+                      note = f"ssr parse error {type(e).__name__}: {e}"[:200]
+              else:
+                  note = f"no ssr, line1={'var line1' in html}, head={html[:80]!r}"
+              print(f"{i:2} {time.strftime('%H:%M:%S')} {code} redirects={redirects} "
+                    f"bytes={size} {time.time() - t:.1f}s {final.rsplit('/', 1)[-1][:40]} | {note}", flush=True)
+              strikes = strikes + 1 if code == "429" else 0
+              if strikes >= 4:
+                  print("4 x 429 подряд — стоп", flush=True)
+                  break
+              time.sleep(3.5)
+          print(f"всего {time.time() - started:.0f} с", flush=True)
+          q = urllib.parse.quote(json.dumps([730, "AK-47 | Redline (Field-Tested)"]), safe="")
+          code = subprocess.run(
+              ["curl", "-s", "-A", UA, "-H", "x-valve-request-type: queryAction", "-o", "actions.json",
+               "-w", "%{http_code}", f"https://steamcommunity.com/market/actions?q=QueryPriceHistory&qp={q}"],
+              capture_output=True, text=True).stdout
+          print("market/actions QueryPriceHistory:", code, open("actions.json", "rb").read()[:120])
