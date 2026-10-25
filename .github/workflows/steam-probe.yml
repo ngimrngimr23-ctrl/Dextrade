@@ -1,0 +1,30 @@
+# Разовая проверка: отвечает ли Steam (priceoverview и страница предмета)
+# машинам GitHub Actions. С адреса Render 2026-10-25 оба отвечали 429 на
+# первом же запросе. Запуск только вручную.
+name: steam-probe
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: priceoverview and item page
+        run: |
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+          for n in "AK-47%20%7C%20Redline%20%28Field-Tested%29" "AWP%20%7C%20Asiimov%20%28Field-Tested%29" \
+                   "USP-S%20%7C%20Road%20Rash%20%28Minimal%20Wear%29" "Tec-9%20%7C%20Cracked%20Opal%20%28Factory%20New%29" \
+                   "Nova%20%7C%20Interlock%20%28Factory%20New%29" "SG%20553%20%7C%20Gator%20Mesh%20%28Minimal%20Wear%29" \
+                   "Dual%20Berettas%20%7C%20Briar%20%28Factory%20New%29" "FAMAS%20%7C%20Djinn%20%28Factory%20New%29" \
+                   "AK-47%20%7C%20Green%20Laminate%20%28Factory%20New%29" "XM1014%20%7C%20Solitude%20%28Factory%20New%29" \
+                   "Sticker%20Slab%20%7C%20WARNING%20%28Foil%29" "USP-S%20%7C%20Cyrex%20%28Factory%20New%29"; do
+            code=$(curl -s -A "$UA" -o body.json -w "%{http_code}" "https://steamcommunity.com/market/priceoverview/?appid=730&currency=1&market_hash_name=$n")
+            echo "priceoverview $code $(head -c 120 body.json)"
+            sleep 3
+          done
+          for n in "AK-47%20%7C%20Redline%20%28Field-Tested%29" "USP-S%20%7C%20Road%20Rash%20%28Minimal%20Wear%29"; do
+            code=$(curl -s -A "$UA" -H "Cookie: bMarketOptOut=1" -H "Accept-Language: en-US,en;q=0.9" -o page.html -w "%{http_code}" "https://steamcommunity.com/market/listings/730/$n")
+            echo "page $code size=$(wc -c < page.html) line1=$(grep -c 'var line1' page.html)"
+            sleep 4
+          done
