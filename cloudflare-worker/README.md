@@ -63,7 +63,8 @@ Cloudflare Dashboard → Workers & Pages → `dextrade-steam-proxy` → Edit cod
 | Переменная | Значение |
 |---|---|
 | `CSFLOAT_PROXY_URL` | `https://<воркер>.workers.dev` |
-| `STEAM_PROXY_URL` | то же самое, если понадобится Steam через прокси (сейчас не нужно) |
+| `STEAM_HISTORY_PROXY_URL` | то же самое — история продаж Steam (медиана за месяц для `/orders`), когда адресу Render Steam отвечает 429; другие запросы к Steam не трогает |
+| `STEAM_PROXY_URL` | то же самое, если понадобится Steam через прокси целиком, включая `/render/` (сейчас не нужно) |
 
 Бот обращается так: `GET /proxy?url=<целевой URL>`.
 

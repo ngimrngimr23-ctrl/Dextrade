@@ -116,3 +116,8 @@ services:
       # Тот же воркер для Steam. В рабочей конфигурации не используется.
       - key: STEAM_PROXY_URL
         sync: false
+      # Тот же воркер — только для истории продаж Steam (медиана сделок за
+      # месяц для /orders), когда адресу Render Steam отвечает 429. Остальные
+      # запросы к Steam не трогает. Формат: https://<имя>.<поддомен>.workers.dev
+      - key: STEAM_HISTORY_PROXY_URL
+        sync: false

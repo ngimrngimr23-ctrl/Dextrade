@@ -110,11 +110,40 @@ _USD = 1   # ecurrency доллара
 # Запасной маршрут ручки — Cloudflare Worker бота (cloudflare-worker/worker.js,
 # тот же, что у CSFloat; steamcommunity.com в нём разрешён). Исходящий адрес у
 # воркера из пула Cloudflare, а не общий адрес Render, которому ручка
-# 2026-10-25 ответила 429 на первом же запросе. Адрес — STEAM_PROXY_URL, а
-# если он пуст (Steam через воркер больше ничего не ходит) — CSFLOAT_PROXY_URL.
-WORKER_URL = (steam_client.STEAM_PROXY_URL
-              or os.environ.get("CSFLOAT_PROXY_URL", "").strip().rstrip("/"))
+# 2026-10-25 ответила 429 на первом же запросе.
+#
+# Переменная своя, STEAM_HISTORY_PROXY_URL. STEAM_PROXY_URL увёл бы через
+# воркер ещё и /render/, а он с Render работает; CSFLOAT_PROXY_URL — CSFloat,
+# как только опустеет пул прокси. Обе остались запасными источниками адреса:
+# 2026-10-25 на Render не было задано ни одной, и маршрут молчал.
+WORKER_ENV = "STEAM_HISTORY_PROXY_URL"
+
+
+def _worker_base(raw: str) -> str:
+    """
+    Адрес воркера так, как его ждёт маршрут: со схемой, без хвостового «/» и
+    «/proxy». Вставляют его из панели Cloudflare кто как — с https:// и без,
+    со ссылкой на /proxy и без, — и каждая такая мелочь молча ломала бы маршрут.
+    """
+    url = raw.strip().rstrip("/")
+    if url.endswith("/proxy"):
+        url = url[:-len("/proxy")]
+    if url and "://" not in url:
+        url = "https://" + url
+    return url
+
+
+WORKER_URL = _worker_base(os.environ.get(WORKER_ENV, "")
+                          or steam_client.STEAM_PROXY_URL
+                          or os.environ.get("CSFLOAT_PROXY_URL", ""))
 WORKER_SCOPE = "history_api_cf"
+
+
+def routes_description() -> str:
+    """Маршруты ручки истории одной строкой — для лога при старте."""
+    if WORKER_URL:
+        return f"напрямую, а после 429 — через воркер {WORKER_URL}"
+    return f"только напрямую: воркер не задан ({WORKER_ENV} пуст)"
 
 # Сколько держать страницу в памяти. История за месяц за три часа почти не
 # меняется; цене нижнего лота столько доверять нельзя, поэтому каждый
@@ -580,7 +609,7 @@ async def _ask_price_history(market_hash_name: str, scope: str, worker: str | No
                     "история продаж (ручка нового рынка, %s): %s — HTTP 429%s",
                     route, market_hash_name,
                     "" if worker or WORKER_URL else
-                    "; запасного маршрута нет (STEAM_PROXY_URL и CSFLOAT_PROXY_URL пусты)",
+                    f"; запасного маршрута нет — воркер не задан ({WORKER_ENV} пуст)",
                 )
                 await note_steam_429(scope=scope, headers=dict(resp.headers))
                 return _RATE_LIMITED

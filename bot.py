@@ -8739,20 +8739,28 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     no_median = sum(1 for _, why in refused if why == buy_orders.UNKNOWN_MONTH_MEDIAN)
     if no_median:
         api_wait = steam_history.history_api_wait()
-        if snapshot is None:
-            where = "снимка цен Steam нет"
-        elif not snapshot.medians:
-            where = "в снимке медиан нет"
+        pause = f"429, пауза ещё {api_wait / 60:.0f} мин"
+        if api_wait > 0 and steam_history.WORKER_URL:
+            why = (f"Steam не отдаёт историю продаж ни с адреса бота, ни через "
+                   f"воркер Cloudflare ({pause})")
+        elif api_wait > 0:
+            # Самое частое и единственное, что чинится настройкой, — говорим,
+            # какой именно.
+            why = (f"Steam не отдаёт историю продаж с адреса бота ({pause}), а "
+                   f"запасной маршрут через воркер Cloudflare не подключён — "
+                   f"нужен адрес воркера в <code>{steam_history.WORKER_ENV}</code> "
+                   f"в настройках Render")
         else:
-            where = (f"в снимке её у них нет или замер старше "
-                     f"{steam_snapshot.VOLUME_MAX_AGE_HOURS:.0f} ч")
+            why = "историю продаж Steam по ним прочитать не вышло"
+        # Снимок поминаем, только если медианы в нём бывают: иначе это
+        # отсылка к файлу, которого никто не присылал.
+        if snapshot is not None and snapshot.medians:
+            why += (f"; в снимке её у них нет или замер старше "
+                    f"{steam_snapshot.VOLUME_MAX_AGE_HOURS:.0f} ч")
         lines.append("")
         lines.append(
-            f"⚠️ Медианы сделок за месяц нет у {no_median} предмет(ов): историю "
-            "продаж Steam "
-            + (f"с адреса бота не отдаёт (429, пауза ещё {api_wait / 60:.0f} мин)"
-               if api_wait > 0 else "по ним прочитать не вышло")
-            + f", а {where}. Без медианы цену не считаю — нижний лот бывает пиком."
+            f"⚠️ Медианы сделок за месяц нет у {no_median} предмет(ов): {why}. "
+            "Без медианы цену не считаю — нижний лот бывает пиком."
         )
 
     if refused:
@@ -12519,6 +12527,7 @@ def _start_health_server():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     log.info("health-check сервер слушает порт %d", port)
     log.info("версия кода: %s", deployed_version())
+    log.info("история продаж Steam: %s", steam_history.routes_description())
 
 
 # Telegram принимает секрет только из этих символов, 1-256 длиной. Несоблюдение
