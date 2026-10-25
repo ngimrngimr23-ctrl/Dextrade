@@ -1,7 +1,7 @@
-# Разовая проверка: отдаёт ли Steam машинам GitHub Actions страницы НОВОГО
-# рынка (страница группы предмета), а в них — историю продаж за месяц.
-# Старую страницу с bMarketOptOut=1 и priceoverview отсюда Steam не отдаёт
-# (2026-10-25, 12 из 12 — 429). Запуск только вручную.
+# Разовая проверка: отдаёт ли Steam машинам GitHub Actions историю продаж
+# через ручку нового рынка market/actions?q=QueryPriceHistory и сколько
+# запросов подряд. Страницу предмета (старую и новую) и priceoverview Steam
+# отсюда не отдаёт — 429 на первом же запросе. Запуск только вручную.
 name: steam-probe
 on: workflow_dispatch
 permissions:
@@ -9,67 +9,63 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
-      - name: group pages
+      - name: QueryPriceHistory
         shell: python3 {0}
+        env:
+          NAMES: '["★ Paracord Knife | Urban Masked (Minimal Wear)", "ESL One Cologne 2014 Legends", "★ Bowie Knife | Black Laminate (Well-Worn)", "★ Nomad Knife | Safari Mesh (Well-Worn)", "Sawed-Off | The Kraken (Field-Tested)", "M4A4 | Royal Paladin (Well-Worn)", "★ Survival Knife | Blue Steel (Minimal Wear)", "StatTrak™ MP9 | Starlight Protector (Battle-Scarred)", "StatTrak™ MP9 | Starlight Protector (Well-Worn)", "StatTrak™ Desert Eagle | Ocean Drive (Well-Worn)", "MP9 | Starlight Protector (Well-Worn)", "★ StatTrak™ Survival Knife | Boreal Forest (Battle-Scarred)", "★ Huntsman Knife | Ultraviolet (Well-Worn)", "★ Broken Fang Gloves | Needle Point (Minimal Wear)", "Five-SeveN | Angry Mob (Minimal Wear)", "StatTrak™ AK-47 | Nightwish (Battle-Scarred)", "★ StatTrak™ Paracord Knife", "★ Shadow Daggers | Damascus Steel (Minimal Wear)", "StatTrak™ FAMAS | Bad Trip (Well-Worn)", "★ StatTrak™ Kukri Knife | Safari Mesh (Battle-Scarred)", "StatTrak™ AK-47 | Redline (Well-Worn)", "FAMAS | Bad Trip (Well-Worn)", "Dust II Pin", "Guardian Elite Pin", "Souvenir M4A4 | Hellish (Well-Worn)", "★ Hydra Gloves | Rattler (Well-Worn)", "★ Hydra Gloves | Mangrove (Minimal Wear)", "USP-S | Printstream (Well-Worn)", "M4A4 | Full Throttle (Field-Tested)", "FAMAS | Commemoration (Minimal Wear)", "★ Driver Gloves | Racing Green (Well-Worn)", "AUG | Sand Storm (Factory New)", "M4A4 | The Battlestar (Minimal Wear)", "Charm | Lil'' Eldritch", "AWP | Exoskeleton (Factory New)", "MP7 | Bloodsport (Battle-Scarred)", "Charm | Quick Silver", "M4A1-S | Control Panel (Minimal Wear)", "M4A1-S | Moss Quartz (Minimal Wear)", "Sticker | nitr0 (Foil) | MLG Columbus 2016", "FAMAS | Spitfire (Battle-Scarred)", "StatTrak™ USP-S | Monster Mashup (Well-Worn)", "StatTrak™ Glock-18 | Mirror Mosaic (Minimal Wear)", "SCAR-20 | Bloodsport (Factory New)", "Little Kev | The Professionals", "StatTrak™ M4A4 | Turbine (Factory New)", "StatTrak™ SCAR-20 | Bloodsport (Factory New)", "MP7 | Nemesis (Factory New)", "Sticker | Fnatic | Katowice 2015", "Krakow 2017 Challengers Autograph Capsule", "Chem-Haz Capitaine | Gendarmerie Nationale", "StatTrak™ MP7 | Abyssal Apparition (Factory New)", "Sticker | FURIA (Holo) | Katowice 2019", "StatTrak™ MP5-SD | Phosphor (Minimal Wear)", "Civil Protection Pin", "CZ75-Auto | Xiangliu (Factory New)", "Dragomir | Sabre Footsoldier", "Five-SeveN | Anodized Gunmetal (Minimal Wear)", "Sticker | ropz (Gold) | Austin 2025", "Sticker | device (Foil) | Katowice 2019", "Osiris | Elite Crew", "Sticker | Team Spirit | Katowice 2019", "Brigadier General Pin", "Katowice 2019 Legends (Holo-Foil)", "Sticker | 9z Team (Holo) | Antwerp 2022", "StatTrak™ UMP-45 | Wild Child (Factory New)", "Sticker | k0nfig | Atlanta 2017", "Sticker | NiKo (Foil) | Berlin 2019", "Rezan The Ready | Sabre", "Berlin 2019 Overpass Souvenir Package", "StatTrak™ Music Kit | Freaky DNA, Vici", "Ground Rebel  | Elite Crew", "Slingshot | Phoenix", "P250 | Red Rock (Field-Tested)", "Markus Delrow | FBI HRT", "Sticker | reltuC (Foil) | Cologne 2015", "Autograph Capsule | Natus Vincere | MLG Columbus 2016", "Sticker | Fnatic (Foil) | Cluj-Napoca 2015", "Sticker | NiKo (Holo) | Stockholm 2021", "Sticker | karrigan (Gold) | Paris 2023", "Blackwolf | Sabre", "Souvenir SSG 08 | Detour (Minimal Wear)", "Souvenir Dual Berettas | Demolition (Field-Tested)", "Sticker | MUTiRiS (Gold) | Copenhagen 2024", "Sticker | Great Wave (Holo)", "Winter Offensive Weapon Case", "P250 | Cartel (Well-Worn)", "PP-Bizon | Blue Streak (Factory New)", "Sticker | coldzera | MLG Columbus 2016", "Tec-9 | Hades (Minimal Wear)", "Sticker | Flipsid3 Tactics | Krakow 2017", "Sticker Capsule 2", "Rezan the Redshirt | Sabre", "Sticker | Flipsid3 Tactics | Cologne 2016", "Sticker | Team SoloMid (Foil) | Cluj-Napoca 2015", "StatTrak™ Zeus x27 | Olympus (Minimal Wear)", "Cache Pin", "Huntsman Weapon Case", "Sticker | Battle Scarred (Holo)", "Sticker | Jame (Gold, Champion) | Rio 2022", "Aces High Pin", "Sticker | Hobbit (Foil) | Krakow 2017", "MAG-7 | Core Breach (Factory New)", "Autograph Capsule | Team Kinguin | Cologne 2015", "Sawed-Off | Sage Spray (Factory New)", "Sticker | FaZe Clan (Gold) | Antwerp 2022", "''Two Times'' McCoy | TACP Cavalry", "Prof. Shahmat | Elite Crew", "CS:GO Weapon Case 3", "Sticker | dexter (Glitter) | Shanghai 2024", "Sticker | Spiidi (Foil) | MLG Columbus 2016", "Sticker | Twistzz (Gold) | Shanghai 2024", "Sticker | Dragon Lore Surf Ava (Foil)", "SSG 08 | Threat Detected (Field-Tested)", "CZ75-Auto | Xiangliu (Minimal Wear)", "Sticker | Copenhagen Flames (Holo) | Antwerp 2022", "''Two Times'' McCoy | USAF TACP", "Sticker | FURIA (Holo) | Copenhagen 2024", "Sticker | flusha (Foil) | MLG Columbus 2016", "Sticker | Winstrike Team (Holo) | London 2018", "Sticker | Opal Flick (Holo)", "StatTrak™ M4A1-S | Blood Tiger (Factory New)", "Negev | Loudmouth (Minimal Wear)", "Sticker | Outsiders (Gold) | Rio 2022", "AUG | Syd Mead (Well-Worn)", "Sticker | GODSENT (Holo) | Stockholm 2021", "Sticker | FaZe (Foil) | 2020 RMR", "Sticker | mou (Foil) | Krakow 2017", "Negev | Bratatat (Factory New)", "Sticker | FaZe (Gold) | 2020 RMR", "Autograph Capsule | Splyce | MLG Columbus 2016", "Souvenir SSG 08 | Tropical Storm (Field-Tested)", "Sticker | Dragon Lore (Foil)", "M4A1-S | Decimator (Well-Worn)", "Maximus | Sabre", "Music Kit | Knock2, dashstar*", "Autograph Capsule | Natus Vincere | Cluj-Napoca 2015", "Dual Berettas | Pyre (Field-Tested)", "StatTrak™ Deluge Music Kit Box", "Sticker | Dead Eye (Holo)", "eSports 2014 Summer Case", "Dragomir | Sabre", "XM1014 | XOXO (Factory New)", "Sticker | Tyloo (Holo) | Stockholm 2021", "Collectible Pins Capsule Series 1", "Collectible Pins Capsule Series 3", "Sticker | Cloud9 (Holo) | Copenhagen 2024", "MP5-SD | Phosphor (Factory New)", "Souvenir MAC-10 | Nuclear Garden (Field-Tested)", "Souvenir P90 | ScaraB Rush (Minimal Wear)"]'
         run: |
-          import json, re, subprocess, time, urllib.parse
+          import json, os, subprocess, time, urllib.parse
           UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
-          SSR = re.compile(r'<script[^>]*id="valve-ssr-data"[^>]*>(.*?)</script>', re.S)
-          names = [
-              "Sawed-Off | The Kraken (Field-Tested)", "M4A4 | Royal Paladin (Well-Worn)",
-              "StatTrak™ MP9 | Starlight Protector (Battle-Scarred)",
-              "StatTrak™ Desert Eagle | Ocean Drive (Well-Worn)", "Five-SeveN | Angry Mob (Minimal Wear)",
-              "StatTrak™ AK-47 | Nightwish (Battle-Scarred)", "FAMAS | Bad Trip (Well-Worn)",
-              "Dust II Pin", "Guardian Elite Pin", "Souvenir M4A4 | Hellish (Well-Worn)",
-              "★ Hydra Gloves | Rattler (Well-Worn)", "USP-S | Printstream (Well-Worn)",
-              "M4A4 | Full Throttle (Field-Tested)", "FAMAS | Commemoration (Minimal Wear)",
-              "ESL One Cologne 2014 Legends", "★ Survival Knife | Blue Steel (Minimal Wear)",
-              "AK-47 | Redline (Field-Tested)", "AWP | Asiimov (Field-Tested)",
-              "USP-S | Cyrex (Factory New)", "Tec-9 | Cracked Opal (Factory New)",
-          ]
-          strikes = 0
+          names = json.loads(os.environ["NAMES"])
+          ok = bad = strikes = 0
           started = time.time()
           for i, name in enumerate(names, 1):
-              url = "https://steamcommunity.com/market/listings/730/" + urllib.parse.quote(name, safe="")
+              qp = urllib.parse.quote(json.dumps([730, name], ensure_ascii=False), safe="")
               t = time.time()
-              out = subprocess.run(
-                  ["curl", "-sSL", "--compressed", "--max-time", "60", "-A", UA,
-                   "-H", "Accept-Language: en-US,en;q=0.9", "-o", "page.html",
-                   "-w", "%{http_code} %{num_redirects} %{size_download} %{url_effective}", url],
-                  capture_output=True, text=True).stdout.split(" ", 3)
-              code, redirects, size, final = (out + ["", "", "", ""])[:4]
-              html = open("page.html", encoding="utf-8", errors="replace").read() if code else ""
+              code = subprocess.run(
+                  ["curl", "-s", "--compressed", "--max-time", "30", "-A", UA,
+                   "-H", "x-valve-request-type: queryAction", "-H", "Accept: application/json",
+                   "-H", "Referer: https://steamcommunity.com/market/", "-o", "h.json",
+                   "-w", "%{http_code} %{size_download}",
+                   f"https://steamcommunity.com/market/actions?q=QueryPriceHistory&qp={qp}"],
+                  capture_output=True, text=True).stdout
+              code, _, size = code.partition(" ")
               note = ""
-              m = SSR.search(html)
-              if m:
+              if code == "200":
+                  ok += 1
+                  strikes = 0
                   try:
-                      data = json.loads(m.group(1))
-                      queries = json.loads(data["renderContext"]["queryData"])["queries"]
-                      hist = {q["queryKey"][3]: (q.get("state") or {}).get("data") or {}
-                              for q in queries
-                              if (q.get("queryKey") or [])[:2] == ["market", "pricehistory"]}
-                      mine = hist.get(name) or {}
-                      month = [p for p in mine.get("prices") or [] if p["time"] >= t - 30 * 86400]
-                      note = (f"ssr variants={len(hist)} currency={mine.get('ecurrency')} "
-                              f"month_points={len(month)} sold30={sum(int(p['purchases']) for p in month)}")
+                      data = json.load(open("h.json"))["data"]
+                      prices = data.get("prices") or []
+                      month = sorted((p["price_median"], int(p["purchases"])) for p in prices
+                                     if p["time"] >= t - 30 * 86400 and int(p["purchases"]) > 0)
+                      total = sum(n for _, n in month)
+                      seen, median = 0, None
+                      for price, n in month:
+                          seen += n
+                          if seen >= total / 2:
+                              median = price
+                              break
+                      newest = max((p["time"] for p in prices), default=0)
+                      note = (f"cur={data.get('ecurrency')} points={len(prices)} month={len(month)} "
+                              f"sold30={total} median30={median} newest={time.strftime('%d %H:%M', time.gmtime(newest))}")
                   except Exception as e:  # noqa: BLE001
-                      note = f"ssr parse error {type(e).__name__}: {e}"[:200]
+                      note = f"parse {type(e).__name__}: {open('h.json', 'rb').read()[:100]!r}"
               else:
-                  note = f"no ssr, line1={'var line1' in html}, head={html[:80]!r}"
-              print(f"{i:2} {time.strftime('%H:%M:%S')} {code} redirects={redirects} "
-                    f"bytes={size} {time.time() - t:.1f}s {final.rsplit('/', 1)[-1][:40]} | {note}", flush=True)
-              strikes = strikes + 1 if code == "429" else 0
-              if strikes >= 4:
-                  print("4 x 429 подряд — стоп", flush=True)
-                  break
-              time.sleep(3.5)
-          print(f"всего {time.time() - started:.0f} с", flush=True)
-          q = urllib.parse.quote(json.dumps([730, "AK-47 | Redline (Field-Tested)"]), safe="")
-          code = subprocess.run(
-              ["curl", "-s", "-A", UA, "-H", "x-valve-request-type: queryAction", "-o", "actions.json",
-               "-w", "%{http_code}", f"https://steamcommunity.com/market/actions?q=QueryPriceHistory&qp={q}"],
-              capture_output=True, text=True).stdout
-          print("market/actions QueryPriceHistory:", code, open("actions.json", "rb").read()[:120])
+                  bad += 1
+                  strikes += 1
+                  note = repr(open("h.json", "rb").read()[:80]) if os.path.exists("h.json") else ""
+              print(f"{i:3} {time.strftime('%H:%M:%S')} {code} {size}B {time.time() - t:.1f}s {name} | {note}", flush=True)
+              if strikes:
+                  if strikes >= 5:
+                      print("5 x не 200 подряд — стоп", flush=True)
+                      break
+                  wait = (30, 60, 120, 240)[strikes - 1]
+                  print(f"   жду {wait} с", flush=True)
+                  time.sleep(wait)
+              else:
+                  time.sleep(1.0)
+          print(f"200: {ok}, не 200: {bad}, всего {time.time() - started:.0f} с", flush=True)
