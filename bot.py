@@ -6795,6 +6795,7 @@ _SCOPE_NAMES = {
     "history": "страница предмета — объём продаж и стабильность для /orders",
     "history_auth": "страница предмета с логином — объём продаж и стабильность для /orders",
     "history_api": "история продаж Steam — медиана за месяц, объём и стабильность для /orders",
+    "history_api_cf": "история продаж Steam через воркер — то же для /orders, запасной маршрут",
 }
 
 # Приписка к сообщениям об отказе из-за кулдауна. Одной строкой и в одном
@@ -7257,7 +7258,7 @@ async def _steam_histories(names: list[str]) -> dict:
     wait = steam_cooldown_remaining(scope=steam_history.active_scope())
     if wait > 0:
         waits.append(f"страница предмета на паузе ещё {wait / 60:.0f} мин")
-    wait = steam_cooldown_remaining(scope=steam_history.API_SCOPE)
+    wait = steam_history.history_api_wait()
     if wait > 0:
         waits.append(f"ручка истории на паузе ещё {wait / 60:.0f} мин")
     log.info(
@@ -8737,7 +8738,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # если её не дали — из снимка. Отказ из-за неё — новость про Steam.
     no_median = sum(1 for _, why in refused if why == buy_orders.UNKNOWN_MONTH_MEDIAN)
     if no_median:
-        api_wait = steam_cooldown_remaining(scope=steam_history.API_SCOPE)
+        api_wait = steam_history.history_api_wait()
         if snapshot is None:
             where = "снимка цен Steam нет"
         elif not snapshot.medians:

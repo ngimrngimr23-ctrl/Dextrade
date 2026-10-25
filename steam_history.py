@@ -57,8 +57,10 @@ import asyncio
 import calendar
 import json
 import logging
+import os
 import re
 import time
+import urllib.parse
 from dataclasses import dataclass
 
 import aiohttp
@@ -104,6 +106,15 @@ TIMEOUT_SECONDS = envcfg.env_float("STEAM_HISTORY_TIMEOUT", 20.0)
 API_SCOPE = "history_api"
 PRICE_HISTORY_URL = "https://steamcommunity.com/market/actions"
 _USD = 1   # ecurrency доллара
+
+# Запасной маршрут ручки — Cloudflare Worker бота (cloudflare-worker/worker.js,
+# тот же, что у CSFloat; steamcommunity.com в нём разрешён). Исходящий адрес у
+# воркера из пула Cloudflare, а не общий адрес Render, которому ручка
+# 2026-10-25 ответила 429 на первом же запросе. Адрес — STEAM_PROXY_URL, а
+# если он пуст (Steam через воркер больше ничего не ходит) — CSFLOAT_PROXY_URL.
+WORKER_URL = (steam_client.STEAM_PROXY_URL
+              or os.environ.get("CSFLOAT_PROXY_URL", "").strip().rstrip("/"))
+WORKER_SCOPE = "history_api_cf"
 
 # Сколько держать страницу в памяти. История за месяц за три часа почти не
 # меняется; цене нижнего лота столько доверять нельзя, поэтому каждый
@@ -366,9 +377,22 @@ def _remember(market_hash_name: str, page: ItemPage) -> None:
             del _cache[next(iter(_cache))]
 
 
+def _history_routes() -> list[tuple[str, str | None]]:
+    """Маршруты ручки истории по порядку: (область кулдауна, воркер или None — напрямую)."""
+    routes: list[tuple[str, str | None]] = [(API_SCOPE, None)]
+    if WORKER_URL:
+        routes.append((WORKER_SCOPE, WORKER_URL))
+    return routes
+
+
+def history_api_wait() -> float:
+    """Сколько ждать, пока откроется хоть один маршрут ручки истории. 0 — открыт."""
+    return min(steam_cooldown_remaining(scope) for scope, _ in _history_routes())
+
+
 def history_api_open() -> bool:
     """Ручка истории не на паузе после 429 — финалисту /orders медиану она даст."""
-    return steam_cooldown_remaining(API_SCOPE) <= 0
+    return history_api_wait() <= 0
 
 
 def cached_month_median(market_hash_name: str) -> tuple[int, float] | None:
@@ -501,69 +525,97 @@ async def _fetch_page(market_hash_name: str) -> ItemPage | None:
     return page
 
 
+_RATE_LIMITED = object()   # ответ 429: пробуем следующий маршрут
+
+
 async def fetch_price_history(market_hash_name: str) -> ItemPage | None:
     """
-    История продаж ручкой нового рынка (см. API_SCOPE). Без кэша — его ведут
-    fetch и month_history. None — пауза после 429, не 200 или ответ не того
-    вида; причина в логе.
+    История продаж ручкой нового рынка (см. API_SCOPE): напрямую, а получив
+    429 — через воркер (WORKER_URL), у каждого маршрута своя пауза. Без кэша —
+    его ведут fetch и month_history. None — оба маршрута на паузе, не 200 или
+    ответ не того вида; причина в логе.
     """
-    if steam_cooldown_remaining(API_SCOPE) > 0:
-        return None
+    for scope, worker in _history_routes():
+        if steam_cooldown_remaining(scope) > 0:
+            continue
+        got = await _ask_price_history(market_hash_name, scope, worker)
+        if got is not _RATE_LIMITED:
+            return got
+    return None
+
+
+async def _ask_price_history(market_hash_name: str, scope: str, worker: str | None):
+    """Один запрос ручки истории. ItemPage, None (не 200, не тот ответ) или _RATE_LIMITED."""
     params = {
         "q": "QueryPriceHistory",
         # Как шлёт сам фронтенд: JSON.stringify([730, имя]) без пробелов.
         "qp": json.dumps([steam_client.APP_ID, market_hash_name],
                          ensure_ascii=False, separators=(",", ":")),
     }
-    headers = {
-        "User-Agent": _UA,
-        "Accept": "application/json",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://steamcommunity.com/market/",
-        "x-valve-request-type": "queryAction",
-        **_UA_HINTS,
-    }
-    await throttle_steam_request(scope=API_SCOPE, lane="")
+    route = "через воркер" if worker else "напрямую"
+    if worker:
+        # Воркер сам ставит Steam свои заголовки; x-valve-request-type ручке не
+        # обязателен (без него она тоже отвечает JSON-ом).
+        url, lane = f"{worker}/proxy", "worker"
+        params = {"url": f"{PRICE_HISTORY_URL}?{urllib.parse.urlencode(params)}"}
+        headers = {"User-Agent": _UA, "Accept": "application/json"}
+    else:
+        url, lane = PRICE_HISTORY_URL, ""
+        headers = {
+            "User-Agent": _UA,
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://steamcommunity.com/market/",
+            "x-valve-request-type": "queryAction",
+            **_UA_HINTS,
+        }
+    await throttle_steam_request(scope=scope, lane=lane)
     try:
         async with get_session().get(
-            PRICE_HISTORY_URL, params=params, headers=headers,
+            url, params=params, headers=headers,
             timeout=aiohttp.ClientTimeout(total=TIMEOUT_SECONDS),
         ) as resp:
             if resp.status == 429:
-                log.warning("история продаж (ручка нового рынка): %s — HTTP 429",
-                            market_hash_name)
-                await note_steam_429(scope=API_SCOPE, headers=dict(resp.headers))
-                return None
+                log.warning(
+                    "история продаж (ручка нового рынка, %s): %s — HTTP 429%s",
+                    route, market_hash_name,
+                    "" if worker or WORKER_URL else
+                    "; запасного маршрута нет (STEAM_PROXY_URL и CSFLOAT_PROXY_URL пусты)",
+                )
+                await note_steam_429(scope=scope, headers=dict(resp.headers))
+                return _RATE_LIMITED
             if resp.status != 200:
-                log.info("история продаж (ручка нового рынка): %s — HTTP %s",
-                         market_hash_name, resp.status)
+                log.info("история продаж (ручка нового рынка, %s): %s — HTTP %s%s",
+                         route, market_hash_name, resp.status,
+                         "" if resp.headers.get("X-Proxy-Upstream") or not worker
+                         else " от самого воркера")
                 return None
             payload = await resp.json(content_type=None)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
-        log.info("история продаж (ручка нового рынка): %s — не получилось (%s)",
-                 market_hash_name, type(e).__name__)
+        log.info("история продаж (ручка нового рынка, %s): %s — не получилось (%s)",
+                 route, market_hash_name, type(e).__name__)
         return None
 
     global _api_currency_logged
-    await note_steam_ok(API_SCOPE)
+    await note_steam_ok(scope)
     page = parse_price_history(payload)
     if page is None:
-        log.info("история продаж (ручка нового рынка): %s — ответ не того вида",
-                 market_hash_name)
+        log.info("история продаж (ручка нового рынка, %s): %s — ответ не того вида",
+                 route, market_hash_name)
         return None
-    if API_SCOPE not in _ok_logged:
-        _ok_logged.add(API_SCOPE)
+    if scope not in _ok_logged:
+        _ok_logged.add(scope)
         median = page.median(30) if page.history_usd else None
         log.info(
-            "история продаж ручкой нового рынка отвечает: %s — точек за %d дн. %d, "
+            "история продаж ручкой нового рынка отвечает (%s): %s — точек за %d дн. %d, "
             "продано за 7 дней %s, медиана сделок за 30 дней %s",
-            market_hash_name, KEEP_DAYS, len(page.points), page.sold(7),
+            route, market_hash_name, KEEP_DAYS, len(page.points), page.sold(7),
             f"${median:.2f}" if median else "не в долларах" if not page.history_usd else "нет",
         )
     if not page.history_usd and not _api_currency_logged:
         _api_currency_logged = True
         log.warning(
-            "история продаж (ручка нового рынка): цены не в долларах — медианы "
-            "за месяц из неё не будет, только объём и разброс",
+            "история продаж (ручка нового рынка, %s): цены не в долларах — медианы "
+            "за месяц из неё не будет, только объём и разброс", route,
         )
     return page

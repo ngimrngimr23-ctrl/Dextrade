@@ -34,12 +34,16 @@ Render передеплоивает сервис на пуш в отслежив
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import logging
 import envcfg
 import os
+import random
+import re
 import time
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -101,6 +105,20 @@ MIN_GAP_SECONDS = envcfg.env_float("LOG_SHIP_MIN_GAP", 300)
 CHUNK_DIR = os.environ.get("LOG_GITHUB_CHUNK_DIR", "logs").strip().strip("/")
 # Счётчик отгрузок за жизнь процесса — только чтобы имена не совпадали.
 _chunk_counter = 0
+
+# Чья копия выгружает — в конце имени куска. Копии на Render стартуют с одного
+# коммита в одну секунду и выгружают лог по одному расписанию: 2026-10-25
+# основная (af2z) и запасная (dextrade-1) коммитили в одну и ту же секунду,
+# GitHub принимал один коммит, второй получал 409 и ждал следующей отгрузки,
+# где всё повторялось, — куски основной копии не доезжали по полчаса.
+COPY_TAG = re.sub(
+    r"[^a-z0-9-]", "",
+    (urlsplit(os.environ.get("RENDER_EXTERNAL_URL", "")).hostname or "").split(".")[0].lower(),
+)[:32]
+# Сколько раз повторить запись, когда GitHub отказал из-за одновременного
+# коммита другой копии (409) или совпавшего имени (422), и сколько секунд ждать.
+WRITE_RETRIES = 3
+WRITE_RETRY_SECONDS = (2.0, 7.0)
 
 # Хеш последней выгруженной версии: если ничего не изменилось, коммит не нужен.
 _last_digest: str | None = None
@@ -354,28 +372,34 @@ async def append(new_text: str, *, note: str = "") -> str:
     # процесса уникален по построению, а сортировку имён не ломает — секунда в
     # имени стоит раньше него.
     global _chunk_counter
-    _chunk_counter += 1
-    stamp = time.gmtime()
-    path = "{}/{}/{}-{:04d}.log".format(
-        CHUNK_DIR,
-        time.strftime("%Y-%m-%d", stamp),
-        time.strftime("%H-%M-%S", stamp),
-        _chunk_counter % 10000,
-    )
-
     async with aiohttp.ClientSession() as session:
         await check(session)
-        body = {
-            "message": f"лог бота{': ' + note if note else ''}",
-            "content": base64.b64encode(payload).decode("ascii"),
-            "branch": BRANCH,
-        }
-        async with session.put(
-            f"{API}/repos/{REPO}/contents/{path}", headers=_headers(), json=body
-        ) as resp:
-            if resp.status not in (200, 201):
+        for attempt in range(WRITE_RETRIES + 1):
+            _chunk_counter += 1
+            stamp = time.gmtime()
+            path = "{}/{}/{}-{:04d}{}.log".format(
+                CHUNK_DIR,
+                time.strftime("%Y-%m-%d", stamp),
+                time.strftime("%H-%M-%S", stamp),
+                _chunk_counter % 10000,
+                f"-{COPY_TAG}" if COPY_TAG else "",
+            )
+            body = {
+                "message": f"лог бота{': ' + note if note else ''}",
+                "content": base64.b64encode(payload).decode("ascii"),
+                "branch": BRANCH,
+            }
+            async with session.put(
+                f"{API}/repos/{REPO}/contents/{path}", headers=_headers(), json=body
+            ) as resp:
+                if resp.status in (200, 201):
+                    break
                 text = (await resp.text())[:300]
+            if resp.status not in (409, 422) or attempt == WRITE_RETRIES:
                 raise LogShipError(f"GitHub ответил {resp.status} при записи: {text}")
+            # Чужой коммит в ту же секунду — подождать случайное время, чтобы
+            # копии разошлись, и записать новым куском.
+            await asyncio.sleep(random.uniform(*WRITE_RETRY_SECONDS))
 
     return (
         f"выгружено {len(payload) / 1024:.1f} КБ в {path}"

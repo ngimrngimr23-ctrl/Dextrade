@@ -177,7 +177,8 @@ _cooldowns: dict[str, dict] = {}
 # Все области, которые ходят в Steam. Нужен явный список: при 429 в одной из них
 # остальные надо придержать (Steam банит IP, а не эндпоинт — см. note_steam_429),
 # а узнать о ещё не созданных состояниях из _cooldowns нельзя.
-KNOWN_SCOPES = ("listings", "pricing", "inventory", "history", "history_auth", "history_api")
+KNOWN_SCOPES = ("listings", "pricing", "inventory", "history", "history_auth", "history_api",
+                "history_api_cf")
 
 # Области, чей 429 НЕ придерживает остальные (см. _apply_collateral_cooldown).
 #
@@ -196,7 +197,8 @@ KNOWN_SCOPES = ("listings", "pricing", "inventory", "history", "history_auth", "
 # Третья — страница предмета ради истории продаж (см. steam_history): history
 # без логина и history_auth с куки аккаунта. Запрос справочный, и анонимно
 # Steam режет его с первого же раза (2026-10-24/25) — останавливать из-за него
-# вотчлист нельзя. Туда же history_api — та же история ручкой нового рынка.
+# вотчлист нельзя. Туда же history_api — та же история ручкой нового рынка,
+# и history_api_cf — она же через Cloudflare Worker.
 #
 # Без исключения смысл разделения областей терялся: 429 на некритичной проверке
 # цены останавливал бы на полчаса критичный сбор листингов — то есть ровно то,
@@ -204,7 +206,8 @@ KNOWN_SCOPES = ("listings", "pricing", "inventory", "history", "history_auth", "
 #
 # Обратное направление сохраняется: 429 на листингах придержит и цены, и
 # инвентарь, и историю — там посылка про общий бан по IP остаётся в силе.
-COLLATERAL_EXEMPT_SCOPES = ("inventory", "pricing", "history", "history_auth", "history_api")
+COLLATERAL_EXEMPT_SCOPES = ("inventory", "pricing", "history", "history_auth", "history_api",
+                            "history_api_cf")
 
 
 def _cooldown_state(scope: str) -> dict:
