@@ -83,6 +83,28 @@ log = logging.getLogger("steam_bot.steam_history")
 SCOPE = "history"
 AUTH_SCOPE = "history_auth"
 TIMEOUT_SECONDS = envcfg.env_float("STEAM_HISTORY_TIMEOUT", 20.0)
+
+# История продаж ручкой НОВОГО рынка — без страницы.
+#
+# Новый фронтенд площадки сам берёт график отсюда: GET /market/actions?
+# q=QueryPriceHistory&qp=[730,"<имя>"] с заголовком x-valve-request-type:
+# queryAction. Ответ — {"data": {"ecurrency": 1, "prices": [{"time",
+# "price_median", "purchases"}, ...]}}: те же точки, что в line1 старой
+# страницы (последний месяц почасовые, раньше посуточные), цена с комиссией,
+# валюта — по адресу зрителя. Витрины в ответе нет — нижнего лота отсюда не
+# взять.
+#
+# Зачем. Страницу предмета Steam с адресов дата-центров не отдаёт — 429 на
+# первом же запросе и у Render, и у машин GitHub Actions, — а без истории нет
+# медианы сделок за месяц, и /orders отказывает всем. У ручки лимит свой, по
+# адресу и с долгим штрафом: 2026-10-25 машина GitHub Actions, которой страница
+# ответила 429, тут же получила здесь 200, другая машина — 429 с первого
+# запроса, а песочница полчаса ловила 429 и потом снова получала 200. Поэтому
+# и область кулдауна своя — её 429 не значит, что закрыта страница, и наоборот.
+API_SCOPE = "history_api"
+PRICE_HISTORY_URL = "https://steamcommunity.com/market/actions"
+_USD = 1   # ecurrency доллара
+
 # Сколько держать страницу в памяти. История за месяц за три часа почти не
 # меняется; цене нижнего лота столько доверять нельзя, поэтому каждый
 # вызывающий сам говорит, насколько старая страница ему годится (max_age).
@@ -266,6 +288,45 @@ def parse(html: str, fetched_at: float | None = None) -> ItemPage | None:
     )
 
 
+def parse_price_history(payload, fetched_at: float | None = None) -> ItemPage | None:
+    """
+    Ответ QueryPriceHistory → ItemPage без витрины (lowest_usd=None).
+
+    None — ответ не того вида или точки есть, а ни одна не разобралась: ноль
+    продаж отказал бы предмету по ликвидности, а на деле мы не поняли формат.
+    Пустой список точек — честное «продаж не было».
+    """
+    now = time.time() if fetched_at is None else fetched_at
+    data = payload.get("data") if isinstance(payload, dict) else None
+    raw = data.get("prices") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return None
+    cutoff = now - KEEP_DAYS * DAY
+    points: list[tuple[float, float, int]] = []
+    parsed = 0
+    for row in raw:
+        try:
+            ts = float(row["time"])
+            price = float(row["price_median"])
+            sold = int(row["purchases"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        parsed += 1
+        if ts >= cutoff:
+            points.append((ts, price, sold))
+    if raw and not parsed:
+        log.warning("история продаж: %d точек, и ни одна не разобралась (образец %r)",
+                    len(raw), raw[0])
+        return None
+    return ItemPage(
+        fetched_at=now,
+        lowest_usd=None,
+        points=tuple(points),
+        has_history=True,
+        history_usd=data.get("ecurrency") == _USD,
+    )
+
+
 def logged_in() -> bool:
     """Ходим ли за страницей с куки аккаунта (см. докстринг модуля)."""
     return bool(steam_client.STEAM_LOGIN_SECURE)
@@ -276,6 +337,7 @@ def logged_in() -> bool:
 # тридцать одинаковых строк на прогон ничего к этому не добавят.
 _ok_logged: set[str] = set()   # области, чей первый успех уже в логе
 _currency_logged = False
+_api_currency_logged = False
 
 
 def active_scope() -> str:
@@ -304,16 +366,76 @@ def _remember(market_hash_name: str, page: ItemPage) -> None:
             del _cache[next(iter(_cache))]
 
 
-async def fetch(market_hash_name: str, *, max_age: float = CACHE_SECONDS) -> ItemPage | None:
+def history_api_open() -> bool:
+    """Ручка истории не на паузе после 429 — финалисту /orders медиану она даст."""
+    return steam_cooldown_remaining(API_SCOPE) <= 0
+
+
+def cached_month_median(market_hash_name: str) -> tuple[int, float] | None:
+    """
+    (медиана сделок за 30 дней в центах, возраст в секундах) из уже прочитанной
+    истории — без запроса. None — истории в памяти нет или она не в долларах.
+    """
+    page = cached(market_hash_name, CACHE_SECONDS)
+    if page is None or not page.has_history or not page.history_usd:
+        return None
+    value = page.median(30)
+    if not value:
+        return None
+    return int(round(value * 100)), max(0.0, time.time() - page.fetched_at)
+
+
+async def fetch(
+    market_hash_name: str, *, max_age: float = CACHE_SECONDS, history_api: bool = False,
+) -> ItemPage | None:
     """
     Страница предмета — из памяти, если она не старше max_age, иначе запросом.
 
-    None — узнать не вышло: область на кулдауне, Steam ответил не 200 или
-    страница не та. Причина в логе; вызывающий решает, чем её заменить.
+    history_api=True — страницу не дали (пауза после 429, не 200, не та), и
+    тогда история продаж берётся ручкой нового рынка (fetch_price_history):
+    нижнего лота в ней нет, а медиана за месяц, объём и стабильность — есть.
+    Тем, кому со страницы нужна только цена (pricing), это лишний запрос, —
+    поэтому по умолчанию выключено.
+
+    None — узнать не вышло. Причина в логе; вызывающий решает, чем её заменить.
     """
     hit = cached(market_hash_name, max_age)
     if hit is not None:
         return hit
+    page = await _fetch_page(market_hash_name)
+    if history_api and (page is None or not page.has_history):
+        history = await fetch_price_history(market_hash_name)
+        if history is not None and page is not None:
+            # Страница без графика, но с нижним лотом: лот — с неё, сделки — из ручки.
+            history = ItemPage(
+                fetched_at=page.fetched_at, lowest_usd=page.lowest_usd,
+                points=history.points, has_history=True, history_usd=history.history_usd,
+            )
+        page = history or page
+    if page is not None:
+        _remember(market_hash_name, page)
+    return page
+
+
+async def month_history(market_hash_name: str, *, max_age: float = CACHE_SECONDS) -> ItemPage | None:
+    """
+    История продаж за месяц — из памяти или ручкой нового рынка, без страницы.
+
+    Для поддержки ордеров: ей нужна медиана сделок, а не нижний лот, и
+    стучаться за ним в страницу, которую Steam с адреса бота не отдаёт, незачем.
+    """
+    hit = cached(market_hash_name, max_age)
+    if hit is not None and hit.has_history:
+        return hit
+    page = await fetch_price_history(market_hash_name)
+    if page is not None and (hit is None or hit.lowest_usd is None):
+        # Страницу с нижним лотом историей без витрины не затираем.
+        _remember(market_hash_name, page)
+    return page
+
+
+async def _fetch_page(market_hash_name: str) -> ItemPage | None:
+    """Страница предмета запросом. None — пауза после 429, не 200 или страница не та."""
     scope = active_scope()
     if steam_cooldown_remaining(scope) > 0:
         return None
@@ -376,5 +498,72 @@ async def fetch(market_hash_name: str, *, max_age: float = CACHE_SECONDS) -> Ite
             "страница предмета: график не в долларах (валюта кошелька аккаунта) — "
             "беру из него только объём и разброс, цену даёт /render/",
         )
-    _remember(market_hash_name, page)
+    return page
+
+
+async def fetch_price_history(market_hash_name: str) -> ItemPage | None:
+    """
+    История продаж ручкой нового рынка (см. API_SCOPE). Без кэша — его ведут
+    fetch и month_history. None — пауза после 429, не 200 или ответ не того
+    вида; причина в логе.
+    """
+    if steam_cooldown_remaining(API_SCOPE) > 0:
+        return None
+    params = {
+        "q": "QueryPriceHistory",
+        # Как шлёт сам фронтенд: JSON.stringify([730, имя]) без пробелов.
+        "qp": json.dumps([steam_client.APP_ID, market_hash_name],
+                         ensure_ascii=False, separators=(",", ":")),
+    }
+    headers = {
+        "User-Agent": _UA,
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://steamcommunity.com/market/",
+        "x-valve-request-type": "queryAction",
+        **_UA_HINTS,
+    }
+    await throttle_steam_request(scope=API_SCOPE, lane="")
+    try:
+        async with get_session().get(
+            PRICE_HISTORY_URL, params=params, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=TIMEOUT_SECONDS),
+        ) as resp:
+            if resp.status == 429:
+                log.warning("история продаж (ручка нового рынка): %s — HTTP 429",
+                            market_hash_name)
+                await note_steam_429(scope=API_SCOPE, headers=dict(resp.headers))
+                return None
+            if resp.status != 200:
+                log.info("история продаж (ручка нового рынка): %s — HTTP %s",
+                         market_hash_name, resp.status)
+                return None
+            payload = await resp.json(content_type=None)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+        log.info("история продаж (ручка нового рынка): %s — не получилось (%s)",
+                 market_hash_name, type(e).__name__)
+        return None
+
+    global _api_currency_logged
+    await note_steam_ok(API_SCOPE)
+    page = parse_price_history(payload)
+    if page is None:
+        log.info("история продаж (ручка нового рынка): %s — ответ не того вида",
+                 market_hash_name)
+        return None
+    if API_SCOPE not in _ok_logged:
+        _ok_logged.add(API_SCOPE)
+        median = page.median(30) if page.history_usd else None
+        log.info(
+            "история продаж ручкой нового рынка отвечает: %s — точек за %d дн. %d, "
+            "продано за 7 дней %s, медиана сделок за 30 дней %s",
+            market_hash_name, KEEP_DAYS, len(page.points), page.sold(7),
+            f"${median:.2f}" if median else "не в долларах" if not page.history_usd else "нет",
+        )
+    if not page.history_usd and not _api_currency_logged:
+        _api_currency_logged = True
+        log.warning(
+            "история продаж (ручка нового рынка): цены не в долларах — медианы "
+            "за месяц из неё не будет, только объём и разброс",
+        )
     return page

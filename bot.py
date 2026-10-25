@@ -6794,6 +6794,7 @@ _SCOPE_NAMES = {
     "inventory": "инвентарь — /inv",
     "history": "страница предмета — объём продаж и стабильность для /orders",
     "history_auth": "страница предмета с логином — объём продаж и стабильность для /orders",
+    "history_api": "история продаж Steam — медиана за месяц, объём и стабильность для /orders",
 }
 
 # Приписка к сообщениям об отказе из-за кулдауна. Одной строкой и в одном
@@ -7131,6 +7132,29 @@ def _with_snapshot_volume(c: _OrderCandidate, snapshot) -> _OrderCandidate:
     return c._replace(volume_per_day=sold, volume_age_seconds=age, volume_from_snapshot=True)
 
 
+def _known_month_median(name: str, snapshot, now: float | None = None) -> tuple[int, float] | None:
+    """
+    (медиана сделок за месяц в центах, возраст) без запросов к Steam — из
+    снимка или из истории продаж, уже прочитанной за последние часы.
+    """
+    known = snapshot.month_median(name, now) if snapshot is not None else None
+    return known if known is not None else steam_history.cached_month_median(name)
+
+
+def _medians_required(snapshot, now: float | None = None) -> bool:
+    """
+    Отсеивать ли на отборе тех, чья медиана за месяц неизвестна.
+
+    Да — только когда в снимке медианы есть (значит, у остальных их нет), а
+    ручка истории Steam на паузе после 429: тогда финалист без медианы
+    получит отказ, и место в финале ему отдавать незачем. Ручка открыта —
+    медиану финалисту даст она.
+    """
+    if steam_history.history_api_open() or snapshot is None:
+        return False
+    return any(snapshot.month_median(n, now) for n in snapshot.medians or ())
+
+
 def _with_month_median(c: _OrderCandidate, page, snapshot) -> _OrderCandidate:
     """
     Цена Steam — не выше медианы сделок за 30 дней.
@@ -7217,19 +7241,32 @@ async def _steam_histories(names: list[str]) -> dict:
     ней же берётся цена. Получить свежую не вышло (пауза после 429) —
     берём и постарше, до steam_history.CACHE_SECONDS: цену из неё уже не
     возьмут (см. orders_cmd), а сделки за месяц за пару часов не меняются.
+
+    Страницу Steam с адреса бота не отдаёт — тогда история продаж приходит
+    ручкой нового рынка (steam_history.fetch_price_history): без нижнего лота,
+    но с медианой сделок за месяц, без которой плана нет.
     """
     pages = {}
     for name in names:
-        page = await steam_history.fetch(name, max_age=ORDERS_STEAM_MAX_AGE)
+        page = await steam_history.fetch(name, max_age=ORDERS_STEAM_MAX_AGE, history_api=True)
         if page is None:
             page = steam_history.cached(name, steam_history.CACHE_SECONDS)
         if page is not None:
             pages[name] = page
+    waits = []
     wait = steam_cooldown_remaining(scope=steam_history.active_scope())
+    if wait > 0:
+        waits.append(f"страница предмета на паузе ещё {wait / 60:.0f} мин")
+    wait = steam_cooldown_remaining(scope=steam_history.API_SCOPE)
+    if wait > 0:
+        waits.append(f"ручка истории на паузе ещё {wait / 60:.0f} мин")
     log.info(
-        "orders: история сделок Steam прочитана у %d из %d финалист(ов)%s",
+        "orders: история сделок Steam прочитана у %d из %d финалист(ов) "
+        "(со страницы %d, ручкой нового рынка %d)%s",
         len(pages), len(names),
-        f", страница предмета на паузе ещё {wait / 60:.0f} мин" if wait > 0 else "",
+        sum(1 for p in pages.values() if p.lowest_usd is not None),
+        sum(1 for p in pages.values() if p.lowest_usd is None and p.has_history),
+        f", {', '.join(waits)}" if waits else "",
     )
     return pages
 
@@ -7573,12 +7610,11 @@ async def _order_candidates_from_catalog(
     # одной дорогой продажей вдвое: по ней в полосу $1-65 попадали скины,
     # которые на рынке стоят $20, и живая проверка тратилась на них зря.
     snapshot, _ = await steam_snapshot.current()
-    # Как у отбора по ценам CSFloat: в снимке есть медианы за месяц — без неё
-    # предмет в финале получит отказ, и место ему не отдаём.
+    # Как у отбора по ценам CSFloat: в снимке есть медианы за месяц, а ручка
+    # истории Steam на паузе — без медианы предмет в финале получит отказ, и
+    # место ему не отдаём.
     now = time.time()
-    with_medians = snapshot is not None and any(
-        snapshot.month_median(n, now) for n in snapshot.medians or ()
-    )
+    with_medians = _medians_required(snapshot, now)
 
     band: list[tuple[str, float, float | None, float | None, float]] = []
     skipped_quiet = skipped_jumpy = skipped_young = skipped_mismatch = skipped_ordered = 0
@@ -7616,7 +7652,7 @@ async def _order_candidates_from_catalog(
             # описывают чужие дорогие (или дешёвые) сделки, а не этот рынок.
             skipped_mismatch += 1
             continue
-        median = snapshot.month_median(name, now) if snapshot else None
+        median = _known_month_median(name, snapshot, now)
         if median is None and with_medians:
             skipped_no_median += 1
             continue
@@ -7714,13 +7750,11 @@ async def _order_candidates_from_csfloat(
     max_spread = limits["stability"]
     cap = int(round(high * 100))
     now = time.time()
-    # Снимок с медианами за месяц: кому медианы нет, тот в финале получит
-    # отказ (buy_orders.UNKNOWN_MONTH_MEDIAN) — место в финале ему не отдаём.
-    # Снимок без медиан (старый файл) никого не отсеивает: отчёт скажет, что
-    # прислать.
-    with_medians = snapshot is not None and any(
-        snapshot.month_median(n, now) for n in snapshot.medians or ()
-    )
+    # Снимок с медианами за месяц, а ручка истории Steam на паузе: кому
+    # медианы нет, тот в финале получит отказ (buy_orders.UNKNOWN_MONTH_MEDIAN)
+    # — место в финале ему не отдаём. Ручка открыта — медиану финалисту даст
+    # она; снимок без медиан (старый файл) тоже никого не отсеивает.
+    with_medians = _medians_required(snapshot, now)
 
     picked = []
     skipped = dict(quiet=0, jumpy=0, mismatch=0, costly=0, far=0, recent=0, thin=0,
@@ -7750,7 +7784,7 @@ async def _order_candidates_from_csfloat(
         ):
             skipped["mismatch"] += 1
             continue
-        median = snapshot.month_median(name, now) if snapshot else None
+        median = _known_month_median(name, snapshot, now)
         if median is None and with_medians:
             skipped["no_median"] += 1
             continue
@@ -7799,7 +7833,7 @@ async def _order_candidates_from_csfloat(
         skipped["jumpy"], skipped["mismatch"], skipped["costly"], skipped["far"],
         skipped["recent"], ORDERS_REFUSED_PAUSE_SECONDS // 3600, skipped["thin"],
         skipped["ordered"], skipped["no_median"],
-        ("да, не выше медианы за месяц" if with_medians else "да, медиан нет")
+        ("да, не выше медианы за месяц" if snapshot.medians else "да, медиан в нём нет")
         if snapshot else "нет, средние прайс-листа", len(batch),
         sum(1 for row in batch if row[6] is not None),
     )
@@ -8699,23 +8733,25 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ликвидности совсем."
         )
 
-    # Медиану за месяц с адреса бота не взять (страницу предмета Steam не
-    # отдаёт) — она приходит в снимке. Отказ из-за неё — новость про снимок.
+    # Медиана за месяц — из истории продаж Steam (ручка нового рынка), а
+    # если её не дали — из снимка. Отказ из-за неё — новость про Steam.
     no_median = sum(1 for _, why in refused if why == buy_orders.UNKNOWN_MONTH_MEDIAN)
     if no_median:
+        api_wait = steam_cooldown_remaining(scope=steam_history.API_SCOPE)
         if snapshot is None:
             where = "снимка цен Steam нет"
         elif not snapshot.medians:
-            where = "в снимке нет колонки «медиана_30д_$»"
+            where = "в снимке медиан нет"
         else:
             where = (f"в снимке её у них нет или замер старше "
                      f"{steam_snapshot.VOLUME_MAX_AGE_HOURS:.0f} ч")
         lines.append("")
         lines.append(
-            f"⚠️ Медианы сделок за месяц нет у {no_median} предмет(ов): страницу "
-            f"предмета Steam с адреса бота не отдаёт, а {where}. Без медианы "
-            "цену не считаю — нижний лот бывает пиком. Свежий снимок с медианами: "
-            "/steamprices"
+            f"⚠️ Медианы сделок за месяц нет у {no_median} предмет(ов): историю "
+            "продаж Steam "
+            + (f"с адреса бота не отдаёт (429, пауза ещё {api_wait / 60:.0f} мин)"
+               if api_wait > 0 else "по ним прочитать не вышло")
+            + f", а {where}. Без медианы цену не считаю — нижний лот бывает пиком."
         )
 
     if refused:

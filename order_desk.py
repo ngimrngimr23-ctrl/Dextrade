@@ -48,6 +48,7 @@ import aiohttp
 import buy_orders
 import csfloat_client
 import envcfg
+import steam_history
 import steam_snapshot
 from csfloat_client import (
     CSFloatError,
@@ -85,6 +86,12 @@ MIN_AUTO_MINUTES = 10
 # Сколько ордеров проверять за один прогон поддержки. Остальные — в
 # следующий: проверяются по очереди, начиная с давно не проверенных.
 MAINTAIN_PER_ROUND = envcfg.env_int("ORDER_MAINTAIN_PER_ROUND", 12)
+
+# Сколько историй продаж Steam запрашивать за прогон поддержки (медиана за
+# месяц для потолка). Лимит у ручки истории по адресу, и тратить его весь на
+# фоновую поддержку нельзя — он нужен /orders. Прочитанная история живёт в
+# памяти три часа, так что все ордера покрываются за несколько прогонов.
+MAINTAIN_HISTORY_FETCHES = envcfg.env_int("ORDER_MAINTAIN_HISTORY_FETCHES", 4)
 
 # Виды событий поддержки — по ним бот решает, о чём писать в чат.
 FILLED = "filled"        # исполнен: в сделках есть покупка
@@ -475,6 +482,23 @@ async def _place(
     return PlaceOutcome(placed, filled_now, refused, stopped, committed, count, balance)
 
 
+async def _history_median(name: str, *, fetch: bool = True) -> tuple[int, float] | None:
+    """
+    (медиана сделок за 30 дней в центах, возраст) по истории продаж Steam —
+    из памяти (до трёх часов), а при fetch=True и запросом. None — не дали
+    или не в долларах.
+    """
+    if not fetch:
+        return steam_history.cached_month_median(name)
+    history = await steam_history.month_history(name)
+    if history is None or not history.history_usd:
+        return None
+    value = history.median(30)
+    if not value:
+        return None
+    return int(round(value * 100)), max(0.0, time.time() - history.fetched_at)
+
+
 def _ceiling_now(
     entry: dict, cached: dict | None, *, min_profit_pct: float, max_order_cents: int,
     month_median_cents: int | None = None,
@@ -609,11 +633,13 @@ async def _maintain(
             except Exception:  # noqa: BLE001 — без кэша потолок просто прежний
                 log.warning("orders: кэш цен Steam не прочитан", exc_info=True)
                 cached_prices = {}
-            # Медианы сделок за месяц — из снимка (страницу предмета Steam с
-            # адреса бота не отдаёт). Нет снимка — потолок без медианы.
+            # Медианы сделок за месяц — из снимка, а нет в нём — из истории
+            # продаж Steam (ручка нового рынка; страницу предмета Steam с адреса
+            # бота не отдаёт). Нет ни там, ни там — последняя известная из реестра.
             snapshot, _ = await steam_snapshot.current()
 
             queue = sorted(registry.items(), key=lambda kv: kv[1].get("checked_at", 0))
+            history_fetches = 0
             for oid, entry in queue[:limit]:
                 order = live[oid]
                 name = entry.get("name") or order.market_hash_name or "?"
@@ -656,6 +682,12 @@ async def _maintain(
                 # стареет за трое суток, а потолок без неё вернулся бы к
                 # нижнему лоту при постановке — к тому самому пику.
                 measured = snapshot.month_median(name) if snapshot else None
+                if measured is None:
+                    measured = await _history_median(name, fetch=False)
+                if measured is None and history_fetches < MAINTAIN_HISTORY_FETCHES \
+                        and steam_history.history_api_open():
+                    history_fetches += 1
+                    measured = await _history_median(name)
                 if measured is not None:
                     entry["month_median"] = measured[0]
                 median = entry.get("month_median")
