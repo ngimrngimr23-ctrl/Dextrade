@@ -8127,6 +8127,9 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Render CSFloat не пускает никогда, а ручки с ключом — пускают.
     route_down: str | None = None
     book_down: str | None = None
+    # book_down из-за того, что CSFloat не принял ключ, — это чинит только
+    # человек, и совет «проверь прокси» тут уводит в сторону.
+    key_rejected = False
     # История продаж CSFloat (номер проданного лота) — без ключа, и CSFloat
     # режет её по адресу отдельно от ручек с ключом.
     sale_down = False
@@ -8225,6 +8228,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 except (CSFloatRateLimited, CSFloatError) as e:
                     book_down = scan_errors.reason(e)
+                    key_rejected = isinstance(e, csfloat_client.CSFloatKeyRejected)
                     log.info(
                         "orders: CSFloat не отвечает на ручки с ключом (%s) — "
                         "дальше считаю без стаканов", book_down,
@@ -8247,7 +8251,6 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if sold_id:
                         listing_id = sold_id
                         cand = cand._replace(listing_sold=True)
-                        via_sale += 1
                     elif csfloat_client.direct_pause_remaining(anonymous=True) > 0:
                         # Историю закрыли по адресу — у следующих предметов
                         # ответ будет тем же, а каждый вопрос продлевает отказ.
@@ -8257,6 +8260,13 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if listing_id is not None:
                     rivals = await csfloat_client.buy_orders_for(session, listing_id)
                     book_read = rivals is not None
+                    # Считаем по факту прочитанного стакана, а не по найденному
+                    # номеру продажи: 2026-10-25 номер нашёлся у двух, стакан по
+                    # нему не отдали обоим (401), а отчёт написал «стакан
+                    # прочитан у 2 — по истории продаж» строкой ниже «не
+                    # прочитан у 2 из 2».
+                    if book_read and cand.listing_sold:
+                        via_sale += 1
 
             if not book_read:
                 # Стакан не прочитан, но план от него не зависит: потолок цены
@@ -8295,6 +8305,14 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     checked = sum(1 for c in ranked if c.steam_verified)
 
     lines = ["<b>План ордеров</b> — пока ничего не поставлено"]
+    if not _is_home_copy():
+        # Значит, страховка WEBHOOK_HOME_URL не сработала (основная спала или
+        # недоступна) — человеку стоит знать, чьи настройки и ключ он видит.
+        lines.append(
+            f"⚠️ <i>Ответила запасная копия бота ({_url_host(WEBHOOK_BASE_URL)}), "
+            f"а не основная ({_url_host(WEBHOOK_HOME_URL)}): у неё свои пороги, "
+            "своя база и свой ключ CSFloat. Лишний сервис лучше удалить в Render.</i>"
+        )
     snapshot, snapshot_note = await steam_snapshot.current()
     if snapshot is not None:
         lines.append(f"<i>Отбор по ценам Steam: {html_module.escape(snapshot.describe())}</i>")
@@ -8398,7 +8416,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
             reach = _reach(cand, plan)
-            if cand.listing_sold:
+            if cand.listing_sold and cand.market_hash_name not in blind:
                 lines.append(
                     "  ℹ️ стакан прочитан по последней продаже: поиск лотов "
                     "CSFloat закрыт"
@@ -8571,7 +8589,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if plans:
         await _offer_order_batch(
             update, chat_id, tickets, held,
-            route_down=route_down, book_down=book_down,
+            route_down=route_down, book_down=book_down, key_rejected=key_rejected,
         )
 
 
@@ -8630,6 +8648,7 @@ def _usd(cents: int | None) -> str:
 async def _offer_order_batch(
     update, chat_id: int, tickets: list, held: dict[str, int], *,
     route_down: str | None = None, book_down: str | None = None,
+    key_rejected: bool = False,
 ) -> None:
     """Сообщение с кнопкой «Поставить» под отчётом /orders."""
     held_lines = [
@@ -8643,7 +8662,14 @@ async def _offer_order_batch(
             # Самая частая причина «нечего» — не рынок, а закрытый CSFloat:
             # без стакана бот не ставит. Говорим это прямо, иначе «стакан не
             # прочитан» читается как беда с предметами.
-            if book_down:
+            if key_rejected:
+                cause = (
+                    f"{html_module.escape(book_down)}. Без ключа стакан не "
+                    "прочитать, и само это не пройдёт: в Render → Environment "
+                    "этого сервиса нужен рабочий CSFLOAT_API_KEY, потом Save "
+                    "и передеплой."
+                )
+            elif book_down:
                 cause = (
                     "CSFloat не отвечает боту даже на запросы с ключом — "
                     f"{html_module.escape(book_down)}. Обычно это проходит само "
@@ -8832,11 +8858,28 @@ async def webhook_watch_job(context: ContextTypes.DEFAULT_TYPE):
         if current == mine:
             _webhook_orphan_seen = False
             return
+        if WEBHOOK_HOME_URL and _is_home_copy():
+            # Основная копия: вебхук у запасной забираем сразу, ошибок
+            # доставки не ждём — Render будит спящую копию на апдейт сам, и
+            # Telegram ошибок так и не увидел бы (см. WEBHOOK_HOME_URL).
+            await context.bot.set_webhook(
+                url=mine,
+                secret_token=TG_WEBHOOK_SECRET or None,
+                allowed_updates=Update.ALL_TYPES,
+            )
+            _webhook_orphan_seen = False
+            log.warning(
+                "webhook: вебхук смотрел на %s, а основная копия — эта (%s) — "
+                "забрал вебхук",
+                _url_host(current) if current else "никуда (снят)",
+                _url_host(mine),
+            )
+            return
         if not current:
             orphan = bool(info.pending_update_count)
             take = orphan and _webhook_orphan_seen
             _webhook_orphan_seen = orphan
-            if take:
+            if take and await _may_take_webhook():
                 await context.bot.set_webhook(
                     url=mine,
                     secret_token=TG_WEBHOOK_SECRET or None,
@@ -8859,6 +8902,9 @@ async def webhook_watch_job(context: ContextTypes.DEFAULT_TYPE):
         )
         if time.time() - failed_ts > WEBHOOK_DEAD_AFTER_SECONDS or not info.pending_update_count:
             return
+        if not await _may_take_webhook():
+            # Основная жива — доставку к ней чинит она сама, а не запасная.
+            return
         await context.bot.set_webhook(
             url=mine,
             secret_token=TG_WEBHOOK_SECRET or None,
@@ -8868,7 +8914,7 @@ async def webhook_watch_job(context: ContextTypes.DEFAULT_TYPE):
         log.warning(
             "webhook: вебхук смотрел на %s, а Telegram туда не доставляет (%s, "
             "недоставленных %d) — забрал вебхук на эту копию",
-            current.split("/")[2] if current.count("/") >= 2 else "?",
+            _url_host(current),
             scan_errors.scrub(info.last_error_message or "без текста"),
             info.pending_update_count,
         )
@@ -12044,6 +12090,64 @@ def _warn_if_webhook_url_foreign() -> None:
         "или вписать в неё %s",
         WEBHOOK_BASE_URL, RENDER_EXTERNAL_URL, RENDER_EXTERNAL_URL,
     )
+
+
+# Основная копия бота — та, что принимает апдейты, когда в Render живут
+# несколько сервисов с одним токеном.
+#
+# Зачем. Вебхук ставит каждая копия при старте, а Render будит все сервисы на
+# каждый деплой — апдейты доставались той, что проснулась последней. 2026-10-25
+# так ответила dextrade-1: своя база (другие пороги, свои 39 прокси) и ключ
+# CSFloat, который CSFloat не принимает («invalid api key»), — /orders не
+# прочитал ни одного стакана, хотя у dextrade-af2z ключ рабочий. Удалять
+# лишние сервисы — дело человека, а это страховка, пока они есть.
+#
+# Правило. Основная копия ставит вебхук всегда и забирает его у запасной сразу,
+# не дожидаясь ошибок доставки. Запасная ставит вебхук на себя, только если
+# основная не отвечает на health-check: сервис удалён (Render отдаёт 404) или
+# спит. Основная работает и без этой страховки — значит, ошибка в адресе ниже
+# не оставит бота глухим.
+#
+# Переехали на другой сервис — впишите его адрес в WEBHOOK_HOME_URL (или
+# оставьте переменную пустой, тогда основной считается любая копия).
+WEBHOOK_HOME_URL = os.environ.get(
+    "WEBHOOK_HOME_URL", "https://dextrade-af2z.onrender.com",
+).strip().rstrip("/")
+# Сколько ждать ответа основной. Живая отвечает за доли секунды, а спящую
+# Render будит до минуты — такую считаем неживой и вебхук берём себе.
+WEBHOOK_HOME_PROBE_SECONDS = 10.0
+
+
+def _url_host(url: str) -> str:
+    """Только хост: в пути вебхука секрет."""
+    return url.split("/")[2] if url.count("/") >= 2 else (url or "?")
+
+
+def _is_home_copy() -> bool:
+    """Эта ли копия основная. Без вебхука (long-polling) спорить не с кем."""
+    if not WEBHOOK_HOME_URL or not WEBHOOK_BASE_URL:
+        return True
+    return WEBHOOK_BASE_URL == WEBHOOK_HOME_URL
+
+
+async def _home_copy_alive() -> bool:
+    """Отвечает ли основная копия на health-check (GET → 200 «ok»)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{WEBHOOK_HOME_URL}/",
+                timeout=aiohttp.ClientTimeout(total=WEBHOOK_HOME_PROBE_SECONDS),
+            ) as resp:
+                return resp.status == 200 and (await resp.text()).strip() == "ok"
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return False
+
+
+async def _may_take_webhook() -> bool:
+    """Можно ли этой копии ставить вебхук на себя (см. WEBHOOK_HOME_URL)."""
+    return _is_home_copy() or not await _home_copy_alive()
+
+
 # Секрет в заголовке X-Telegram-Bot-Api-Secret-Token: Telegram шлёт его с
 # каждым апдейтом, и это единственный способ отличить настоящий апдейт от
 # чужого POST'а на наш URL. Необязателен, но без него мы верим кому угодно.
@@ -12216,40 +12320,51 @@ async def _run_with_webhook(app, token: str) -> bool:
         except Exception:
             log.exception("webhook: post_init упал — бот поднимется без восстановленного состояния")
 
+    # Запасная копия у живой основной вебхук не забирает (см. WEBHOOK_HOME_URL):
+    # апдейты так и идут основной, а эта копия просто доживает до сна.
+    stand_by = not await _may_take_webhook()
+    if stand_by:
+        log.warning(
+            "webhook: эта копия (%s) запасная, основная %s отвечает — вебхук "
+            "на себя не ставлю, апдейты идут туда",
+            _url_host(WEBHOOK_BASE_URL), _url_host(WEBHOOK_HOME_URL),
+        )
+
     # Flood control — это «подожди», а не «не выйдет».
     #
     # Render передеплоивает все сервисы разом, и 2026-10-24 три копии бота
     # позвали setWebhook в одну секунду. Третья получила «Flood control
     # exceeded. Retry in 1 seconds» и откатилась на long-polling, а polling при
     # старте снимает вебхук — то есть отключила приём апдейтов у остальных.
-    for attempt in range(1, WEBHOOK_SET_ATTEMPTS + 1):
-        try:
-            await app.bot.set_webhook(
-                url=url,
-                secret_token=TG_WEBHOOK_SECRET or None,
-                allowed_updates=Update.ALL_TYPES,
-            )
-            break
-        except RetryAfter as e:
-            if attempt == WEBHOOK_SET_ATTEMPTS:
-                log.exception("webhook: Telegram так и не дал поставить вебхук, "
-                              "откатываюсь на long-polling")
+    if not stand_by:
+        for attempt in range(1, WEBHOOK_SET_ATTEMPTS + 1):
+            try:
+                await app.bot.set_webhook(
+                    url=url,
+                    secret_token=TG_WEBHOOK_SECRET or None,
+                    allowed_updates=Update.ALL_TYPES,
+                )
+                break
+            except RetryAfter as e:
+                if attempt == WEBHOOK_SET_ATTEMPTS:
+                    log.exception("webhook: Telegram так и не дал поставить вебхук, "
+                                  "откатываюсь на long-polling")
+                    await app.shutdown()
+                    return False
+                pause = e.retry_after
+                pause = pause.total_seconds() if hasattr(pause, "total_seconds") else float(pause)
+                # Разброс — чтобы копии, получившие отказ вместе, не пришли снова
+                # в одну и ту же секунду.
+                pause += attempt + secrets.randbelow(3000) / 1000
+                log.warning(
+                    "webhook: Telegram просит подождать (flood control) — повторю "
+                    "через %.1f с, попытка %d из %d", pause, attempt, WEBHOOK_SET_ATTEMPTS,
+                )
+                await asyncio.sleep(pause)
+            except Exception:
+                log.exception("webhook: set_webhook не удался, откатываюсь на long-polling")
                 await app.shutdown()
                 return False
-            pause = e.retry_after
-            pause = pause.total_seconds() if hasattr(pause, "total_seconds") else float(pause)
-            # Разброс — чтобы копии, получившие отказ вместе, не пришли снова
-            # в одну и ту же секунду.
-            pause += attempt + secrets.randbelow(3000) / 1000
-            log.warning(
-                "webhook: Telegram просит подождать (flood control) — повторю "
-                "через %.1f с, попытка %d из %d", pause, attempt, WEBHOOK_SET_ATTEMPTS,
-            )
-            await asyncio.sleep(pause)
-        except Exception:
-            log.exception("webhook: set_webhook не удался, откатываюсь на long-polling")
-            await app.shutdown()
-            return False
 
     await app.start()
 
@@ -12258,10 +12373,11 @@ async def _run_with_webhook(app, token: str) -> bool:
     _tg_application, _tg_loop = app, asyncio.get_running_loop()
     _tg_webhook_path = _webhook_path(token)
 
-    log.info(
-        "Режим webhook: апдейты принимаются на %s (секрет %s)",
-        url, "задан" if TG_WEBHOOK_SECRET else "НЕ задан — стоит задать TG_WEBHOOK_SECRET",
-    )
+    if not stand_by:
+        log.info(
+            "Режим webhook: апдейты принимаются на %s (секрет %s)",
+            url, "задан" if TG_WEBHOOK_SECRET else "НЕ задан — стоит задать TG_WEBHOOK_SECRET",
+        )
 
     try:
         await asyncio.Event().wait()  # работаем, пока процесс не погасят
