@@ -1,5 +1,5 @@
 """
-Страница предмета Steam: нижний лот и история продаж — одним запросом, без логина.
+Страница предмета Steam: нижний лот и история продаж — одним запросом.
 
 Зачем. Объём продаж — обязательное условие ордера (buy_orders.plan отказывает
 с UNKNOWN_VOLUME, когда его нет), а до сих пор он брался только из
@@ -29,12 +29,24 @@ priceoverview. Этот эндпоинт Steam режет жёстче всех:
     не по средним прайс-листа (в средних одна продажа с дорогими наклейками
     задирает цену вдвое).
 
-Куки аккаунта сюда НЕ идут: залогиненному Steam показывает цены в валюте его
-кошелька, а нам нужны доллары. Нужна только bMarketOptOut=1 — без неё приходит
-новая площадка, где line1 нет (см. steam_client.steam_cookie_header).
+С КУКИ АККАУНТА, если они заданы (STEAM_LOGIN_SECURE). Сначала страница
+ходила анонимно — залогиненному Steam показывает цены в валюте кошелька, а нам
+нужны доллары. Но анонимно она так и не ответила ни разу: 2026-10-24 и
+2026-10-25 все копии бота получили 429 на ПЕРВОМ же запросе страницы (и
+priceoverview тоже), а /render/ с куки аккаунта в те же минуты отвечал 200 на
+каждый из тридцати запросов подряд. Анонимный лимит Steam считает по адресу, а
+адрес у Render общий; у запросов с логином лимит свой (см. steam_client). В
+итоге /orders отказал всем тридцати финалистам — «объём продаж неизвестен».
 
-Своя область кулдауна — "history". Её 429 остальных не придерживает (лимиты у
-страницы и у /render/ могут быть разные, и останавливать вотчлист из-за
+Валюта при этом мешает меньше, чем казалось: объём и относительный разброс от
+неё не зависят, а цену в долларах даёт /render/ (currency=1). Если кошелёк не
+в долларах, страница отдаёт только объём и стабильность (history_usd=False,
+lowest_usd=None), а цену берут из /render/. Нужна и bMarketOptOut=1 — без неё
+приходит новая площадка, где line1 нет (steam_cookie_header её добавляет).
+
+Своя область кулдауна: "history_auth" с куки и "history" без них — лимиты у
+этих запросов разные, и 429 анонимной страницы не повод не спросить с логином.
+429 страницы остальных областей не придерживает (останавливать вотчлист из-за
 справочного запроса нельзя), а вот бан на листингах придерживает и её — это
 тот же адрес и тот же сайт.
 """
@@ -53,6 +65,7 @@ import aiohttp
 
 import envcfg
 from http_session import get_session
+import steam_client
 from steam_client import (
     _UA,
     _UA_HINTS,
@@ -60,6 +73,7 @@ from steam_client import (
     item_page_url,
     note_steam_429,
     note_steam_ok,
+    steam_cookie_header,
     steam_cooldown_remaining,
     throttle_steam_request,
 )
@@ -67,6 +81,7 @@ from steam_client import (
 log = logging.getLogger("steam_bot.steam_history")
 
 SCOPE = "history"
+AUTH_SCOPE = "history_auth"
 TIMEOUT_SECONDS = envcfg.env_float("STEAM_HISTORY_TIMEOUT", 20.0)
 # Сколько держать страницу в памяти. История за месяц за три часа почти не
 # меняется; цене нижнего лота столько доверять нельзя, поэтому каждый
@@ -251,6 +266,23 @@ def parse(html: str, fetched_at: float | None = None) -> ItemPage | None:
     )
 
 
+def logged_in() -> bool:
+    """Ходим ли за страницей с куки аккаунта (см. докстринг модуля)."""
+    return bool(steam_client.STEAM_LOGIN_SECURE)
+
+
+# Первую удачную страницу и чужую валюту пишем в лог один раз за процесс:
+# по ним видно, ответил ли Steam с логином и что из страницы берётся, а
+# тридцать одинаковых строк на прогон ничего к этому не добавят.
+_ok_logged: set[str] = set()   # области, чей первый успех уже в логе
+_currency_logged = False
+
+
+def active_scope() -> str:
+    """Область кулдауна, в которой сейчас ходит страница."""
+    return AUTH_SCOPE if logged_in() else SCOPE
+
+
 _cache: dict[str, ItemPage] = {}
 
 
@@ -282,7 +314,8 @@ async def fetch(market_hash_name: str, *, max_age: float = CACHE_SECONDS) -> Ite
     hit = cached(market_hash_name, max_age)
     if hit is not None:
         return hit
-    if steam_cooldown_remaining(SCOPE) > 0:
+    scope = active_scope()
+    if steam_cooldown_remaining(scope) > 0:
         return None
 
     final_url, params = _build_request(item_page_url(market_hash_name))
@@ -290,20 +323,25 @@ async def fetch(market_hash_name: str, *, max_age: float = CACHE_SECONDS) -> Ite
         "User-Agent": _UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Cookie": "bMarketOptOut=1",
+        # Прямым адресом, как и /render/ с куки (steam_client.fetch_all_listings):
+        # через резидентные прокси логин не шлём нигде.
+        "Cookie": steam_cookie_header() if logged_in() else "bMarketOptOut=1",
         **_UA_HINTS,
     }
     # Полоса прямого адреса общая с /render/ и priceoverview: к Steam с адреса
     # Render по-прежнему уходит один запрос в MIN_REQUEST_INTERVAL.
-    await throttle_steam_request(scope=SCOPE, lane="")
+    await throttle_steam_request(scope=scope, lane="")
     try:
         async with get_session().get(
             final_url, params=params, headers=headers,
             timeout=aiohttp.ClientTimeout(total=TIMEOUT_SECONDS),
         ) as resp:
             if resp.status == 429:
-                log.warning("страница предмета: %s — HTTP 429", market_hash_name)
-                await note_steam_429(scope=SCOPE, headers=dict(resp.headers))
+                log.warning(
+                    "страница предмета%s: %s — HTTP 429",
+                    " (с куки аккаунта)" if logged_in() else "", market_hash_name,
+                )
+                await note_steam_429(scope=scope, headers=dict(resp.headers))
                 return None
             if resp.status != 200:
                 log.info("страница предмета: %s — HTTP %s", market_hash_name, resp.status)
@@ -314,7 +352,8 @@ async def fetch(market_hash_name: str, *, max_age: float = CACHE_SECONDS) -> Ite
                  market_hash_name, type(e).__name__)
         return None
 
-    await note_steam_ok(SCOPE)
+    global _currency_logged
+    await note_steam_ok(scope)
     page = parse(html)
     if page is None:
         log.info(
@@ -322,10 +361,20 @@ async def fetch(market_hash_name: str, *, max_age: float = CACHE_SECONDS) -> Ite
             market_hash_name, len(html),
         )
         return None
-    if page.has_history and not page.history_usd:
+    if scope not in _ok_logged:
+        _ok_logged.add(scope)
+        log.info(
+            "страница предмета%s отвечает: %s — точек графика за %d дн. %d, "
+            "продано за 7 дней %s, нижний лот %s",
+            " с куки аккаунта" if logged_in() else "", market_hash_name, KEEP_DAYS,
+            len(page.points), page.sold(7) if page.has_history else "?",
+            f"${page.lowest_usd:.2f}" if page.lowest_usd is not None else "не в долларах",
+        )
+    if page.has_history and not page.history_usd and not _currency_logged:
+        _currency_logged = True
         log.warning(
-            "страница предмета: %s — график не в долларах; беру из него только "
-            "объём и разброс", market_hash_name,
+            "страница предмета: график не в долларах (валюта кошелька аккаунта) — "
+            "беру из него только объём и разброс, цену даёт /render/",
         )
     _remember(market_hash_name, page)
     return page

@@ -6793,6 +6793,7 @@ _SCOPE_NAMES = {
     "pricing": "цены — арбитраж, /dips, /markets",
     "inventory": "инвентарь — /inv",
     "history": "страница предмета — объём продаж и стабильность для /orders",
+    "history_auth": "страница предмета с логином — объём продаж и стабильность для /orders",
 }
 
 # Приписка к сообщениям об отказе из-за кулдауна. Одной строкой и в одном
@@ -7158,7 +7159,7 @@ async def _steam_histories(names: list[str]) -> dict:
             page = steam_history.cached(name, steam_history.CACHE_SECONDS)
         if page is not None:
             pages[name] = page
-    wait = steam_cooldown_remaining(scope=steam_history.SCOPE)
+    wait = steam_cooldown_remaining(scope=steam_history.active_scope())
     log.info(
         "orders: история сделок Steam прочитана у %d из %d финалист(ов)%s",
         len(pages), len(names),
@@ -8490,7 +8491,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         wait = steam_cooldown_remaining(scope="pricing")
         if wait > 0:
             waits.append(f"priceoverview на паузе ещё {wait / 60:.0f} мин")
-        page_wait = steam_cooldown_remaining(scope=steam_history.SCOPE)
+        page_wait = steam_cooldown_remaining(scope=steam_history.active_scope())
         if page_wait > 0:
             waits.append(f"страница предмета на паузе ещё {page_wait / 60:.0f} мин")
         lines.append("")

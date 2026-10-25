@@ -177,7 +177,7 @@ _cooldowns: dict[str, dict] = {}
 # Все области, которые ходят в Steam. Нужен явный список: при 429 в одной из них
 # остальные надо придержать (Steam банит IP, а не эндпоинт — см. note_steam_429),
 # а узнать о ещё не созданных состояниях из _cooldowns нельзя.
-KNOWN_SCOPES = ("listings", "pricing", "inventory", "history")
+KNOWN_SCOPES = ("listings", "pricing", "inventory", "history", "history_auth")
 
 # Области, чей 429 НЕ придерживает остальные (см. _apply_collateral_cooldown).
 #
@@ -193,9 +193,10 @@ KNOWN_SCOPES = ("listings", "pricing", "inventory", "history")
 #               логе: все восемь проверок цены получили 429, а вотчлист в тот
 #               же час спокойно собирал листинги с HTTP 200.
 #
-# Третья область — history, страница предмета ради истории продаж (см.
-# steam_history). Её лимит ещё не измерен, а запрос справочный: если он
-# окажется жёстче, чем у /render/, останавливать из-за него вотчлист нельзя.
+# Третья — страница предмета ради истории продаж (см. steam_history): history
+# без логина и history_auth с куки аккаунта. Запрос справочный, и анонимно
+# Steam режет его с первого же раза (2026-10-24/25) — останавливать из-за него
+# вотчлист нельзя.
 #
 # Без исключения смысл разделения областей терялся: 429 на некритичной проверке
 # цены останавливал бы на полчаса критичный сбор листингов — то есть ровно то,
@@ -203,7 +204,7 @@ KNOWN_SCOPES = ("listings", "pricing", "inventory", "history")
 #
 # Обратное направление сохраняется: 429 на листингах придержит и цены, и
 # инвентарь, и историю — там посылка про общий бан по IP остаётся в силе.
-COLLATERAL_EXEMPT_SCOPES = ("inventory", "pricing", "history")
+COLLATERAL_EXEMPT_SCOPES = ("inventory", "pricing", "history", "history_auth")
 
 
 def _cooldown_state(scope: str) -> dict:
@@ -775,9 +776,13 @@ async def fetch_all_listings(
     def _with_cookie(headers: dict) -> dict:
         return {**headers, "Cookie": cookie} if cookie else headers
 
+    # Про логин — по STEAM_LOGIN_SECURE, а не по непустому заголовку: в нём
+    # всегда есть bMarketOptOut=1, и прежнее «куки=есть» печаталось даже без
+    # входа в аккаунт — по логу нельзя было понять, анонимно ли мы ходим.
     log.info(
         "fetch_all_listings: предмет %r, прокси=%s, куки Steam-сессии=%s",
-        market_hash_name, STEAM_PROXY_URL or "нет (прямой запрос)", "есть" if cookie else "нет",
+        market_hash_name, STEAM_PROXY_URL or "нет (прямой запрос)",
+        "есть" if STEAM_LOGIN_SECURE else "нет (анонимно)",
     )
 
     raise_if_cooling_down()
