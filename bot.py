@@ -7101,6 +7101,25 @@ class _OrderCandidate(NamedTuple):
     # Порядок внутри своего источника. None — по цене Steam, дороже вперёд;
     # источник по ценам CSFloat ставит сюда ожидаемую прибыль в центах.
     rank: float | None = None
+    # Объём продаж — из файла снимка, а не от живого Steam: с адресов
+    # дата-центров Steam объём не отдаёт (см. steam_snapshot).
+    volume_from_snapshot: bool = False
+
+
+def _with_snapshot_volume(c: _OrderCandidate, snapshot) -> _OrderCandidate:
+    """
+    Продажи за сутки из снимка — только тем, кому живой Steam объёма не дал.
+
+    Живой ответ и сделки со страницы предмета всегда главнее: они свежее, а
+    файл привозит то, что Steam отдал снаружи (см. steam_snapshot).
+    """
+    if snapshot is None or c.volume_per_day is not None or c.sold_week is not None:
+        return c
+    known = snapshot.volume(c.market_hash_name)
+    if known is None:
+        return c
+    sold, age = known
+    return c._replace(volume_per_day=sold, volume_age_seconds=age, volume_from_snapshot=True)
 
 
 def _with_history(c: _OrderCandidate, page) -> _OrderCandidate:
@@ -7622,7 +7641,7 @@ async def _order_candidates_from_csfloat(
     now = time.time()
 
     picked = []
-    skipped = dict(quiet=0, jumpy=0, mismatch=0, costly=0, far=0, recent=0)
+    skipped = dict(quiet=0, jumpy=0, mismatch=0, costly=0, far=0, recent=0, thin=0)
     for name, cf in price_list.prices.items():
         sp = details.get(name)
         if sp is None or (cf.top_cents is None and cf.low_cents is None):
@@ -7664,8 +7683,14 @@ async def _order_candidates_from_csfloat(
         if refused_at and now - refused_at < ORDERS_REFUSED_PAUSE_SECONDS:
             skipped["recent"] += 1
             continue
+        # Продажи за сутки из снимка: заведомо малый объём — не тратим на
+        # предмет ни места в финале, ни запросов к Steam и CSFloat.
+        known = snapshot.volume(name, now) if snapshot else None
+        if known is not None and known[0] * 7 < limits["volume"]:
+            skipped["thin"] += 1
+            continue
         gain = order * buy_orders.profit_pct_at(order, steam_cents) / 100
-        picked.append((gain, name, steam_cents, spread, month_avg, cf))
+        picked.append((gain, name, steam_cents, spread, month_avg, cf, known))
 
     picked.sort(key=lambda row: -row[0])
     batch = picked[:ORDERS_CSFLOAT_BATCH]
@@ -7673,27 +7698,31 @@ async def _order_candidates_from_csfloat(
         "orders: цены CSFloat (%s) — выгодный ордер возможен у %d предмет(ов) в "
         "полосе $%g-$%g (пропущено: %d без сделок за сутки, %d без ровного "
         "месяца, %d с историей не по цене, %d где верхний ордер выше потолка, "
-        "%d где заявка ниже витрины в разы, %d отказанных за последние %d ч). "
-        "Цена Steam из снимка: %s. Беру %d",
+        "%d где заявка ниже витрины в разы, %d отказанных за последние %d ч, "
+        "%d с малыми продажами по снимку). Цена Steam из снимка: %s. Беру %d, "
+        "объём из снимка у %d",
         price_list.describe(), len(picked), low, high, skipped["quiet"],
         skipped["jumpy"], skipped["mismatch"], skipped["costly"], skipped["far"],
-        skipped["recent"], ORDERS_REFUSED_PAUSE_SECONDS // 3600,
+        skipped["recent"], ORDERS_REFUSED_PAUSE_SECONDS // 3600, skipped["thin"],
         "да" if snapshot else "нет, средние прайс-листа", len(batch),
+        sum(1 for row in batch if row[6] is not None),
     )
     return [
         _OrderCandidate(
             market_hash_name=name,
             listing_id=None,
             steam_price_cents=steam_cents,
-            volume_per_day=None,
             spread_pct=spread,
             source="цены CSFloat",
             csfloat_ask_cents=cf.low_cents,
             month_avg_cents=int(round(month_avg * 100)) if month_avg else None,
             ask_from_list=cf.low_cents is not None,
             rank=gain,
+            volume_per_day=known[0] if known else None,
+            volume_age_seconds=known[1] if known else None,
+            volume_from_snapshot=known is not None,
         )
-        for gain, name, steam_cents, spread, month_avg, cf in batch
+        for gain, name, steam_cents, spread, month_avg, cf, known in batch
     ]
 
 
@@ -8080,7 +8109,11 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 steam_verified=live,
                 steam_age_seconds=quote.age_seconds if live else None,
                 steam_ask_cents=ask if live and sale and sale < ask else None,
-                volume_age_seconds=quote.volume_age_seconds,
+                volume_age_seconds=(
+                    quote.volume_age_seconds if quote.volume is not None
+                    else c.volume_age_seconds
+                ),
+                volume_from_snapshot=c.volume_from_snapshot and quote.volume is None,
             )
 
         ranked = [_with_live(c) for c in ranked]
@@ -8108,6 +8141,15 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # месяц. По сделкам со страницы предмета видно и сколько продано за
         # неделю, и как держалась цена каждую из четырёх недель.
         ranked = [_with_history(c, pages.get(c.market_hash_name)) for c in ranked]
+
+        # Объём, который живой Steam так и не отдал, — из снимка (продажи за
+        # сутки, снятые снаружи; см. steam_snapshot).
+        volume_snapshot, _ = await steam_snapshot.current()
+        ranked = [_with_snapshot_volume(c, volume_snapshot) for c in ranked]
+        from_file = sum(1 for c in ranked if c.volume_from_snapshot)
+        if from_file:
+            log.info("orders: объём продаж из снимка у %d из %d финалист(ов)",
+                     from_file, len(ranked))
 
     plans: list[tuple[_OrderCandidate, buy_orders.OrderPlan]] = []
     refused: list[tuple[str, str]] = []
@@ -8410,7 +8452,12 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "считаю по сделкам"
                 )
             age = cand.volume_age_seconds
-            if age is not None and age >= ORDERS_VOLUME_NOTE_SECONDS:
+            if cand.volume_from_snapshot and age is not None:
+                lines.append(
+                    f"  ℹ️ объём из снимка: {cand.volume_per_day} шт за сутки, замер "
+                    f"{age / 3600:.0f} ч назад — живой Steam объём не отдал"
+                )
+            elif age is not None and age >= ORDERS_VOLUME_NOTE_SECONDS:
                 lines.append(
                     f"  ℹ️ объём продаж замерен {age / 3600:.0f} ч назад — "
                     f"свежий Steam не отдал"
@@ -9819,6 +9866,13 @@ def _snapshot_lines(snapshot, counts: dict[str, int], threshold: float) -> list[
             "• /orders выбирает кандидатов по этим ценам; перед постановкой "
             "цена всё равно проверяется живым запросом к Steam"
         )
+        if snapshot.volumes:
+            lines.append(
+                f"• продажи за сутки — у {len(snapshot.volumes)} предметов: /orders "
+                "берёт их, когда живой Steam объём не отдаёт, и сразу отсеивает "
+                "малопродаваемые (годятся "
+                f"{steam_snapshot.VOLUME_MAX_AGE_HOURS:.0f} ч от замера)"
+            )
         lines.append(
             f"• годится ещё {steam_snapshot.MAX_AGE_HOURS - snapshot.age_hours():.0f} ч, "
             "потом бот вернётся к прайс-листу и напомнит"

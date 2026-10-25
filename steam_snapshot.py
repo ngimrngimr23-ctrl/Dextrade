@@ -25,6 +25,14 @@
 Цены в снимке — то же число, что priceoverview.lowest_price и первый лот
 /render/: сколько платит покупатель, с комиссией. Сверено 2026-10-24 с
 живыми ценами из логов бота: совпадение до цента у 39 предметов.
+
+ОБЪЁМ ПРОДАЖ (необязательные колонки «продано_за_сутки» и «объём_снят_utc»).
+С 2026-10-25 Steam отвечает 429 на priceoverview и страницу предмета с
+адресов дата-центров на ПЕРВОМ же запросе — и с Render, и с машин GitHub
+Actions (проверено: 12 из 12). Без объёма /orders отказывает всем. Снаружи
+priceoverview отвечает, поэтому продажи за сутки по кандидатам собираются там
+же, где снимок, и приходят в том же файле. У каждой строки своё время замера:
+объём снят позже цен. Старше VOLUME_MAX_AGE_HOURS он не используется.
 """
 
 from __future__ import annotations
@@ -49,12 +57,18 @@ MAX_AGE_HOURS = envcfg.env_float("STEAM_SNAPSHOT_MAX_AGE_H", 72)
 # Меньше — это не снимок рынка, а обрывок (или чужой файл).
 MIN_ITEMS = 100
 
+# Сколько верить продажам за сутки из файла. Это не цена: число сделок за день
+# у предмета меняется медленно, а заменить его сейчас нечем (см. докстринг).
+VOLUME_MAX_AGE_HOURS = envcfg.env_float("STEAM_SNAPSHOT_VOLUME_MAX_AGE_H", 48)
+
 # Колонки CSV, которые мы понимаем: наш формат (merge_history.py) и
 # английский формат самого сборщика.
 _NAME_COLUMNS = ("market_hash_name",)
 _PRICE_COLUMNS = ("цена_steam_сейчас_$", "steam_price_usd")
 _LISTINGS_COLUMNS = ("лотов_на_рынке", "listings")
 _TIME_COLUMNS = ("снято_utc", "collected_at_utc")
+_VOLUME_COLUMNS = ("продано_за_сутки", "steam_sold_24h")
+_VOLUME_TIME_COLUMNS = ("объём_снят_utc", "volume_collected_at_utc")
 
 
 class SnapshotError(ValueError):
@@ -64,6 +78,8 @@ class SnapshotError(ValueError):
 class Snapshot(NamedTuple):
     collected_at: float                          # epoch, UTC
     prices: dict[str, tuple[int, int | None]]    # имя -> (цена в центах, лотов)
+    # имя -> (продано за сутки, когда замерено) — только у тех, кого опросили.
+    volumes: dict[str, tuple[int, float]] | None = None
 
     def age_hours(self, now: float | None = None) -> float:
         return max(0.0, ((now or time.time()) - self.collected_at) / 3600)
@@ -72,10 +88,25 @@ class Snapshot(NamedTuple):
         row = self.prices.get(name)
         return row[0] if row else None
 
+    def volume(self, name: str, now: float | None = None) -> tuple[int, float] | None:
+        """(продано за сутки, возраст замера в секундах). None — нет или устарел."""
+        row = (self.volumes or {}).get(name)
+        if row is None:
+            return None
+        age = max(0.0, (now or time.time()) - row[1])
+        if age > VOLUME_MAX_AGE_HOURS * 3600:
+            return None
+        return row[0], age
+
     def describe(self) -> str:
         stamp = time.strftime("%d.%m %H:%M", time.gmtime(self.collected_at))
-        return (f"снимок Steam от {stamp} UTC ({self.age_hours():.0f} ч назад), "
+        text = (f"снимок Steam от {stamp} UTC ({self.age_hours():.0f} ч назад), "
                 f"{len(self.prices)} скинов")
+        if self.volumes:
+            newest = max(at for _, at in self.volumes.values())
+            text += (f", продажи за сутки у {len(self.volumes)} (замер "
+                     f"{time.strftime('%d.%m %H:%M', time.gmtime(newest))} UTC)")
+        return text
 
 
 def _number(raw: str) -> float | None:
@@ -123,8 +154,11 @@ def _from_csv(text: str) -> Snapshot | None:
         return None  # не наш файл — пусть разбирают другие ветки
     listings_i = _column(header, _LISTINGS_COLUMNS)
     time_i = _column(header, _TIME_COLUMNS)
+    volume_i = _column(header, _VOLUME_COLUMNS)
+    volume_time_i = _column(header, _VOLUME_TIME_COLUMNS)
 
     prices: dict[str, tuple[int, int | None]] = {}
+    volumes: dict[str, tuple[int, float]] = {}
     collected_at = None
     for row in rows[1:]:
         if len(row) <= max(name_i, price_i):
@@ -140,7 +174,15 @@ def _from_csv(text: str) -> Snapshot | None:
         prices[name] = (int(round(price * 100)), listings)
         if collected_at is None and time_i is not None and len(row) > time_i:
             collected_at = _parse_time(row[time_i])
-    return _checked(prices, collected_at, has_time_column=time_i is not None)
+        # Объём без своего времени не берём: выдать его за свежий нельзя.
+        if (volume_i is not None and volume_time_i is not None
+                and len(row) > max(volume_i, volume_time_i)):
+            sold = _number(row[volume_i])
+            sold_at = _parse_time(row[volume_time_i])
+            if sold is not None and sold >= 0 and sold_at is not None:
+                volumes[name] = (int(sold), sold_at)
+    return _checked(prices, collected_at, has_time_column=time_i is not None,
+                    volumes=volumes)
 
 
 def _from_json(text: str) -> Snapshot | None:
@@ -152,6 +194,7 @@ def _from_json(text: str) -> Snapshot | None:
         return None
     items = data["items"]
     prices: dict[str, tuple[int, int | None]] = {}
+    volumes: dict[str, tuple[int, float]] = {}
     if isinstance(items, list):          # формат merge_history.py
         pairs = ((r.get("name"), r) for r in items if isinstance(r, dict))
     elif isinstance(items, dict):        # формат сборщика
@@ -167,12 +210,16 @@ def _from_json(text: str) -> Snapshot | None:
         listings = row.get("listings")
         prices[name] = (int(round(price * 100)),
                         listings if isinstance(listings, int) else None)
+        sold, sold_at = row.get("sold_24h"), _parse_time(row.get("volume_collected_at_utc"))
+        if isinstance(sold, int) and not isinstance(sold, bool) and sold >= 0 and sold_at:
+            volumes[name] = (sold, sold_at)
     if not prices:
         return None
-    return _checked(prices, _parse_time(data.get("collected_at_utc")), has_time_column=True)
+    return _checked(prices, _parse_time(data.get("collected_at_utc")), has_time_column=True,
+                    volumes=volumes)
 
 
-def _checked(prices, collected_at, *, has_time_column: bool) -> Snapshot:
+def _checked(prices, collected_at, *, has_time_column: bool, volumes=None) -> Snapshot:
     if len(prices) < MIN_ITEMS:
         raise SnapshotError(
             f"в файле всего {len(prices)} цен — это не снимок рынка. Пришли полный "
@@ -190,7 +237,10 @@ def _checked(prices, collected_at, *, has_time_column: bool) -> Snapshot:
         )
     if collected_at > time.time() + 3600:
         raise SnapshotError("время сбора в файле из будущего — файл испорчен")
-    return Snapshot(collected_at, prices)
+    now = time.time()
+    volumes = {name: row for name, row in (volumes or {}).items()
+               if name in prices and row[1] <= now + 3600}
+    return Snapshot(collected_at, prices, volumes or None)
 
 
 def parse(text: str) -> Snapshot | None:
@@ -210,17 +260,28 @@ def parse(text: str) -> Snapshot | None:
 
 async def save(snapshot: Snapshot) -> None:
     """Сохранить снимок в хранилище (StorageUnavailable — наружу)."""
-    global _cached
+    global _cached, _cached_stamp
+    volumes = snapshot.volumes or {}
     await save_steam_snapshot(
         {"collected_at": snapshot.collected_at, "count": len(snapshot.prices),
          "uploaded_at": time.time()},
-        {name: list(row) for name, row in snapshot.prices.items()},
+        # [цена, лотов] или [цена, лотов, продано за сутки, когда замерено]
+        {name: list(row) + list(volumes.get(name, ()))
+         for name, row in snapshot.prices.items()},
     )
     _cached = snapshot
+    _cached_stamp = None   # своя загрузка: метку подтянет первый же latest()
     log.info("снимок Steam: сохранено %d цен (%s)", len(snapshot.prices), snapshot.describe())
 
 
 _cached: Snapshot | None = None
+# Метка, с которой снят _cached. Сверяем и время загрузки: файл с теми же
+# ценами, но с дописанным объёмом — это новый снимок.
+_cached_stamp: tuple | None = None
+
+
+def _stamp(meta: dict) -> tuple:
+    return meta.get("collected_at"), meta.get("uploaded_at")
 
 
 async def latest() -> Snapshot | None:
@@ -231,7 +292,7 @@ async def latest() -> Snapshot | None:
     Целиком снимок читается один раз на загрузку: в памяти он лежит, пока
     метка в хранилище не сменится, — проверка метки стоит одну команду.
     """
-    global _cached
+    global _cached, _cached_stamp
     try:
         meta = await get_steam_snapshot_meta()
     except Exception:  # noqa: BLE001 — см. докстринг
@@ -239,7 +300,11 @@ async def latest() -> Snapshot | None:
         return _cached
     if not meta:
         return None
-    if _cached is not None and _cached.collected_at == meta.get("collected_at"):
+    if _cached is not None and (
+        _cached_stamp == _stamp(meta)
+        or (_cached_stamp is None and _cached.collected_at == meta.get("collected_at"))
+    ):
+        _cached_stamp = _stamp(meta)
         return _cached
     try:
         loaded = await get_steam_snapshot()
@@ -252,7 +317,10 @@ async def latest() -> Snapshot | None:
     _cached = Snapshot(
         float(meta["collected_at"]),
         {name: (int(row[0]), row[1] if len(row) > 1 else None) for name, row in raw.items()},
+        {name: (int(row[2]), float(row[3])) for name, row in raw.items()
+         if len(row) >= 4 and row[2] is not None and row[3] is not None} or None,
     )
+    _cached_stamp = _stamp(meta)
     return _cached
 
 
