@@ -7371,7 +7371,9 @@ async def _order_candidates_from_arb(
     ], len(listings)
 
 
-async def _order_candidates_from_dips(chat_id: int) -> list[_OrderCandidate]:
+async def _order_candidates_from_dips(
+    chat_id: int, *, skip: set[str] = frozenset(),
+) -> list[_OrderCandidate]:
     """
     Кандидаты из /dips — предметы, просевшие ниже своей нормы.
 
@@ -7395,6 +7397,8 @@ async def _order_candidates_from_dips(chat_id: int) -> list[_OrderCandidate]:
         min_price=_setting("min_price", dips.MIN_PRICE),
         max_price=saved.get("max_price"),
     )
+    # До живых цен: на предмет с ордером запрос к Steam тратить незачем.
+    found = [d for d in found if d.market_hash_name not in skip]
     if not found:
         return []
 
@@ -7470,7 +7474,9 @@ def _volume_line(volume) -> str:
 ORDERS_CATALOG_BATCH = envcfg.env_int("ORDERS_CATALOG_BATCH", 30)
 
 
-async def _order_candidates_from_catalog(chat_id: int, limits: dict) -> list[_OrderCandidate]:
+async def _order_candidates_from_catalog(
+    chat_id: int, limits: dict, *, skip: set[str] = frozenset(),
+) -> list[_OrderCandidate]:
     """
     Кандидаты из ВСЕГО каталога CS2 в заданной ценовой полосе.
 
@@ -7519,7 +7525,7 @@ async def _order_candidates_from_catalog(chat_id: int, limits: dict) -> list[_Or
     snapshot, _ = await steam_snapshot.current()
 
     band: list[tuple[str, float, float | None, float | None]] = []
-    skipped_quiet = skipped_jumpy = skipped_young = skipped_mismatch = 0
+    skipped_quiet = skipped_jumpy = skipped_young = skipped_mismatch = skipped_ordered = 0
     from_snapshot = 0
     for name, sp in details.items():
         # Наличие суточного окна само по себе значит, что сделки сегодня были.
@@ -7531,6 +7537,9 @@ async def _order_candidates_from_catalog(chat_id: int, limits: dict) -> list[_Or
         now_cents = snapshot.price_cents(name) if snapshot else None
         price = now_cents / 100 if now_cents else day
         if not (low <= price <= high):
+            continue
+        if name in skip:
+            skipped_ordered += 1
             continue
         # Стабильность за месяц, а не сутки против недели: ордер исполнится
         # через часы, а продать предмет в Steam можно будет лишь через неделю
@@ -7580,9 +7589,10 @@ async def _order_candidates_from_catalog(chat_id: int, limits: dict) -> list[_Or
         "orders: каталог — в полосе $%g-$%g подходят %d предмет(ов) "
         "(пропущено: %d без сделок за сутки, %d без истории за месяц, "
         "%d с ценой, гуляющей за месяц больше %g%%, %d с историей, не сходящейся с "
-        "ценой). Цена из снимка Steam у %d. Беру %d начиная с %d",
+        "ценой, %d с уже стоящим ордером). Цена из снимка Steam у %d. Беру %d "
+        "начиная с %d",
         low, high, len(band), skipped_quiet, skipped_young, skipped_jumpy,
-        max_spread, skipped_mismatch, from_snapshot, len(window), cursor,
+        max_spread, skipped_mismatch, skipped_ordered, from_snapshot, len(window), cursor,
     )
 
     return [
@@ -7611,7 +7621,7 @@ _orders_refused_at: dict[str, float] = {}
 
 
 async def _order_candidates_from_csfloat(
-    chat_id: int, limits: dict, price_list,
+    chat_id: int, limits: dict, price_list, *, skip: set[str] = frozenset(),
 ) -> list[_OrderCandidate]:
     """
     Кандидаты по ценам CSFloat со всего рынка (csfloat_prices): предметы, где
@@ -7641,7 +7651,8 @@ async def _order_candidates_from_csfloat(
     now = time.time()
 
     picked = []
-    skipped = dict(quiet=0, jumpy=0, mismatch=0, costly=0, far=0, recent=0, thin=0)
+    skipped = dict(quiet=0, jumpy=0, mismatch=0, costly=0, far=0, recent=0, thin=0,
+                   ordered=0)
     for name, cf in price_list.prices.items():
         sp = details.get(name)
         if sp is None or (cf.top_cents is None and cf.low_cents is None):
@@ -7653,6 +7664,9 @@ async def _order_candidates_from_csfloat(
         now_cents = snapshot.price_cents(name) if snapshot else None
         price = now_cents / 100 if now_cents else day
         if not (low <= price <= high):
+            continue
+        if name in skip:
+            skipped["ordered"] += 1
             continue
         spread = sp.month_spread_pct
         if spread is None or spread > max_spread:
@@ -7699,12 +7713,12 @@ async def _order_candidates_from_csfloat(
         "полосе $%g-$%g (пропущено: %d без сделок за сутки, %d без ровного "
         "месяца, %d с историей не по цене, %d где верхний ордер выше потолка, "
         "%d где заявка ниже витрины в разы, %d отказанных за последние %d ч, "
-        "%d с малыми продажами по снимку). Цена Steam из снимка: %s. Беру %d, "
-        "объём из снимка у %d",
+        "%d с малыми продажами по снимку, %d с уже стоящим ордером). Цена Steam "
+        "из снимка: %s. Беру %d, объём из снимка у %d",
         price_list.describe(), len(picked), low, high, skipped["quiet"],
         skipped["jumpy"], skipped["mismatch"], skipped["costly"], skipped["far"],
         skipped["recent"], ORDERS_REFUSED_PAUSE_SECONDS // 3600, skipped["thin"],
-        "да" if snapshot else "нет, средние прайс-листа", len(batch),
+        skipped["ordered"], "да" if snapshot else "нет, средние прайс-листа", len(batch),
         sum(1 for row in batch if row[6] is not None),
     )
     return [
@@ -7881,6 +7895,15 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     log.info("orders: chat_id=%s прогон начат, пороги %s", chat_id, limits)
 
+    # Предметы, на которые ордер уже стоит (ботом или руками), не предлагаем:
+    # постановка всё равно откажет («ордер уже стоит»), а место в финале и
+    # запросы к Steam и CSFloat уйдут на них впустую.
+    ordered, ordered_note = await order_desk.ordered_names(chat_id)
+    log.info(
+        "orders: chat_id=%s уже стоят ордера на %d предмет(ов) — в отбор не беру%s",
+        chat_id, len(ordered), f" ({ordered_note})" if ordered_note else "",
+    )
+
     # Прайс-лист греем ДО таймера, и это не мелочь.
     #
     # Он лежит в файле внутри контейнера, а контейнер пересоздаётся на каждом
@@ -7945,7 +7968,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ {scan_errors.scrub(str(e))}")
         candidates = []
     try:
-        dips_found = await _order_candidates_from_dips(chat_id)
+        dips_found = await _order_candidates_from_dips(chat_id, skip=ordered)
         from_dips = len(dips_found)
         candidates += dips_found
     except Exception as e:  # noqa: BLE001 — один источник не должен ронять другой
@@ -7963,11 +7986,13 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Каталог — запасной путь, когда прайс-лист CSFloat не скачался.
     try:
         if cf_prices is not None:
-            csfloat_found = await _order_candidates_from_csfloat(chat_id, limits, cf_prices)
+            csfloat_found = await _order_candidates_from_csfloat(
+                chat_id, limits, cf_prices, skip=ordered,
+            )
             from_csfloat = len(csfloat_found)
             candidates += csfloat_found
         else:
-            catalog_found = await _order_candidates_from_catalog(chat_id, limits)
+            catalog_found = await _order_candidates_from_catalog(chat_id, limits, skip=ordered)
             from_catalog = len(catalog_found)
             candidates += catalog_found
     except Exception as e:  # noqa: BLE001 — источники независимы
@@ -7984,9 +8009,12 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Один предмет мог прийти из обоих источников — оставляем дороже, по нему и
-    # прибыль считается щедрее.
+    # прибыль считается щедрее. С уже стоящим ордером — мимо: источники с
+    # лимитом отсеяли их сами, здесь страховка для остальных (арбитраж).
     best: dict[str, _OrderCandidate] = {}
     for cand in candidates:
+        if cand.market_hash_name in ordered:
+            continue
         seen = best.get(cand.market_hash_name)
         if seen is None or cand.steam_price_cents > seen.steam_price_cents:
             best[cand.market_hash_name] = cand
@@ -8368,6 +8396,13 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     if cf_prices is not None:
         lines.append(f"<i>Цены CSFloat: {html_module.escape(cf_prices.describe())}</i>")
+    if ordered:
+        lines.append(
+            f"<i>На {len(ordered)} предмет(ов) ордер уже стоит — их не предлагаю. "
+            "Все ордера: /myorders</i>"
+        )
+    if ordered_note:
+        lines.append(f"⚠️ <i>{html_module.escape(ordered_note)}</i>")
     lines.append("")
     # ЧТО ЗНАЧИТ «ЗАЯВКА ДОСТАЁТ ДО РЫНКА».
     #

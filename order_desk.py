@@ -770,6 +770,33 @@ async def snapshot(chat_id: int) -> Snapshot:
     return Snapshot(orders, registry, balance)
 
 
+async def ordered_names(chat_id: int) -> tuple[set[str], str | None]:
+    """
+    Предметы, на которые ордер уже стоит, — чтобы /orders не предлагал их снова.
+
+    Источник правды — список своих ордеров на CSFloat: там и ботовые, и
+    поставленные руками, и правило то же, что у постановки (_place). Список не
+    прочитался — берём реестр бота: ручных в нём нет, но свои бот хотя бы не
+    предложит второй раз. Второе значение — оговорка для отчёта, None — список
+    полный.
+    """
+    try:
+        async with _session() as session:
+            current = await csfloat_client.my_buy_orders(session)
+        return {o.market_hash_name for o in current if o.market_hash_name}, None
+    except (CSFloatError, CSFloatRateLimited) as e:
+        reason = _reason(e)
+    try:
+        registry = await get_bot_orders(chat_id)
+    except StorageUnavailable as e:
+        return set(), (f"свои ордера не прочитаны ни на CSFloat ({reason}), ни в "
+                       f"реестре бота ({_reason(e)}) — в плане могут быть предметы, "
+                       "на которые ордер уже стоит")
+    names = {entry["name"] for entry in registry.values() if entry.get("name")}
+    return names, (f"список ордеров на CSFloat не прочитан ({reason}) — не предлагаю "
+                   "только ботовые из реестра, ручные могут попасть в план")
+
+
 async def _cancel(
     chat_id: int, *, ids: list[str] | None = None, include_manual: bool = False,
 ) -> CancelOutcome:
