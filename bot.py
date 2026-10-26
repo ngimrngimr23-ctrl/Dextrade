@@ -9450,9 +9450,19 @@ async def myorders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if entry:
             age_h = (now - float(entry.get("placed_at") or now)) / 3600
             moved = int(entry.get("reprices") or 0)
+            # Потолок — с последней сверки (с медианой за месяц), а не с
+            # постановки: тот бывал посчитан от пика и выше цены, по которой
+            # бот ордер на самом деле держит.
+            median = entry.get("month_median")
+            basis = ""
+            if median:
+                basis = (" (от месячной цены прайс-листа " if
+                         entry.get("month_median_from") == order_desk.PRICELIST
+                         else " (от медианы Steam ") + f"{_usd(median)})"
             lines.append(
                 f"{i}. 🤖 <code>{name}</code> — {_usd(o.price_cents)}{qty} · "
-                f"потолок {_usd(entry.get('ceiling'))} · стоит {age_h:.0f} ч"
+                f"потолок {_usd(entry.get('ceiling_now') or entry.get('ceiling'))}{basis}"
+                f" · стоит {age_h:.0f} ч"
                 + (f" · переставлен {moved} раз" if moved else "")
                 + (" · ⚠️ обошли выше потолка" if entry.get("outbid_noted") else "")
             )

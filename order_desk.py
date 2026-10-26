@@ -717,6 +717,9 @@ async def _maintain(
                     min_profit_pct=min_profit_pct, max_order_cents=max_order_cents,
                     month_median_cents=median,
                 )
+                # Для /myorders: «ceiling» — потолок на момент постановки, он же
+                # основа расчёта, а этот — с медианой и порогами на сейчас.
+                entry["ceiling_now"] = ceiling
                 decision = buy_orders.reprice(
                     current_cents=order.price_cents,
                     ceiling_cents=ceiling,
