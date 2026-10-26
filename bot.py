@@ -7113,6 +7113,9 @@ class _OrderCandidate(NamedTuple):
     # страницы предмета.
     month_median_age_seconds: float | None = None
     month_median_from_snapshot: bool = False
+    # Медианы сделок нет — это месячная цена из прайс-листа (доля окна
+    # last_30d, см. pricing.pricelist_month_cents).
+    month_median_from_pricelist: bool = False
     # Цену Steam срезала медиана за МЕСЯЦ: нижний лот был выше неё.
     steam_cut_by_month: bool = False
 
@@ -7133,13 +7136,21 @@ def _with_snapshot_volume(c: _OrderCandidate, snapshot) -> _OrderCandidate:
     return c._replace(volume_per_day=sold, volume_age_seconds=age, volume_from_snapshot=True)
 
 
-def _known_month_median(name: str, snapshot, now: float | None = None) -> tuple[int, float] | None:
+def _known_month_median(name: str, snapshot, now: float | None = None,
+                        pricelist: dict | None = None) -> tuple[int, float | None] | None:
     """
-    (медиана сделок за месяц в центах, возраст) без запросов к Steam — из
-    снимка или из истории продаж, уже прочитанной за последние часы.
+    (месячная цена в центах, возраст или None) без запросов к Steam: медиана
+    сделок из снимка или из истории продаж, уже прочитанной за последние часы,
+    а нет её — месячная цена из прайс-листа (pricing.pricelist_month_cents).
     """
     known = snapshot.month_median(name, now) if snapshot is not None else None
-    return known if known is not None else steam_history.cached_month_median(name)
+    if known is None:
+        known = steam_history.cached_month_median(name)
+    if known is None:
+        cents = pricing.pricelist_month_cents(pricelist, name)
+        if cents:
+            known = (cents, None)
+    return known
 
 
 def _medians_required(snapshot, now: float | None = None) -> bool:
@@ -7156,7 +7167,8 @@ def _medians_required(snapshot, now: float | None = None) -> bool:
     return any(snapshot.month_median(n, now) for n in snapshot.medians or ())
 
 
-def _with_month_median(c: _OrderCandidate, page, snapshot) -> _OrderCandidate:
+def _with_month_median(c: _OrderCandidate, page, snapshot,
+                       pricelist: dict | None = None) -> _OrderCandidate:
     """
     Цена Steam — не выше медианы сделок за 30 дней.
 
@@ -7166,12 +7178,13 @@ def _with_month_median(c: _OrderCandidate, page, snapshot) -> _OrderCandidate:
     такой пик не срезают: на коротком окне он и есть весь рынок.
 
     Медиана — со страницы предмета, если её прочитали, иначе из снимка
-    (steam_snapshot: с адреса Render страницу Steam не отдаёт). Нет ни там, ни
-    там — month_median_cents остаётся None, и buy_orders.plan откажет: не
-    знаем, не пик ли перед нами.
+    (steam_snapshot: с адреса Render страницу Steam не отдаёт), а нет и там —
+    месячная цена из прайс-листа (pricing.pricelist_month_cents). Нет ничего —
+    month_median_cents остаётся None, и buy_orders.plan откажет: не знаем, не
+    пик ли перед нами.
     """
     median = age = None
-    from_snapshot = False
+    from_snapshot = from_pricelist = False
     if page is not None and page.has_history and page.history_usd:
         value = page.median(30)
         if value:
@@ -7182,9 +7195,13 @@ def _with_month_median(c: _OrderCandidate, page, snapshot) -> _OrderCandidate:
         if known is not None:
             (median, age), from_snapshot = known, True
     if not median:
+        median = pricing.pricelist_month_cents(pricelist, c.market_hash_name)
+        from_pricelist = bool(median)
+    if not median:
         return c
     changes: dict = dict(month_median_cents=median, month_median_age_seconds=age,
-                         month_median_from_snapshot=from_snapshot)
+                         month_median_from_snapshot=from_snapshot,
+                         month_median_from_pricelist=from_pricelist)
     if median < c.steam_price_cents:
         changes.update(
             steam_ask_cents=c.steam_ask_cents or c.steam_price_cents,
@@ -7653,7 +7670,7 @@ async def _order_candidates_from_catalog(
             # описывают чужие дорогие (или дешёвые) сделки, а не этот рынок.
             skipped_mismatch += 1
             continue
-        median = _known_month_median(name, snapshot, now)
+        median = _known_month_median(name, snapshot, now, details)
         if median is None and with_medians:
             skipped_no_median += 1
             continue
@@ -7785,7 +7802,7 @@ async def _order_candidates_from_csfloat(
         ):
             skipped["mismatch"] += 1
             continue
-        median = _known_month_median(name, snapshot, now)
+        median = _known_month_median(name, snapshot, now, details)
         if median is None and with_medians:
             skipped["no_median"] += 1
             continue
@@ -8296,14 +8313,21 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.info("orders: объём продаж из снимка у %d из %d финалист(ов)",
                      from_file, len(ranked))
 
-        # Цена Steam — не выше медианы сделок за месяц: нижний лот бывает пиком.
-        ranked = [_with_month_median(c, pages.get(c.market_hash_name), volume_snapshot)
+        # Цена Steam — не выше месячной: нижний лот бывает пиком. Медиана
+        # сделок, если она есть, иначе месячная цена из прайс-листа.
+        pricelist = ((await get_csgotrader_price_details() or {})
+                     if pricing.PRICELIST_MONTH_FACTOR > 0 else {})
+        ranked = [_with_month_median(c, pages.get(c.market_hash_name), volume_snapshot,
+                                     pricelist)
                   for c in ranked]
         log.info(
-            "orders: медиана сделок Steam за месяц известна у %d из %d финалист(ов) "
-            "(из снимка у %d), срезала цену у %d",
+            "orders: месячная цена известна у %d из %d финалист(ов) (медиана сделок "
+            "Steam у %d, из снимка у %d, из прайс-листа у %d), срезала цену у %d",
             sum(1 for c in ranked if c.month_median_cents), len(ranked),
+            sum(1 for c in ranked if c.month_median_cents and not c.month_median_from_snapshot
+                and not c.month_median_from_pricelist),
             sum(1 for c in ranked if c.month_median_from_snapshot),
+            sum(1 for c in ranked if c.month_median_from_pricelist),
             sum(1 for c in ranked if c.steam_cut_by_month),
         )
 
@@ -8608,9 +8632,16 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             if cand.sold_week is not None:
                 lines.append(f"  📦 в Steam продано за 7 дней: {cand.sold_week} шт")
-            # Откуда медиана за месяц и сколько ей — как у объёма из снимка.
+            # Откуда месячная цена и сколько ей — как у объёма из снимка.
             median_from = ""
-            if cand.month_median_cents:
+            median_name, median_of, by_median = (
+                "медиана сделок Steam за месяц", "медианы сделок за месяц", "по медиане")
+            if cand.month_median_from_pricelist:
+                median_name, median_of, by_median = (
+                    "месячная цена", "месячной цены", "по ней")
+                median_from = (f"{pricing.PRICELIST_MONTH_FACTOR * 100:.0f}% от цены "
+                               "прайс-листа за 30 дней")
+            elif cand.month_median_cents:
                 median_age = cand.month_median_age_seconds or 0
                 median_from = (
                     "со страницы Steam" if not cand.month_median_from_snapshot
@@ -8620,8 +8651,8 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if cand.steam_cut_by_month:
                 lines.append(
                     f"  ℹ️ {'нижний лот в Steam' if verified else 'оценка цены Steam'} "
-                    f"${cand.steam_ask_cents / 100:.2f} выше медианы сделок за месяц — "
-                    f"считаю по медиане ${plan.steam_price_cents / 100:.2f} ({median_from})"
+                    f"${cand.steam_ask_cents / 100:.2f} выше {median_of} — "
+                    f"считаю {by_median} ${plan.steam_price_cents / 100:.2f} ({median_from})"
                 )
             elif cand.steam_ask_cents:
                 period = "неделю" if cand.steam_cut_by_week else "сутки"
@@ -8632,7 +8663,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             if cand.month_median_cents and not cand.steam_cut_by_month:
                 lines.append(
-                    f"  📉 медиана сделок Steam за месяц "
+                    f"  📉 {median_name} "
                     f"${cand.month_median_cents / 100:.2f} ({median_from}) — цена не выше неё"
                 )
             age = cand.volume_age_seconds
@@ -8737,7 +8768,19 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Медиана за месяц — из истории продаж Steam (ручка нового рынка), а
     # если её не дали — из снимка. Отказ из-за неё — новость про Steam.
     no_median = sum(1 for _, why in refused if why == buy_orders.UNKNOWN_MONTH_MEDIAN)
-    if no_median:
+    if no_median and pricing.PRICELIST_MONTH_FACTOR > 0:
+        # Месячная цена берётся из прайс-листа — нет её только у тех, кого
+        # там нет за 30 дней.
+        why = "в прайс-листе нет их цены за 30 дней — скорее всего, продаются редко"
+        if snapshot is not None and snapshot.medians:
+            why += (f"; в снимке медианы у них нет или замер старше "
+                    f"{steam_snapshot.VOLUME_MAX_AGE_HOURS:.0f} ч")
+        lines.append("")
+        lines.append(
+            f"⚠️ Месячной цены нет у {no_median} предмет(ов): {why}. "
+            "Без неё цену не считаю — нижний лот бывает пиком."
+        )
+    elif no_median:
         api_wait = steam_history.history_api_wait()
         pause = f"429, пауза ещё {api_wait / 60:.0f} мин"
         if api_wait > 0 and steam_history.WORKER_URL:

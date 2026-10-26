@@ -48,6 +48,7 @@ import aiohttp
 import buy_orders
 import csfloat_client
 import envcfg
+import pricing
 import steam_history
 import steam_snapshot
 from csfloat_client import (
@@ -92,6 +93,9 @@ MAINTAIN_PER_ROUND = envcfg.env_int("ORDER_MAINTAIN_PER_ROUND", 12)
 # фоновую поддержку нельзя — он нужен /orders. Прочитанная история живёт в
 # памяти три часа, так что все ордера покрываются за несколько прогонов.
 MAINTAIN_HISTORY_FETCHES = envcfg.env_int("ORDER_MAINTAIN_HISTORY_FETCHES", 4)
+
+# Метка в реестре: месячная цена ордера взята из прайс-листа, а не из сделок.
+PRICELIST = "pricelist"
 
 # Виды событий поддержки — по ним бот решает, о чём писать в чат.
 FILLED = "filled"        # исполнен: в сделках есть покупка
@@ -637,6 +641,9 @@ async def _maintain(
             # продаж Steam (ручка нового рынка; страницу предмета Steam с адреса
             # бота не отдаёт). Нет ни там, ни там — последняя известная из реестра.
             snapshot, _ = await steam_snapshot.current()
+            # А медианы сделок нет совсем — месячная цена из прайс-листа. Он на
+            # диске (сеть трогается раз в три часа) и читается, только когда нужен.
+            pricelist = None
 
             queue = sorted(registry.items(), key=lambda kv: kv[1].get("checked_at", 0))
             history_fetches = 0
@@ -690,7 +697,21 @@ async def _maintain(
                     measured = await _history_median(name)
                 if measured is not None:
                     entry["month_median"] = measured[0]
+                    entry.pop("month_median_from", None)
+                elif pricing.PRICELIST_MONTH_FACTOR > 0 and (
+                        not entry.get("month_median")
+                        or entry.get("month_median_from") == PRICELIST):
+                    # Медианы сделок нет и не было — месячная цена из прайс-листа.
+                    # Прочитанную раньше медиану сделок она не перебивает: та точнее.
+                    if pricelist is None:
+                        pricelist = await pricing.get_csgotrader_price_details() or {}
+                    cents = pricing.pricelist_month_cents(pricelist, name)
+                    if cents:
+                        entry["month_median"] = cents
+                        entry["month_median_from"] = PRICELIST
                 median = entry.get("month_median")
+                median_name = ("месячная цена" if entry.get("month_median_from") == PRICELIST
+                               else "медиана сделок Steam за месяц")
                 ceiling = _ceiling_now(
                     entry, cached_prices.get(name),
                     min_profit_pct=min_profit_pct, max_order_cents=max_order_cents,
@@ -706,13 +727,13 @@ async def _maintain(
                     entry, cached_prices.get(name),
                     min_profit_pct=min_profit_pct, max_order_cents=max_order_cents,
                 ):
-                    # Потолок опустила медиана за месяц — в уведомлении скажем,
+                    # Потолок опустила месячная цена — в уведомлении скажем,
                     # почему ордер вдруг подешевел.
-                    why += f" (медиана сделок Steam за месяц ${median / 100:.2f})"
+                    why += f" ({median_name} ${median / 100:.2f})"
                 log.info(
                     "orders: chat_id=%s «%s» $%.2f, потолок $%.2f%s — %s: %s",
                     chat_id, name, order.price_cents / 100, ceiling / 100,
-                    f" (медиана за месяц ${median / 100:.2f})" if median else "",
+                    f" ({median_name} ${median / 100:.2f})" if median else "",
                     decision.action, why,
                 )
 

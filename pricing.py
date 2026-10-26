@@ -254,6 +254,35 @@ CSGOTRADER_RECENT_WINDOWS = ("last_24h", "last_7d")
 CSGOTRADER_MONTH_WINDOWS = ("last_24h", "last_7d", "last_30d")
 
 
+# МЕСЯЧНАЯ ЦЕНА ДЛЯ /orders — из окна last_30d, когда медианы сделок Steam нет.
+# Без запросов к Steam: адресу Render историю продаж он не отдаёт, а прайс-лист
+# бот и так скачивает.
+#
+# Это НЕ медиана сделок, и как есть её брать нельзя. Сверка 2026-10-26 по 1239
+# предметам ($2.5-100, от 20 продаж за месяц) с медианами, снятыми с самого
+# Steam: last_30d выше настоящей медианы в среднем на 26% (у каждого десятого
+# меньше чем на 9%, у каждого десятого больше чем на 59%). Цена «не выше
+# last_30d» пики почти не срезает: завышенных больше чем на 10% выходит 13%
+# против 14% без всякой отсечки. Доля 0.85 оставляет таких 6%, а завышенных
+# больше чем на 20% — 1% вместо 4%. Плата — у 14% предметов цена выходит на 10%
+# и более ниже настоящей: упущенный ордер, а не убыток.
+PRICELIST_MONTH_WINDOW = "last_30d"
+PRICELIST_MONTH_FACTOR = envcfg.env_float("STEAM_MONTH_PRICELIST_FACTOR", 0.85)
+
+
+def pricelist_month_cents(details: dict | None, market_hash_name: str) -> int | None:
+    """
+    Месячная цена предмета в центах — PRICELIST_MONTH_FACTOR от окна last_30d.
+    details — словарь get_csgotrader_price_details(). None: окна нет (предмет
+    месяц не продавался) или доля выключена (STEAM_MONTH_PRICELIST_FACTOR=0).
+    """
+    sp = details.get(market_hash_name) if details else None
+    value = sp.windows.get(PRICELIST_MONTH_WINDOW) if sp is not None else None
+    if not value or PRICELIST_MONTH_FACTOR <= 0:
+        return None
+    return int(round(value * PRICELIST_MONTH_FACTOR * 100))
+
+
 def _load_csgotrader_cache() -> tuple[dict, float] | None:
     """Содержимое дискового кэша прайс-листа. Читается один раз на версию файла (см. _read_json_memo)."""
     data = _read_json_memo(CSGOTRADER_CACHE_PATH, None)
