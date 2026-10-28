@@ -7852,7 +7852,7 @@ async def _order_candidates_from_csfloat(
         skipped["recent"], ORDERS_REFUSED_PAUSE_SECONDS // 3600, skipped["thin"],
         skipped["ordered"], skipped["no_median"],
         ("да, не выше медианы за месяц" if snapshot.medians else "да, медиан в нём нет")
-        if snapshot else "нет, средние прайс-листа", len(batch),
+        if snapshot and snapshot.prices else "нет, средние прайс-листа", len(batch),
         sum(1 for row in batch if row[6] is not None),
     )
     return [

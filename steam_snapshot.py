@@ -116,8 +116,12 @@ class Snapshot(NamedTuple):
 
     def describe(self) -> str:
         stamp = time.strftime("%d.%m %H:%M", time.gmtime(self.collected_at))
-        text = (f"снимок Steam от {stamp} UTC ({self.age_hours():.0f} ч назад), "
-                f"{len(self.prices)} скинов")
+        text = f"снимок Steam от {stamp} UTC ({self.age_hours():.0f} ч назад), "
+        if self.prices:
+            text += f"{len(self.prices)} скинов"
+        else:
+            # current() убрал цены старше MAX_AGE_HOURS
+            text += f"цены старше {MAX_AGE_HOURS:.0f} ч — беру средние прайс-листа"
         if self.volumes:
             newest = max(at for _, at in self.volumes.values())
             text += (f", продажи за сутки у {len(self.volumes)} (замер "
@@ -386,11 +390,17 @@ async def current() -> tuple[Snapshot | None, str | None]:
 
     (снимок, None) — используем; (None, причина) — снимка нет или он старше
     MAX_AGE_HOURS, и причину стоит показать человеку.
+
+    Старше MAX_AGE_HOURS устаревают только цены: объём продаж и медиана
+    меняются медленно (VOLUME_MAX_AGE_HOURS), поэтому снимок отдаётся без цен,
+    и отбор берёт цену из прайс-листа, а объём и медиану — из файла.
     """
     snapshot = await latest()
     if snapshot is None:
         return None, None
     if snapshot.age_hours() > MAX_AGE_HOURS:
+        if snapshot.volumes or snapshot.medians:
+            return snapshot._replace(prices={}), None
         return None, (
             f"{snapshot.describe()} — старше {MAX_AGE_HOURS:.0f} ч, не использую. "
             "Пришли свежий файл цен"
