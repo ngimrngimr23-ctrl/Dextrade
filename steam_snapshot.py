@@ -32,7 +32,7 @@
 Actions (проверено: 12 из 12). Без объёма /orders отказывает всем. Снаружи
 priceoverview отвечает, поэтому продажи за сутки по кандидатам собираются там
 же, где снимок, и приходят в том же файле. У каждой строки своё время замера:
-объём снят позже цен. Старше VOLUME_MAX_AGE_HOURS он не используется.
+объём снят позже цен. Срок годности — VOLUME_MAX_AGE_HOURS (0 — без срока).
 
 МЕДИАНА СДЕЛОК ЗА МЕСЯЦ (необязательная колонка «медиана_30д_$»). Нижний лот
 бывает пиком: 2026-10-25 бот считал FAMAS | Bad Trip (Well-Worn) от $55.32, а
@@ -64,9 +64,17 @@ MAX_AGE_HOURS = envcfg.env_float("STEAM_SNAPSHOT_MAX_AGE_H", 72)
 # Меньше — это не снимок рынка, а обрывок (или чужой файл).
 MIN_ITEMS = 100
 
-# Сколько верить продажам за сутки из файла. Это не цена: число сделок за день
-# у предмета меняется медленно, а заменить его сейчас нечем (см. докстринг).
-VOLUME_MAX_AGE_HOURS = envcfg.env_float("STEAM_SNAPSHOT_VOLUME_MAX_AGE_H", 48)
+# Сколько верить продажам за сутки и медиане из файла. Это не цена: число
+# сделок за день и месячная медиана у предмета меняются медленно, а заменить
+# их сейчас нечем (см. докстринг). 0 — без срока: годятся, пока лежит файл.
+VOLUME_MAX_AGE_HOURS = envcfg.env_float("STEAM_SNAPSHOT_VOLUME_MAX_AGE_H", 0)
+
+
+def volume_limit_text() -> str:
+    """Срок годности объёма и медианы для сообщений: «48 ч» или «без срока»."""
+    if VOLUME_MAX_AGE_HOURS > 0:
+        return f"{VOLUME_MAX_AGE_HOURS:.0f} ч от замера"
+    return "без срока, пока лежит файл"
 
 # Колонки CSV, которые мы понимаем: наш формат (merge_history.py) и
 # английский формат самого сборщика.
@@ -120,11 +128,11 @@ class Snapshot(NamedTuple):
 
 
 def _fresh(row: tuple[int, float] | None, now: float | None) -> tuple[int, float] | None:
-    """Значение из истории продаж и его возраст — если не старше VOLUME_MAX_AGE_HOURS."""
+    """Значение из истории продаж и его возраст — если не старше VOLUME_MAX_AGE_HOURS (0 — без срока)."""
     if row is None:
         return None
     age = max(0.0, (now or time.time()) - row[1])
-    if age > VOLUME_MAX_AGE_HOURS * 3600:
+    if VOLUME_MAX_AGE_HOURS > 0 and age > VOLUME_MAX_AGE_HOURS * 3600:
         return None
     return row[0], age
 

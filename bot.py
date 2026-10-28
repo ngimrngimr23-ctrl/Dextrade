@@ -8773,8 +8773,9 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # там нет за 30 дней.
         why = "в прайс-листе нет их цены за 30 дней — скорее всего, продаются редко"
         if snapshot is not None and snapshot.medians:
-            why += (f"; в снимке медианы у них нет или замер старше "
-                    f"{steam_snapshot.VOLUME_MAX_AGE_HOURS:.0f} ч")
+            why += (f"; в снимке медианы у них нет"
+                    + (f" или замер старше {steam_snapshot.VOLUME_MAX_AGE_HOURS:.0f} ч"
+                       if steam_snapshot.VOLUME_MAX_AGE_HOURS > 0 else ""))
         lines.append("")
         lines.append(
             f"⚠️ Месячной цены нет у {no_median} предмет(ов): {why}. "
@@ -8798,8 +8799,9 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Снимок поминаем, только если медианы в нём бывают: иначе это
         # отсылка к файлу, которого никто не присылал.
         if snapshot is not None and snapshot.medians:
-            why += (f"; в снимке её у них нет или замер старше "
-                    f"{steam_snapshot.VOLUME_MAX_AGE_HOURS:.0f} ч")
+            why += (f"; в снимке её у них нет"
+                    + (f" или замер старше {steam_snapshot.VOLUME_MAX_AGE_HOURS:.0f} ч"
+                       if steam_snapshot.VOLUME_MAX_AGE_HOURS > 0 else ""))
         lines.append("")
         lines.append(
             f"⚠️ Медианы сделок за месяц нет у {no_median} предмет(ов): {why}. "
@@ -10137,13 +10139,13 @@ def _snapshot_lines(snapshot, counts: dict[str, int], threshold: float) -> list[
                 f"• продажи за сутки — у {len(snapshot.volumes)} предметов: /orders "
                 "берёт их, когда живой Steam объём не отдаёт, и сразу отсеивает "
                 "малопродаваемые (годятся "
-                f"{steam_snapshot.VOLUME_MAX_AGE_HOURS:.0f} ч от замера)"
+                f"{steam_snapshot.volume_limit_text()})"
             )
         if snapshot.medians:
             lines.append(
                 f"• медиана сделок за месяц — у {len(snapshot.medians)} предметов: "
                 "/orders и поддержка ордеров считают цену Steam не выше неё (годится "
-                f"{steam_snapshot.VOLUME_MAX_AGE_HOURS:.0f} ч от замера)"
+                f"{steam_snapshot.volume_limit_text()})"
             )
         else:
             lines.append(
