@@ -1,0 +1,4 @@
+pages/
+out/
+*.log
+__pycache__/
