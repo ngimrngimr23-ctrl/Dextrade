@@ -63,7 +63,7 @@ from urllib.parse import quote
 
 import aiohttp
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import RetryAfter
+from telegram.error import RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -10205,13 +10205,32 @@ async def steamprices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# Файл цен Steam весит 2–3 МБ: за стандартные 5 секунд на чтение Telegram его
+# не всегда успевает отдать — человек получал «Не смог прочитать файл как
+# JSON: Timed out». Даём минуту и одну повторную попытку.
+DOCUMENT_DOWNLOAD_TIMEOUT = 60
+
+
+async def _download_document(bot, file_id: str) -> bytes:
+    for attempt in (1, 2):
+        try:
+            tg_file = await bot.get_file(file_id, read_timeout=DOCUMENT_DOWNLOAD_TIMEOUT)
+            return bytes(await tg_file.download_as_bytearray(
+                read_timeout=DOCUMENT_DOWNLOAD_TIMEOUT))
+        except TimedOut:
+            if attempt == 2:
+                raise
+            log.warning("файл из Telegram не скачался за %d с — пробую ещё раз",
+                        DOCUMENT_DOWNLOAD_TIMEOUT)
+    raise AssertionError("unreachable")
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     document = update.message.document
     filename = (document.file_name or "").lower()
     try:
-        tg_file = await context.bot.get_file(document.file_id)
-        raw = bytes(await tg_file.download_as_bytearray())
+        raw = await _download_document(context.bot, document.file_id)
 
         # PDF (частый случай на мобильных: "Печать -> Сохранить как PDF"
         # вместо обычного скачивания файла) — вытаскиваем текст через pdftotext
@@ -10299,6 +10318,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text = text[start:end + 1]
 
             data = json.loads(text)
+    except TimedOut:
+        await update.message.reply_text(
+            "Telegram не отдал файл и за минуту — перешли его ещё раз."
+        )
+        return
     except Exception as e:
         await update.message.reply_text(
             f"Не смог прочитать файл как JSON: {e}\n\n"
