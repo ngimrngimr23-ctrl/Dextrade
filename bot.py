@@ -10134,32 +10134,40 @@ def _snapshot_lines(snapshot, counts: dict[str, int], threshold: float) -> list[
             "• /orders выбирает кандидатов по этим ценам; перед постановкой "
             "цена всё равно проверяется живым запросом к Steam"
         )
-        if snapshot.volumes:
-            lines.append(
-                f"• продажи за сутки — у {len(snapshot.volumes)} предметов: /orders "
-                "берёт их, когда живой Steam объём не отдаёт, и сразу отсеивает "
-                "малопродаваемые (годятся "
-                f"{steam_snapshot.volume_limit_text()})"
-            )
-        if snapshot.medians:
-            lines.append(
-                f"• медиана сделок за месяц — у {len(snapshot.medians)} предметов: "
-                "/orders и поддержка ордеров считают цену Steam не выше неё (годится "
-                f"{steam_snapshot.volume_limit_text()})"
-            )
-        else:
-            lines.append(
-                "• ⚠️ медиан сделок за месяц в файле нет (колонка «медиана_30д_$») — "
-                "без них /orders планов не строит: нижний лот бывает пиком"
-            )
+    # Объём и медиана работают и при старых ценах (steam_snapshot.current).
+    if snapshot.volumes:
         lines.append(
-            f"• годится ещё {steam_snapshot.MAX_AGE_HOURS - snapshot.age_hours():.0f} ч, "
-            "потом бот вернётся к прайс-листу и напомнит"
+            f"• продажи за сутки — у {len(snapshot.volumes)} предметов: /orders "
+            "берёт их, когда живой Steam объём не отдаёт, и сразу отсеивает "
+            "малопродаваемые (годятся "
+            f"{steam_snapshot.volume_limit_text()})"
+        )
+    if snapshot.medians:
+        lines.append(
+            f"• медиана сделок за месяц — у {len(snapshot.medians)} предметов: "
+            "/orders и поддержка ордеров считают цену Steam не выше неё (годится "
+            f"{steam_snapshot.volume_limit_text()})"
         )
     else:
         lines.append(
-            f"⚠️ старше {steam_snapshot.MAX_AGE_HOURS:.0f} ч — для отбора не "
-            "используется. Пришли свежий файл"
+            "• ⚠️ медиан сделок за месяц в файле нет (колонка «медиана_30д_$») — "
+            "без них /orders планов не строит: нижний лот бывает пиком"
+        )
+    if usable:
+        lines.append(
+            f"• цены годятся ещё {steam_snapshot.MAX_AGE_HOURS - snapshot.age_hours():.0f} ч, "
+            "потом цену Steam бот возьмёт из прайс-листа, а объём и медиана "
+            "из файла останутся"
+        )
+    elif snapshot.volumes or snapshot.medians:
+        lines.append(
+            f"• цены в файле старше {steam_snapshot.MAX_AGE_HOURS:.0f} ч — цену Steam "
+            "бот берёт из прайс-листа, объём и медиана из файла работают"
+        )
+    else:
+        lines.append(
+            f"⚠️ старше {steam_snapshot.MAX_AGE_HOURS:.0f} ч, а объёма и медиан в "
+            "файле нет — для отбора не используется. Пришли свежий файл"
         )
     return lines
 
