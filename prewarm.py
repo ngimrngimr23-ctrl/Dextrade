@@ -17,7 +17,10 @@ import asyncio
 import logging
 import time
 
-from pricing import CACHE_TTL_SECONDS, _load_overrides, _fetch_one_price
+from pricing import (
+    CACHE_TTL_SECONDS, _fetch_one_price, _load_overrides, _resolve_market_hash_name,
+    get_csgotrader_prices,
+)
 from sticker_catalog import get_catalog
 from steam_client import steam_cooldown_remaining
 from storage import get_prices_batch, set_price, all_known_keys
@@ -72,10 +75,33 @@ async def _prewarm_once():
         log.info("prewarm: все %d стикер(ов) ещё свежие", len(keys))
         return
 
-    log.info("prewarm: обновляю %d стикер(ов)", len(stale_keys))
-    zeros = 0
     overrides = _load_overrides()
     catalog = await get_catalog()
+
+    # Цены из прайс-листа csgotrader в кэш НЕ переписываем: прайс-лист и так
+    # лежит в памяти и обновляется каждый час, get_sticker_prices берёт цену
+    # прямо из него. Переписывание ~7 200 стикеров раз в 12 часов — по
+    # команде Upstash на каждый — съедало 600 из 720 команд в час, и
+    # 2026-10-31 месячный лимит бесплатного тарифа (500 000) кончился. Греем
+    # только то, чего в прайс-листе нет: за этим придётся идти в Steam.
+    ct_prices = await get_csgotrader_prices()
+    in_pricelist = 0
+    need_steam = []
+    for key in stale_keys:
+        name, is_exact = _resolve_market_hash_name(key, overrides, catalog)
+        if is_exact and ct_prices.get(name) is not None:
+            in_pricelist += 1
+        else:
+            need_steam.append(key)
+    if not need_steam:
+        log.info("prewarm: %d стикер(ов) к обновлению — все есть в прайс-листе, "
+                 "кэш не трогаю", len(stale_keys))
+        return
+    stale_keys = need_steam
+
+    log.info("prewarm: обновляю %d стикер(ов) (ещё %d берутся из прайс-листа)",
+             len(stale_keys), in_pricelist)
+    zeros = 0
 
     async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
         for key in stale_keys:

@@ -1193,13 +1193,11 @@ async def get_sticker_prices(sticker_keys: set[str]) -> dict[str, float]:
     if not ct_prices:
         log.warning("get_sticker_prices: прайс-лист csgotrader.app пуст/недоступен, все ключи уйдут сразу на Steam-фолбэк")
 
-    ct_hits: list[tuple[str, Optional[str], float, int]] = []
     for key in to_fetch:
         name_or_query, is_exact = _resolve_market_hash_name(key, overrides, catalog)
 
         ct_price = ct_prices.get(name_or_query) if is_exact else None
         if ct_price is not None:
-            ct_hits.append((key, name_or_query, ct_price, CACHE_TTL_SECONDS))
             result[key] = ct_price
             _tally("из прайс-листа")
         else:
@@ -1208,8 +1206,9 @@ async def get_sticker_prices(sticker_keys: set[str]) -> dict[str, float]:
             _tally("каталог не сопоставил" if not is_exact else "нет в прайс-листе")
             steam_fallback_needed.append((key, name_or_query, is_exact))
 
-    if ct_hits:
-        await set_prices_batch(ct_hits)
+    # Цены из прайс-листа в Upstash не пишем: прайс-лист в памяти, следующий
+    # прогон возьмёт цену оттуда же, а запись — по две команды на стикер (SET
+    # и SADD) — тратила месячный лимит Upstash впустую (см. prewarm.py).
 
     if steam_fallback_needed:
         # Живой путь (/scan, /scanfile, автоскан вотчлиста) больше НЕ ходит в
