@@ -1176,6 +1176,50 @@ async def save_steam_snapshot(meta: dict, prices: dict[str, list]) -> None:
     )
 
 
+async def has_chat_data() -> bool:
+    """Есть ли в базе данные хоть одного чата: настройки, ордера или вотчлист."""
+    if not REDIS_ENABLED:
+        return False
+    for prefix in (DEFAULTS_KEY_PREFIX, BOT_ORDERS_KEY_PREFIX, WATCHLIST_KEY_PREFIX):
+        if await _redis_cmd("KEYS", prefix + "*"):
+            return True
+    return False
+
+
+async def restore_keys(entries: dict) -> int:
+    """
+    Записать ключи из резервной копии (rdb_restore.parse): {ключ: (тип,
+    значение, срок в мс или None)}. По команде на строку, по две на
+    множество/хэш/список. Истёкшие пропускаются. Возвращает число записанных.
+    """
+    if not REDIS_ENABLED:
+        raise StorageUnavailable("Upstash не подключён — восстанавливать некуда")
+    now_ms = time.time() * 1000
+    written = 0
+    dec = lambda b: b.decode("utf-8")
+    for key, (kind, value, expire_ms) in entries.items():
+        if expire_ms is not None and expire_ms <= now_ms:
+            continue
+        k = dec(key)
+        ttl = ["PX", str(int(expire_ms - now_ms))] if expire_ms is not None else []
+        if kind == "string":
+            await _redis_cmd("SET", k, dec(value), *ttl)
+        else:
+            await _redis_cmd("DEL", k)
+            if kind == "set":
+                await _redis_cmd("SADD", k, *[dec(m) for m in value])
+            elif kind == "hash":
+                await _redis_cmd("HSET", k, *[dec(x) for kv in value.items() for x in kv])
+            elif kind == "list":
+                await _redis_cmd("RPUSH", k, *[dec(x) for x in value])
+            else:
+                continue
+            if ttl:
+                await _redis_cmd("PEXPIRE", k, ttl[1])
+        written += 1
+    return written
+
+
 async def get_steam_snapshot_meta() -> dict | None:
     """Метка снимка: время сбора и число цен. Сбой Upstash — исключение наружу."""
     if REDIS_ENABLED:

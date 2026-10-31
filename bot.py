@@ -186,6 +186,8 @@ import order_desk
 import csfloat_prices
 import steam_history
 import steam_snapshot
+import rdb_restore
+import storage
 import pricing
 import dips
 import price_history
@@ -10233,12 +10235,61 @@ async def _download_document(bot, file_id: str) -> bytes:
     raise AssertionError("unreachable")
 
 
+async def _restore_from_rdb(update, raw: bytes) -> None:
+    """
+    Перенос базы из резервной копии Upstash (.rdb) — см. rdb_restore.
+
+    Пишем только в пустую базу и только копию, где есть данные самого
+    отправителя: бот открыт всем, и иначе любой мог бы прислать свой файл и
+    затереть чужие ордера и настройки.
+    """
+    chat_id = update.effective_chat.id
+    try:
+        data = rdb_restore.restorable(rdb_restore.parse(raw))
+    except rdb_restore.RdbError as e:
+        await update.message.reply_text(f"Похоже на резервную копию Upstash, но разобрать не вышло: {e}")
+        return
+    mine = [f"{p}{chat_id}".encode() for p in (
+        storage.DEFAULTS_KEY_PREFIX, storage.BOT_ORDERS_KEY_PREFIX, storage.WATCHLIST_KEY_PREFIX)]
+    if not any(k in data for k in mine):
+        await update.message.reply_text(
+            "В этой резервной копии нет данных этого чата — восстанавливать её отсюда не буду."
+        )
+        return
+    try:
+        if await storage.has_chat_data():
+            await update.message.reply_text(
+                "База бота уже не пустая — копию поверх живых данных не пишу. "
+                "Восстановление — только в новую, пустую базу."
+            )
+            return
+        written = await storage.restore_keys(data)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Восстановить не вышло: {e}")
+        return
+    orders_raw = data.get(f"{storage.BOT_ORDERS_KEY_PREFIX}{chat_id}".encode())
+    try:
+        orders = len(json.loads(orders_raw[1])) if orders_raw else 0
+    except (ValueError, TypeError):
+        orders = 0
+    log.info("rdb: восстановлено %d ключей из резервной копии (чат %s)", written, chat_id)
+    await update.message.reply_text(
+        f"✅ Восстановил базу из резервной копии: {written} ключей — ордера бота "
+        f"({orders}), настройки, вотчлист, снимок цен Steam.\n\n"
+        "Перезапусти сервис в Render (Manual Deploy → Restart service), чтобы бот "
+        "заново подхватил ордера и расписания."
+    )
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     document = update.message.document
     filename = (document.file_name or "").lower()
     try:
         raw = await _download_document(context.bot, document.file_id)
+        if raw[:5] == b"REDIS":
+            await _restore_from_rdb(update, raw)
+            return
 
         # PDF (частый случай на мобильных: "Печать -> Сохранить как PDF"
         # вместо обычного скачивания файла) — вытаскиваем текст через pdftotext
