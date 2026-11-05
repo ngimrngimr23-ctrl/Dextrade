@@ -9206,6 +9206,7 @@ async def webhook_watch_job(context: ContextTypes.DEFAULT_TYPE):
                     "забирать их некому, поставил вебхук на эту копию",
                     info.pending_update_count,
                 )
+                await _start_chat_jobs(context.application)
             return
         _webhook_orphan_seen = False
         failed_at = info.last_error_date
@@ -9233,6 +9234,7 @@ async def webhook_watch_job(context: ContextTypes.DEFAULT_TYPE):
             scan_errors.scrub(info.last_error_message or "без текста"),
             info.pending_update_count,
         )
+        await _start_chat_jobs(context.application)
     except Exception:  # noqa: BLE001 — проверка вспомогательная, ронять нечего
         log.warning("webhook: проверка вебхука не удалась", exc_info=True)
     finally:
@@ -12301,40 +12303,15 @@ BOT_COMMANDS = [
 ]
 
 
-async def _on_startup(app: Application):
-    await app.bot.set_my_commands(BOT_COMMANDS)
+_chat_jobs_started = False
 
-    # ДО всего остального, что может тронуть Steam (prewarm, автоскан) —
-    # восстанавливаем кулдаун после 429, если рестарт застал его активным.
-    # Без этого бот "забывал" бы про ещё не снятый бан на каждом рестарте
-    # процесса и тут же пробовал снова, продлевая реальный бан.
-    await load_persisted_cooldown()
-    await csfloat_client.load_persisted_cooldown()
-    await price_ruler.load()
-    # Прокси, добавленные через /proxyadd, живут в хранилище — без этого они
-    # пропадали бы при каждом редеплое, а Render передеплоивает часто.
-    try:
-        stored_proxies = await get_extra_proxies()
-    except Exception:
-        log.exception("не смог прочитать сохранённые прокси")
-        stored_proxies = []
-    if stored_proxies:
-        raw = " ".join(stored_proxies)
-        cs_result = csfloat_client.CSFLOAT_POOL.add(raw)
-        steam_result = STEAM_POOL.add(raw)
-        log.info(
-            "прокси: из хранилища добавлено %d в пул CSFloat и %d в пул Steam "
-            "(разобрано %d, дубликатов %d)",
-            cs_result.added, steam_result.added, cs_result.seen, cs_result.duplicates,
-        )
 
-    if csfloat_client.csfloat_enabled():
-        log.info("csfloat: маршрут — %s", csfloat_client.route_description())
-        _warn_if_over_budget()
-        proxy_problem = csfloat_client.http_proxy_problem()
-        if proxy_problem:
-            log.error("csfloat: CSFLOAT_HTTP_PROXY задан неверно — %s", proxy_problem)
-
+async def _start_chat_jobs(app: Application) -> None:
+    """prewarm и джобы чатов (автоскан, арбитраж, /markets, /dips, инвентарь, ордера). Один раз на процесс."""
+    global _chat_jobs_started
+    if _chat_jobs_started:
+        return
+    _chat_jobs_started = True
     asyncio.create_task(prewarm_loop())
 
     # Восстанавливаем джобы автоскана вотчлиста после рестарта/редеплоя —
@@ -12428,6 +12405,53 @@ async def _on_startup(app: Application):
         orders_restored += 1
     if orders_restored:
         log.info("orders: восстановлена поддержка ордеров для %d чат(ов)", orders_restored)
+
+
+async def _on_startup(app: Application):
+    await app.bot.set_my_commands(BOT_COMMANDS)
+
+    # ДО всего остального, что может тронуть Steam (prewarm, автоскан) —
+    # восстанавливаем кулдаун после 429, если рестарт застал его активным.
+    # Без этого бот "забывал" бы про ещё не снятый бан на каждом рестарте
+    # процесса и тут же пробовал снова, продлевая реальный бан.
+    await load_persisted_cooldown()
+    await csfloat_client.load_persisted_cooldown()
+    await price_ruler.load()
+    # Прокси, добавленные через /proxyadd, живут в хранилище — без этого они
+    # пропадали бы при каждом редеплое, а Render передеплоивает часто.
+    try:
+        stored_proxies = await get_extra_proxies()
+    except Exception:
+        log.exception("не смог прочитать сохранённые прокси")
+        stored_proxies = []
+    if stored_proxies:
+        raw = " ".join(stored_proxies)
+        cs_result = csfloat_client.CSFLOAT_POOL.add(raw)
+        steam_result = STEAM_POOL.add(raw)
+        log.info(
+            "прокси: из хранилища добавлено %d в пул CSFloat и %d в пул Steam "
+            "(разобрано %d, дубликатов %d)",
+            cs_result.added, steam_result.added, cs_result.seen, cs_result.duplicates,
+        )
+
+    if csfloat_client.csfloat_enabled():
+        log.info("csfloat: маршрут — %s", csfloat_client.route_description())
+        _warn_if_over_budget()
+        proxy_problem = csfloat_client.http_proxy_problem()
+        if proxy_problem:
+            log.error("csfloat: CSFLOAT_HTTP_PROXY задан неверно — %s", proxy_problem)
+
+    # Запасная копия при живой основной джобы чатов не поднимает: иначе
+    # автоскан, арбитраж и ордера крутились бы в двух копиях разом — двойные
+    # уведомления, двойная нагрузка на Steam и CSFloat. Если основная потом
+    # пропадёт и запасная заберёт вебхук, джобы поднимет webhook_watch_job.
+    if WEBHOOK_BASE_URL and not await _may_take_webhook():
+        log.warning(
+            "запасная копия: автоскан, арбитраж, ордера и prewarm не запускаю — "
+            "этим занимается основная %s", _url_host(WEBHOOK_HOME_URL),
+        )
+    else:
+        await _start_chat_jobs(app)
 
     # Срез цен — одна джоба на процесс, а не по чатам: история общая. Первый
     # запуск скоро после старта, чтобы накопление начиналось сразу; повтор от
@@ -12534,8 +12558,12 @@ def _warn_if_webhook_url_foreign() -> None:
 #
 # Переехали на другой сервис — впишите его адрес в WEBHOOK_HOME_URL (или
 # оставьте переменную пустой, тогда основной считается любая копия).
+#
+# 2026-11-05 основной стала dextrade-7eh4: к dextrade-af2z у владельца нет
+# доступа, а у неё отвалились прокси и выгрузка логов. Выключить af2z нельзя,
+# поэтому она остаётся запасной — без вебхука и без джоб чатов.
 WEBHOOK_HOME_URL = os.environ.get(
-    "WEBHOOK_HOME_URL", "https://dextrade-af2z.onrender.com",
+    "WEBHOOK_HOME_URL", "https://dextrade-7eh4.onrender.com",
 ).strip().rstrip("/")
 # Сколько ждать ответа основной. Живая отвечает за доли секунды, а спящую
 # Render будит до минуты — такую считаем неживой и вебхук берём себе.

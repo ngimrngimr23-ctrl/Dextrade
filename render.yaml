@@ -55,7 +55,7 @@ services:
       - key: TG_WEBHOOK_SECRET
         generateValue: true
       # WEBHOOK_HOME_URL — адрес ОСНОВНОЙ копии бота (по умолчанию
-      # https://dextrade-af2z.onrender.com, см. bot.py). Пока она отвечает,
+      # https://dextrade-7eh4.onrender.com, см. bot.py). Пока она отвечает,
       # другие сервисы с тем же токеном вебхук на себя не ставят. Сюда
       # ключом не вынесено нарочно: пустое значение выключает это правило.
 
