@@ -813,6 +813,13 @@ async def _compute_offers(
                     float_low_min=settings.float_low_min if settings.float_low_min is not None else 0.0,
                     float_high_max=settings.float_high_max if settings.float_high_max is not None else 1.0,
                 )
+                # /setpricefilter — про любой оффер, не только стикерный: без этого
+                # находки по флоату приходили и за $1800 при фильтре до $100.
+                float_offers = [
+                    o for o in float_offers
+                    if (min_price is None or o.price >= min_price)
+                    and (max_price is None or o.price <= max_price)
+                ]
 
         offers = []
         if check_stickers:
