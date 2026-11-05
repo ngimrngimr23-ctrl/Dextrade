@@ -12829,7 +12829,7 @@ async def _run_with_webhook(app, token: str) -> bool:
     if not stand_by:
         log.info(
             "Режим webhook: апдейты принимаются на %s (секрет %s)",
-            url, "задан" if TG_WEBHOOK_SECRET else "НЕ задан — стоит задать TG_WEBHOOK_SECRET",
+            _url_host(url), "задан" if TG_WEBHOOK_SECRET else "НЕ задан — стоит задать TG_WEBHOOK_SECRET",
         )
 
     try:
