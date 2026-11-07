@@ -9494,7 +9494,10 @@ async def myorders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         lines.append("Автоподдержка выключена: /autoorders 30 — включить.")
-    lines.append("Снять: /cancelorders — все ботовые, /cancelorders 2 — один по номеру.")
+    lines.append(
+        "Снять: /cancelorders — все ботовые, /cancelorders 2 — один по номеру, "
+        "/cancelorders все — вообще все, и ручные."
+    )
 
     keyboard = None
     if bot_count:
