@@ -7375,7 +7375,8 @@ async def _order_candidates_from_arb(
     if cooldown > 0:
         raise CSFloatRateLimited(
             f"CSFloat на кулдауне ещё {cooldown / 60:.0f} мин — широкий скан "
-            "пропускаю, кандидаты будут только из просадок"
+            "(лоты, выставленные на CSFloat прямо сейчас) пропускаю; кандидаты "
+            "будут из просадок и из прайс-листов"
         )
 
     # Пул НЕ проверяем: раньше здесь стоял отказ «все прокси недоступны», и он
@@ -8103,7 +8104,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(
             f"⚠️ Широкий скан не уложился в {ORDERS_ARB_TIMEOUT:.0f} с — беру "
-            "кандидатов только из просадок. Чем именно занят, видно в логах."
+            "кандидатов из просадок и прайс-листов. Чем именно занят, видно в логах."
         )
         candidates = []
     except (CSFloatRateLimited, CSFloatError) as e:
