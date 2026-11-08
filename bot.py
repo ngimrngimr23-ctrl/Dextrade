@@ -12473,6 +12473,17 @@ async def _on_startup(app: Application):
         webhook_watch_job, when=WEBHOOK_WATCH_SECONDS, name=WEBHOOK_WATCH_JOB_NAME,
     )
 
+    # Не даём Render усыпить основную копию (см. keepalive_job).
+    if WEBHOOK_BASE_URL and KEEPALIVE_MINUTES > 0 and _is_home_copy():
+        for job in app.job_queue.get_jobs_by_name(KEEPALIVE_JOB_NAME):
+            job.schedule_removal()
+        app.job_queue.run_repeating(
+            keepalive_job, interval=KEEPALIVE_MINUTES * 60, first=60,
+            name=KEEPALIVE_JOB_NAME,
+        )
+        log.info("keepalive: стучусь в свой адрес раз в %d мин, чтобы Render "
+                 "не усыплял сервис", KEEPALIVE_MINUTES)
+
     # Выгрузка лога в репозиторий — только если настроена. Проверяем ЗДЕСЬ, на
     # старте, а не при первой выгрузке: узнать «репозиторий публичный, писать
     # не буду» через полчаса работы хуже, чем сразу. Проверка не должна мешать
@@ -12572,6 +12583,32 @@ WEBHOOK_HOME_URL = os.environ.get(
 # Сколько ждать ответа основной. Живая отвечает за доли секунды, а спящую
 # Render будит до минуты — такую считаем неживой и вебхук берём себе.
 WEBHOOK_HOME_PROBE_SECONDS = 10.0
+
+# Бесплатный Render усыпляет веб-сервис через 15 минут без входящих запросов.
+# 2026-11-07/08 dextrade-xzbp так и жил: поработал 15–30 минут после команды и
+# заснул. Следующая команда будила его — минута тишины, пока Render поднимет
+# контейнер и бот стартует, — а пока он спал, не шли ни сверка ордеров, ни
+# автоскан. Раньше от сна спасал внешний пингер (UptimeRobot), на новом
+# аккаунте его нет. Запрос к собственному публичному адресу проходит через
+# балансировщик Render и считается входящим, так что основная копия будит себя
+# сама. 0 — выключить (если пингер настроен снаружи или тариф платный).
+# Помнить: бесплатных часов у Render 750 в месяц на аккаунт — круглосуточно
+# хватает ровно на один сервис.
+KEEPALIVE_MINUTES = envcfg.env_int("KEEPALIVE_MINUTES", 10)
+KEEPALIVE_JOB_NAME = "keepalive"
+
+
+async def keepalive_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """GET на свой публичный адрес — для Render это входящий запрос."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{WEBHOOK_BASE_URL}/", timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    log.warning("keepalive: свой адрес ответил HTTP %s", resp.status)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        log.warning("keepalive: свой адрес не ответил: %s", e)
 
 
 def _url_host(url: str) -> str:
