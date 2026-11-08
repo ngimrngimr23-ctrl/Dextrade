@@ -41,6 +41,7 @@ Telegram.
 import asyncio
 import datetime as dt
 from collections import Counter
+import functools
 import hashlib
 import html as html_module
 import io
@@ -75,6 +76,8 @@ from telegram.ext import (
 
 from steam_client import (
     MANUAL_REQUEST_INTERVAL,
+    reset_steam_priority,
+    set_steam_priority,
     MIN_REQUEST_INTERVAL,
     fetch_all_listings,
     market_hash_name_from_url,
@@ -105,7 +108,6 @@ from pricing import (
     clear_manual_prices,
     manual_prices_count,
     get_csgotrader_price_details,
-    get_csgotrader_prices,
     get_steam_market_price_retrying,
     STEAM_POOL,
 )
@@ -418,6 +420,9 @@ MARKETS_VERIFY_LIMIT = envcfg.env_int("MARKETS_VERIFY_LIMIT", 25)
 # переносит спокойно. Остальное берётся из кэша, а он наполняется постепенно:
 # кандидаты от прогона к прогону в основном одни и те же.
 STEAM_LIVE_BUDGET = envcfg.env_int("STEAM_LIVE_BUDGET", 8)
+# Сколько не перезапрашивать цену, у которой нет объёма продаж, если её
+# только что спросили: объёма Steam не дал, и повтор вернёт то же самое.
+STEAM_VOLUME_RETRY_SECONDS = envcfg.env_int("STEAM_VOLUME_RETRY_SECONDS", 30 * 60)
 
 # Минимум продаж в Steam за сутки, чтобы находка считалась реализуемой.
 # Без этого «выгода» бумажная: предмет, который не продаётся, не перепродать
@@ -2466,6 +2471,24 @@ async def _run_watchlist_scan(
     bundle: dict | None = None,
 ) -> WatchlistScanReport | None:
     """
+    Скан вотчлиста — без приоритета к Steam, даже из команды (/scanall, /scan):
+    он идёт десятки минут и не должен держать в очереди команды, ответа на
+    которые человек ждёт сейчас (см. steam_client._LaneGate).
+    """
+    token = set_steam_priority(False)
+    try:
+        return await _run_watchlist_scan_body(
+            bot, chat_id, request_interval, mode=mode, bundle=bundle,
+        )
+    finally:
+        reset_steam_priority(token)
+
+
+async def _run_watchlist_scan_body(
+    bot, chat_id: int, request_interval: float | None = None, *, mode: str = SCAN_CYCLE,
+    bundle: dict | None = None,
+) -> WatchlistScanReport | None:
+    """
     Прогоняет весь вотчлист чата разом — общая логика для джобы по расписанию
     и команды /scanall. Возвращает WatchlistScanReport, либо None, если прогон
     не запустился вообще (пустой список / уже идёт другой прогон) — в этом
@@ -4320,7 +4343,6 @@ async def floatcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     так что категория зафиксирована и сравниваются сопоставимые вещи).
     Сравниваем медианные цены двух групп.
     """
-    chat_id = update.effective_chat.id
     if not context.args:
         await update.message.reply_text(
             "Проверить, платят ли за низкий флоат на конкретном скине.\n\n"
@@ -4947,7 +4969,6 @@ async def proxycheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif detailed:
             lines.append(f"  {proxy_pool.mask(proxy)} → ⚠️ {html_module.escape(error or 'нет ответа')}")
 
-    working = len(ips)
     failed = len(results) - sum(1 for _, first, _, _ in results if first)
     on_cooldown = sum(1 for p in pool.proxies if pool.cooldown_remaining(p) > 0)
 
@@ -5903,6 +5924,14 @@ async def _live_prices_for(
         age = now - entry.get("updated_at", 0)
         if max_age is not None and age > max_age:
             stale += 1
+            continue
+        if (need_volume and entry.get("volume") is None
+                and age < STEAM_VOLUME_RETRY_SECONDS):
+            # Спрашивали только что, а объёма Steam так и не дал (цена пришла
+            # из /render/, там его нет). Повтор принёс бы то же самое: Sticker
+            # Slab | WARNING (Foil) 2026-11-07 перезапрашивался на каждом
+            # /orders, дважды за минуту, отнимая очередь Steam у остальных.
+            out[name] = LiveQuote(entry["price"], entry.get("median"), None, age, None)
             continue
         if need_volume and entry.get("volume") is None:
             # Откладываем, но НЕ выбрасываем: если спросить заново не выйдет
@@ -12928,6 +12957,25 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("не удалось отправить сообщение об ошибке в chat_id=%s", chat_id)
 
 
+def _steam_first(handler):
+    """
+    Обработчик команды или кнопки: его запросы к Steam идут вне очереди.
+
+    Человек ждёт ответа, а фоновые прогоны и /scanall — нет: без этого на
+    единственной полосе (без прокси) команда стояла за всеми воркерами скана.
+    Сами сканы вотчлиста приоритет снимают (_run_watchlist_scan), даже когда
+    их запустили командой.
+    """
+    @functools.wraps(handler)
+    async def wrapped(update, context):
+        token = set_steam_priority(True)
+        try:
+            return await handler(update, context)
+        finally:
+            reset_steam_priority(token)
+    return wrapped
+
+
 def _build_application(token: str):
     """
     Собрать Application со всеми обработчиками. Отдельной функцией, потому что
@@ -12960,12 +13008,16 @@ def _build_application(token: str):
     # Из одного реестра — и обработчики, и меню Telegram, и /help. Раньше это
     # были три списка, и справочник от них отставал на треть команд.
     for cmd in COMMANDS:
-        app.add_handler(CommandHandler(cmd.name, cmd.handler))
+        app.add_handler(CommandHandler(cmd.name, _steam_first(cmd.handler)))
     # Кнопки ордеров — раньше общего разбора меню: тот ловит любые нажатия.
-    app.add_handler(CallbackQueryHandler(orders_callback, pattern=rf"^{ORDER_CB}\|"))
-    app.add_handler(CallbackQueryHandler(menu_callback))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_selection))
+    app.add_handler(CallbackQueryHandler(
+        _steam_first(orders_callback), pattern=rf"^{ORDER_CB}\|",
+    ))
+    app.add_handler(CallbackQueryHandler(_steam_first(menu_callback)))
+    app.add_handler(MessageHandler(filters.Document.ALL, _steam_first(handle_document)))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, _steam_first(handle_text_selection),
+    ))
     app.add_error_handler(on_error)
     return app
 

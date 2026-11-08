@@ -22,7 +22,6 @@
 только цена самого стикера.
 """
 
-import asyncio
 import json
 import logging
 import envcfg
@@ -34,7 +33,7 @@ from typing import NamedTuple, Optional
 
 import aiohttp
 
-from proxy_pool import ProxyPool, mask as mask_proxy
+from proxy_pool import mask as mask_proxy
 from sticker_catalog import get_catalog
 from storage import get_prices_batch, set_prices_batch
 from steam_client import (

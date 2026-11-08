@@ -41,6 +41,8 @@ Cookie на steamcommunity.com (код воркера не в этом репо�
 """
 
 import asyncio
+import contextvars
+import heapq
 import logging
 import envcfg
 import os
@@ -544,7 +546,70 @@ def raise_if_cooling_down(scope: str = "listings") -> None:
         )
 
 
-_lane_locks: dict[str, asyncio.Lock] = {}
+class _LaneGate:
+    """
+    Замок полосы с приоритетом: ждущие с приоритетом проходят раньше
+    остальных, внутри одного приоритета — по очереди прихода.
+
+    Зачем. Обычный asyncio.Lock — строгая очередь. Без прокси полоса одна, и
+    /scanall (сотни предметов, ~40 минут) держал в ней своих воркеров: любая
+    команда, которой нужен Steam, вставала за ними в хвост. Теперь запрос
+    команды, которую человек запустил и ждёт, идёт следующим. Паузу между
+    запросами это не сокращает: Steam видит те же 4 секунды, меняется только
+    порядок.
+    """
+
+    def __init__(self) -> None:
+        self._busy = False
+        self._waiters: list = []  # куча (приоритет, номер, future)
+        self._seq = 0
+
+    def locked(self) -> bool:
+        return self._busy
+
+    async def acquire(self, rank: int) -> None:
+        if not self._busy and not self._waiters:
+            self._busy = True
+            return
+        fut = asyncio.get_running_loop().create_future()
+        self._seq += 1
+        heapq.heappush(self._waiters, (rank, self._seq, fut))
+        try:
+            await fut
+        except asyncio.CancelledError:
+            # Отменили уже после того, как замок нам передали, — отдаём дальше.
+            # Отменённый до передачи future release() пропустит сам.
+            if fut.done() and not fut.cancelled():
+                self.release()
+            raise
+
+    def release(self) -> None:
+        while self._waiters:
+            _, _, fut = heapq.heappop(self._waiters)
+            if not fut.done():
+                fut.set_result(None)  # замок переходит к нему, _busy остаётся
+                return
+        self._busy = False
+
+
+# Приоритет запросов текущей задачи: True — команда, которую человек ждёт.
+# Задаётся обёрткой обработчиков в bot.py; фоновые джобы и /scanall идут без
+# него. Каждый апдейт Telegram — своя задача, так что значение не протекает.
+_steam_priority: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "steam_priority", default=False,
+)
+
+
+def set_steam_priority(enabled: bool) -> contextvars.Token:
+    """Включить/выключить приоритет для текущей задачи (и создаваемых из неё)."""
+    return _steam_priority.set(enabled)
+
+
+def reset_steam_priority(token: contextvars.Token) -> None:
+    _steam_priority.reset(token)
+
+
+_lane_locks: dict[str, _LaneGate] = {}
 _lane_last: dict[str, float] = {}
 
 # Сколько секунд суммарно простояли в паузе троттлинга с прошлого замера.
@@ -611,7 +676,7 @@ async def throttle_steam_request(
     global _last_request_at, _throttle_wait_seconds, _lock_wait_seconds
     lock = _lane_locks.get(lane)
     if lock is None:
-        lock = _lane_locks[lane] = asyncio.Lock()
+        lock = _lane_locks[lane] = _LaneGate()
 
     # Ожидание САМОГО лока меряем отдельно от паузы. Разница принципиальная:
     # пауза — это наше расписание, а очередь на локе — это «полос меньше, чем
@@ -619,7 +684,8 @@ async def throttle_steam_request(
     # отчёт показывал 11.8 секунды сетевой задержки там, где большую часть
     # составляло стояние за другими воркерами на одной полосе.
     waiting_since = time.monotonic()
-    async with lock:
+    await lock.acquire(0 if _steam_priority.get() else 1)
+    try:
         _lock_wait_seconds += time.monotonic() - waiting_since
         gap = MIN_REQUEST_INTERVAL if interval is None else interval
         wait = gap - (time.monotonic() - _lane_last.get(lane, 0.0))
@@ -632,6 +698,8 @@ async def throttle_steam_request(
         if not lane:
             _last_request_at = now
         _record_steam_request(scope)
+    finally:
+        lock.release()
 
 
 def steam_cookie_header() -> str:
