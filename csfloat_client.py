@@ -2145,7 +2145,9 @@ async def account_balance(session: aiohttp.ClientSession) -> int | None:
     """
     try:
         status, data = await _authed(session, "GET", "/me")
-    except CSFloatError as e:
+    except (CSFloatError, CSFloatRateLimited) as e:
+        # CSFloatRateLimited — не наследник CSFloatError: без него квотный
+        # 429 на этом запросе ронял постановку ордеров без ответа в чат.
         log.info("csfloat: баланс не узнали — %s", scrub(str(e)))
         return None
     if status != 200 or not isinstance(data, dict):

@@ -96,6 +96,12 @@ COOLDOWN_AFTER_429_SECONDS = 30 * 60  # получили 429 -> не трога�
 # десяток отказов за секунды — это один залп, а не десять провинностей.
 ESCALATION_DEBOUNCE_SECONDS = envcfg.env_float("ESCALATION_DEBOUNCE_SECONDS", 120)
 COOLDOWN_MAX_SECONDS = 6 * 60 * 60  # потолок при повторных 429 подряд (бан может быть длинным)
+# Сколько спокойных часов после конца кулдауна забывают прошлые 429. Счётчик
+# сбрасывается успешным ответом, но в редкую область (pricing) успешных может
+# не быть сутками: 2026-11-08 первый за сутки 429 посчитался «5-м подряд» по
+# счётчику, оставшемуся с прошлых дней, и получил шесть часов вместо тридцати
+# минут.
+ESCALATION_FORGET_SECONDS = envcfg.env_float("ESCALATION_FORGET_SECONDS", 6 * 60 * 60)
 
 STEAM_PROXY_URL = os.environ.get("STEAM_PROXY_URL", "").rstrip("/")
 
@@ -430,6 +436,14 @@ async def note_steam_429(
     # человек ждал часами, а пауза росла быстрее, чем он ждал.
     since_last = time.time() - state["last_429_at"]
     burst = state["last_429_at"] > 0 and since_last < ESCALATION_DEBOUNCE_SECONDS
+    quiet = time.time() - state["cooldown_until"]
+    if (not burst and state["cooldown_until"] > 0
+            and quiet > ESCALATION_FORGET_SECONDS and state["consecutive_429"]):
+        log.info(
+            "Steam (%s): с конца прошлого кулдауна %.0f ч без 429 — счётчик %s "
+            "подряд обнуляю", scope, quiet / 3600, state["consecutive_429"],
+        )
+        state["consecutive_429"] = 0
     if not burst and escalate:
         state["consecutive_429"] += 1
     # max(1, ...) обязателен. Счётчик бывает нулевым — после ручного /reset или
