@@ -902,6 +902,8 @@ async def fetch_all_listings(
     # значит скрыть первопричину. Именно на этом человек и споткнулся: бот
     # писал «Steam тут ни при чём» через четыре секунды после его 429.
     steam_refused = steam_cooldown_remaining("listings") > 0
+    # Поставили ли уже паузу прямому адресу в этом вызове (см. ветку 429).
+    direct_noted = False
     start = 0
     total_count = None
     while total_count is None or start < total_count:
@@ -1096,6 +1098,12 @@ async def fetch_all_listings(
                 steam_refused = True
                 if route:
                     STEAM_POOL.mark_exhausted(route, LISTINGS_PROXY_COOLDOWN, "Steam 429")
+                elif not direct_noted:
+                    # Прямой адрес забанен — ставим ему паузу сразу, даже если
+                    # уходим на прокси. Без неё следующий предмет снова
+                    # начинал с прямого, ловил 429 и продлевал бан.
+                    direct_noted = True
+                    await note_steam_429(scope="listings", headers=dict(resp.headers))
                 next_route = STEAM_POOL.next() if attempts_left > 0 else None
                 if next_route:
                     attempts_left -= 1
@@ -1141,15 +1149,22 @@ async def fetch_all_listings(
                         f"пойдёт как обычно."
                     )
 
-                seconds = await note_steam_429(scope="listings", headers=dict(resp.headers))
+                if direct_noted:
+                    seconds = steam_cooldown_remaining("listings")
+                else:
+                    seconds = await note_steam_429(scope="listings", headers=dict(resp.headers))
                 raise SteamRateLimited(
                     f"Steam ответил 429 (Too Many Requests) — это временный бан IP, "
                     f"который продлевается от новых попыток, поэтому не ретраю. "
                     f"Свободных прокси нет ({STEAM_POOL.describe()}). "
                     f"Запросы к Steam приостановлены на {seconds / 60:.0f} мин."
                 )
-            await note_steam_ok()
-            STEAM_POOL.mark_ok(route)
+            if resp.status < 400:
+                # Счётчик 429 — про ПРЯМОЙ адрес: успех через прокси о нём
+                # ничего не говорит, а ошибка сервера — тем более не успех.
+                if route is None:
+                    await note_steam_ok()
+                STEAM_POOL.mark_ok(route)
             resp.raise_for_status()
 
             content_type = resp.headers.get("Content-Type", "")

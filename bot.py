@@ -54,7 +54,6 @@ import os
 import re
 import secrets
 import statistics
-import subprocess
 import tempfile
 import threading
 import time
@@ -422,6 +421,8 @@ MARKETS_VERIFY_LIMIT = envcfg.env_int("MARKETS_VERIFY_LIMIT", 25)
 STEAM_LIVE_BUDGET = envcfg.env_int("STEAM_LIVE_BUDGET", 8)
 # Сколько не перезапрашивать цену, у которой нет объёма продаж, если её
 # только что спросили: объёма Steam не дал, и повтор вернёт то же самое.
+# Сколько ждать pdftotext на присланном PDF, прежде чем сдаться.
+PDFTOTEXT_TIMEOUT = envcfg.env_float("PDFTOTEXT_TIMEOUT", 60.0)
 STEAM_VOLUME_RETRY_SECONDS = envcfg.env_int("STEAM_VOLUME_RETRY_SECONDS", 30 * 60)
 
 # Минимум продаж в Steam за сутки, чтобы находка считалась реализуемой.
@@ -10346,16 +10347,26 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # и склеиваем строки, разорванные печатным макетом, перед парсингом JSON.
         is_pdf = raw[:4] == b"%PDF" or filename.endswith(".pdf")
         if is_pdf:
+            # Асинхронно и с таймаутом: subprocess.run держал весь бот, пока
+            # pdftotext работал, а на кривом файле мог не вернуться вовсе.
             with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp_pdf:
                 tmp_pdf.write(raw)
                 tmp_pdf.flush()
-                proc = subprocess.run(
-                    ["pdftotext", "-raw", tmp_pdf.name, "-"],
-                    capture_output=True,
+                proc = await asyncio.create_subprocess_exec(
+                    "pdftotext", "-raw", tmp_pdf.name, "-",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
+                try:
+                    out, err = await asyncio.wait_for(proc.communicate(), timeout=PDFTOTEXT_TIMEOUT)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    raise ValueError(
+                        f"PDF не разобрался за {PDFTOTEXT_TIMEOUT:.0f} с — пришли файл JSON"
+                    ) from None
             if proc.returncode != 0:
-                raise ValueError(f"не удалось извлечь текст из PDF: {proc.stderr.decode(errors='replace')}")
-            text = proc.stdout.decode("utf-8", errors="replace")
+                raise ValueError(f"не удалось извлечь текст из PDF: {err.decode(errors='replace')}")
+            text = out.decode("utf-8", errors="replace")
             # pdftotext переносит длинные строки — склеиваем всё в одну строку,
             # JSON без переносов внутри строковых значений парсится нормально
             text = "".join(line.strip() for line in text.splitlines())

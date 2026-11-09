@@ -18,6 +18,7 @@ GiftSatteliteAdapter (Upstash + локальный fallback).
 редеплой).
 """
 
+import copy
 import json
 import os
 import secrets
@@ -303,6 +304,9 @@ def _local_defaults_save(data: dict) -> None:
 # _degraded_watchlists). /orders пишет сюда метку обхода каталога на каждом
 # прогоне, так что одного сбоя чтения хватило бы, чтобы обнулить всё.
 _degraded_settings: set[int] = set()
+# Последний блок настроек чата, удачно прочитанный из Upstash или записанный
+# в него. Выручает при кратком сбое Upstash (см. _get_chat_settings).
+_settings_memo: dict[int, dict] = {}
 
 
 async def _get_chat_settings(chat_id: int) -> dict:
@@ -315,13 +319,25 @@ async def _get_chat_settings(chat_id: int) -> dict:
         try:
             raw = await _redis_cmd("GET", DEFAULTS_KEY_PREFIX + str(chat_id))
             _degraded_settings.discard(chat_id)
-            return json.loads(raw) if raw else {}
+            settings = json.loads(raw) if raw else {}
+            _settings_memo[chat_id] = copy.deepcopy(settings)
+            return settings
         except Exception:
+            _degraded_settings.add(chat_id)
+            memo = _settings_memo.get(chat_id)
+            if memo is not None:
+                # Последний удачно прочитанный блок — а не локальный файл,
+                # который на Render пуст. С пустыми настройками автосканы
+                # читали «интервал не задан» и больше не перепланировались.
+                log.warning(
+                    "настройки чата %s: Upstash не ответил — беру последние "
+                    "прочитанные из памяти, запись заблокирована", chat_id, exc_info=True,
+                )
+                return copy.deepcopy(memo)
             log.warning(
                 "настройки чата %s: Upstash не ответил — читаю локальную копию, "
                 "запись поверх неё заблокирована", chat_id, exc_info=True,
             )
-            _degraded_settings.add(chat_id)
 
     return _local_defaults_load().get(str(chat_id), {})
 
@@ -356,6 +372,7 @@ async def _save_chat_settings(chat_id: int, settings: dict) -> None:
         try:
             # без TTL — это осознанная настройка пользователя, не кэш
             await _redis_cmd("SET", DEFAULTS_KEY_PREFIX + str(chat_id), value)
+            _settings_memo[chat_id] = copy.deepcopy(settings)
             return
         except Exception:
             pass

@@ -739,9 +739,10 @@ async def _get_with_retry(session: aiohttp.ClientSession, url: str, params: dict
                     STEAM_POOL.mark_exhausted(proxy, STEAM_PROXY_COOLDOWN_SECONDS, "Steam ответил 429")
                 continue
 
-            await note_steam_ok(scope="pricing")
-            STEAM_POOL.mark_ok(proxy)  # прошло — забываем прошлые отказы адреса
-            if resp.status != 200:
+            if resp.status == 200:
+                await note_steam_ok(scope="pricing")
+                STEAM_POOL.mark_ok(proxy)  # прошло — забываем прошлые отказы адреса
+            else:
                 log.warning(
                     "%s: HTTP %s для запроса %r",
                     label, resp.status, params.get("query") or params.get("market_hash_name"),
