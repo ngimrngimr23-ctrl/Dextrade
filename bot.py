@@ -7489,6 +7489,7 @@ async def _order_candidates_from_arb(
         avg = sp.windows.get("last_30d") if sp else None
         return int(round(avg * 100)) if avg else None
 
+    offers = [o for o in offers if not buy_orders.is_case_or_key(o.market_hash_name)]
     return [
         _OrderCandidate(
             market_hash_name=o.market_hash_name,
@@ -7542,7 +7543,8 @@ async def _order_candidates_from_dips(
         max_price=saved.get("max_price"),
     )
     # До живых цен: на предмет с ордером запрос к Steam тратить незачем.
-    found = [d for d in found if d.market_hash_name not in skip]
+    found = [d for d in found if d.market_hash_name not in skip
+             and not buy_orders.is_case_or_key(d.market_hash_name)]
     if not found:
         return []
 
@@ -7691,6 +7693,8 @@ async def _order_candidates_from_catalog(
         if name in skip:
             skipped_ordered += 1
             continue
+        if buy_orders.is_case_or_key(name):
+            continue
         # Стабильность за месяц, а не сутки против недели: ордер исполнится
         # через часы, а продать предмет в Steam можно будет лишь через неделю
         # защиты трейда (см. pricing.SteamPrice.month_spread_pct).
@@ -7830,6 +7834,8 @@ async def _order_candidates_from_csfloat(
             continue
         if name in skip:
             skipped["ordered"] += 1
+            continue
+        if buy_orders.is_case_or_key(name):
             continue
         spread = sp.month_spread_pct
         if spread is None or spread > max_spread:
@@ -8187,6 +8193,8 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     best: dict[str, _OrderCandidate] = {}
     for cand in candidates:
         if cand.market_hash_name in ordered:
+            continue
+        if buy_orders.is_case_or_key(cand.market_hash_name):
             continue
         seen = best.get(cand.market_hash_name)
         if seen is None or cand.steam_price_cents > seen.steam_price_cents:

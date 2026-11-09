@@ -939,6 +939,9 @@ async def place(
     chat_id: int, tickets: list[Ticket], *, budget_cents: int, max_count: int,
 ) -> PlaceOutcome:
     """Поставить ордера (см. _place) под замком всех копий бота."""
+    # Страховка для кнопок, нажатых под старыми предложениями: кейсы и ключи
+    # под ордера не ставим (см. buy_orders.is_case_or_key).
+    tickets = [t for t in tickets if not buy_orders.is_case_or_key(t.market_hash_name)]
     try:
         return await _place(chat_id, tickets, budget_cents=budget_cents, max_count=max_count)
     except _NoLock as e:

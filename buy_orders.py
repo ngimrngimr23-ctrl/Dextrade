@@ -250,6 +250,21 @@ HISTORY_GAP = (
     "стабильность цены не проверить"
 )
 
+CASE_OR_KEY = "кейсы и ключи от кейсов под ордера не берём"
+
+
+def is_case_or_key(market_hash_name: str) -> bool:
+    """
+    Кейс («Kilowatt Case», «Operation Breakout Weapon Case») или ключ к нему
+    («Operation Hydra Case Key», «eSports Key»). У скинов, наклеек и прочего в
+    названии есть «|», у кейсов и ключей — нет, по этому их и отличаем, не
+    задевая, например, «Sticker | ... Case»-подобные имена.
+    """
+    name = market_hash_name.strip()
+    if "|" in name:
+        return False
+    return name.endswith((" Case", " Key"))
+
 
 def plan(
     market_hash_name: str,
@@ -306,6 +321,8 @@ def plan(
     вызывающий (её же видно в отчёте); здесь только require_month_median=True:
     без медианы не знаем, не пик ли нижний лот, и отказываем.
     """
+    if is_case_or_key(market_hash_name):
+        return None, CASE_OR_KEY
     if steam_price_cents <= 0:
         return None, "нет цены Steam — сравнивать не с чем"
 
