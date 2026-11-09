@@ -7217,6 +7217,26 @@ def _medians_required(snapshot, now: float | None = None) -> bool:
     return any(snapshot.month_median(n, now) for n in snapshot.medians or ())
 
 
+def _volumes_required(snapshot, limits: dict) -> bool:
+    """
+    Отсеивать ли на отборе тех, у кого объёма продаж нет в снимке.
+
+    Объём живьём дают только priceoverview, страница предмета и ручка истории.
+    Когда все три на паузе после 429, финалист без объёма в файле гарантированно
+    получит «объём продаж неизвестен». 2026-11-09 так ушло 19 мест из 30: в
+    файле объём есть у 16 тыс. предметов, а прайс-лист CSFloat — на 29 тыс.,
+    и места в финале занимали те, кого в файле нет, пока 250 выгодных с
+    объёмом в файле в финал не попали. Хоть одна ручка открыта — не отсеиваем.
+    """
+    if not limits.get("volume") or snapshot is None or not snapshot.volumes:
+        return False
+    if steam_cooldown_remaining(scope="pricing") <= 0:
+        return False
+    if steam_cooldown_remaining(scope=steam_history.active_scope()) <= 0:
+        return False
+    return not steam_history.history_api_open()
+
+
 def _with_month_median(c: _OrderCandidate, page, snapshot,
                        pricelist: dict | None = None) -> _OrderCandidate:
     """
@@ -7529,7 +7549,7 @@ async def _order_candidates_from_arb(
 
 
 async def _order_candidates_from_dips(
-    chat_id: int, *, skip: set[str] = frozenset(),
+    chat_id: int, *, skip: set[str] = frozenset(), limits: dict | None = None,
 ) -> list[_OrderCandidate]:
     """
     Кандидаты из /dips — предметы, просевшие ниже своей нормы.
@@ -7557,6 +7577,15 @@ async def _order_candidates_from_dips(
     # До живых цен: на предмет с ордером запрос к Steam тратить незачем.
     found = [d for d in found if d.market_hash_name not in skip
              and not buy_orders.is_case_or_key(d.market_hash_name)]
+    # Steam объём не отдаёт — без объёма в снимке просадка всё равно получит
+    # отказ, а живой запрос цены на неё потрачен (см. _volumes_required).
+    snapshot, _ = await steam_snapshot.current()
+    if limits is not None and _volumes_required(snapshot, limits):
+        before = len(found)
+        found = [d for d in found if snapshot.volume(d.market_hash_name) is not None]
+        if before != len(found):
+            log.info("orders: просадки — %d из %d без объёма в снимке при закрытом "
+                     "Steam, не беру", before - len(found), before)
     if not found:
         return []
 
@@ -7686,10 +7715,11 @@ async def _order_candidates_from_catalog(
     # место ему не отдаём.
     now = time.time()
     with_medians = _medians_required(snapshot, now)
+    with_volumes = _volumes_required(snapshot, limits)
 
     band: list[tuple[str, float, float | None, float | None, float]] = []
     skipped_quiet = skipped_jumpy = skipped_young = skipped_mismatch = skipped_ordered = 0
-    skipped_no_median = 0
+    skipped_no_median = skipped_no_volume = 0
     from_snapshot = 0
     for name, sp in details.items():
         # Наличие суточного окна само по себе значит, что сделки сегодня были.
@@ -7729,6 +7759,9 @@ async def _order_candidates_from_catalog(
         if median is None and with_medians:
             skipped_no_median += 1
             continue
+        if with_volumes and snapshot.volume(name, now) is None:
+            skipped_no_volume += 1
+            continue
         from_snapshot += 1 if now_cents else 0
         # Цена для оценки — не выше медианы сделок за месяц (см.
         # _with_month_median); полосу и порядок обхода она не меняет.
@@ -7762,10 +7795,12 @@ async def _order_candidates_from_catalog(
         "orders: каталог — в полосе $%g-$%g подходят %d предмет(ов) "
         "(пропущено: %d без сделок за сутки, %d без истории за месяц, "
         "%d с ценой, гуляющей за месяц больше %g%%, %d с историей, не сходящейся с "
-        "ценой, %d с уже стоящим ордером, %d без медианы за месяц в снимке). Цена "
+        "ценой, %d с уже стоящим ордером, %d без медианы за месяц в снимке, %d без "
+        "объёма в снимке при закрытом Steam). Цена "
         "из снимка Steam у %d. Беру %d начиная с %d",
         low, high, len(band), skipped_quiet, skipped_young, skipped_jumpy,
-        max_spread, skipped_mismatch, skipped_ordered, skipped_no_median, from_snapshot,
+        max_spread, skipped_mismatch, skipped_ordered, skipped_no_median,
+        skipped_no_volume, from_snapshot,
         len(window), cursor,
     )
 
@@ -7828,10 +7863,11 @@ async def _order_candidates_from_csfloat(
     # — место в финале ему не отдаём. Ручка открыта — медиану финалисту даст
     # она; снимок без медиан (старый файл) тоже никого не отсеивает.
     with_medians = _medians_required(snapshot, now)
+    with_volumes = _volumes_required(snapshot, limits)
 
     picked = []
     skipped = dict(quiet=0, jumpy=0, mismatch=0, costly=0, far=0, recent=0, thin=0,
-                   ordered=0, no_median=0)
+                   ordered=0, no_median=0, no_volume=0)
     for name, cf in price_list.prices.items():
         sp = details.get(name)
         if sp is None or (cf.top_cents is None and cf.low_cents is None):
@@ -7892,6 +7928,9 @@ async def _order_candidates_from_csfloat(
         if known is not None and known[0] * 7 < limits["volume"]:
             skipped["thin"] += 1
             continue
+        if known is None and with_volumes:
+            skipped["no_volume"] += 1
+            continue
         gain = order * buy_orders.profit_pct_at(order, steam_cents) / 100
         picked.append((gain, name, steam_cents, spread, month_avg, cf, known))
 
@@ -7903,11 +7942,12 @@ async def _order_candidates_from_csfloat(
         "месяца, %d с историей не по цене, %d где верхний ордер выше потолка, "
         "%d где заявка ниже витрины в разы, %d отказанных за последние %d ч, "
         "%d с малыми продажами по снимку, %d с уже стоящим ордером, %d без медианы "
-        "за месяц в снимке). Цена Steam из снимка: %s. Беру %d, объём из снимка у %d",
+        "за месяц в снимке, %d без объёма в снимке при закрытом Steam). Цена Steam "
+        "из снимка: %s. Беру %d, объём из снимка у %d",
         price_list.describe(), len(picked), low, high, skipped["quiet"],
         skipped["jumpy"], skipped["mismatch"], skipped["costly"], skipped["far"],
         skipped["recent"], ORDERS_REFUSED_PAUSE_SECONDS // 3600, skipped["thin"],
-        skipped["ordered"], skipped["no_median"],
+        skipped["ordered"], skipped["no_median"], skipped["no_volume"],
         ("да, не выше медианы за месяц" if snapshot.medians else "да, медиан в нём нет")
         if snapshot and snapshot.prices else "нет, средние прайс-листа", len(batch),
         sum(1 for row in batch if row[6] is not None),
@@ -8159,7 +8199,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ {scan_errors.scrub(str(e))}")
         candidates = []
     try:
-        dips_found = await _order_candidates_from_dips(chat_id, skip=ordered)
+        dips_found = await _order_candidates_from_dips(chat_id, skip=ordered, limits=limits)
         from_dips = len(dips_found)
         candidates += dips_found
     except Exception as e:
