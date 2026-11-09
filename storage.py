@@ -1265,7 +1265,12 @@ async def get_steam_snapshot() -> tuple[dict, dict[str, list]] | None:
     return data["meta"], data.get("prices", {})
 
 
-async def all_chat_ids_with_settings() -> list[int]:
+def settings_degraded(chat_id: int) -> bool:
+    """Последнее чтение настроек чата сорвалось и отдало запасную копию."""
+    return REDIS_ENABLED and chat_id in _degraded_settings
+
+
+async def all_chat_ids_with_settings(*, strict: bool = False) -> list[int]:
     """
     Чаты, у которых вообще есть сохранённые настройки — нужно, чтобы понять,
     кому слать арбитраж (он не привязан к вотчлисту: сканируется весь рынок).
@@ -1282,7 +1287,10 @@ async def all_chat_ids_with_settings() -> list[int]:
                     continue
             return out
         except Exception:
-            pass
+            # strict — для восстановления джоб на старте: пустой локальный файл
+            # там неотличим от «чатов нет», и все автоджобы молча пропадали бы.
+            if strict:
+                raise
     return [int(x) for x in _local_defaults_load().keys() if str(x).lstrip("-").isdigit()]
 
 
@@ -1490,14 +1498,15 @@ async def set_watch_paused(chat_id: int, paused: bool) -> None:
     await _save_watchlist_entry(chat_id, paused=paused)
 
 
-async def all_watchlist_chat_ids() -> list[int]:
+async def all_watchlist_chat_ids(*, strict: bool = False) -> list[int]:
     """Все chat_id, у которых когда-либо был непустой вотчлист — для восстановления джобов после рестарта бота."""
     if REDIS_ENABLED:
         try:
             result = await _redis_cmd("SMEMBERS", WATCHLIST_CHATS_INDEX_KEY)
             return [int(x) for x in (result or [])]
         except Exception:
-            pass
+            if strict:
+                raise
     return [int(x) for x in _local_watchlist_load().keys()]
 
 

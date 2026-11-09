@@ -179,6 +179,7 @@ from storage import (
     get_arb_settings,
     set_arb_setting,
     all_chat_ids_with_settings,
+    settings_degraded,
 )
 import csfloat_client
 import market_prices
@@ -2644,6 +2645,16 @@ async def _run_watchlist_scan_body(
                     if not rate_limit_hit:
                         rate_limit_hit.append((market_hash_name, e))
                     return
+                except Exception as e:
+                    # Сбой после листингов (Telegram при отправке, Upstash при
+                    # дедупе) раньше вылетал из воркера и рвал gather: соседние
+                    # воркеры оставались крутиться сиротами, а джоба
+                    # перепланировалась поверх них — прогоны накладывались,
+                    # отчёт терялся. Теперь это сбой одного предмета.
+                    log.warning("watchlist: %s (chat_id=%s): сбой предмета: %s",
+                                market_hash_name, chat_id, e, exc_info=True)
+                    stats.note_error(market_hash_name, e)
+                    continue
                 found_any = found_any or found
 
         # Предметы идут параллельно, но темп запросов к Steam держит общий
@@ -4901,7 +4912,7 @@ async def proxycheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ) as resp:
                     data = await resp.json(content_type=None)
                     return data.get("ip"), None
-        except Exception as e:  # noqa: BLE001 — проверка не должна падать целиком
+        except Exception as e:
             return None, f"{type(e).__name__}: {e}"
 
     direct_ip, direct_error = await ask_direct_ip()
@@ -4934,7 +4945,7 @@ async def proxycheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     timeout=aiohttp.ClientTimeout(total=20),
                 ) as resp:
                     return proxy, resp.status, None
-        except Exception as e:  # noqa: BLE001 — проверка не падает целиком
+        except Exception as e:
             return proxy, None, f"{type(e).__name__}: {e}"
 
     async def one_csfloat(proxy: str):
@@ -8100,7 +8111,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     warm_started = time.monotonic()
     try:
         await get_csgotrader_price_details()
-    except Exception as e:  # noqa: BLE001 — без прайс-листа дальше разберутся сами
+    except Exception as e:
         log.warning("orders: прайс-лист не подняли: %s", e)
     warm_took = time.monotonic() - warm_started
     log.info("orders: прайс-лист готов за %.1f с", warm_took)
@@ -8151,7 +8162,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dips_found = await _order_candidates_from_dips(chat_id, skip=ordered)
         from_dips = len(dips_found)
         candidates += dips_found
-    except Exception as e:  # noqa: BLE001 — один источник не должен ронять другой
+    except Exception as e:
         log.warning("orders: просадки не дали кандидатов: %s", e)
         await update.message.reply_text(f"⚠️ Просадки не дали кандидатов: {e}")
 
@@ -8175,7 +8186,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             catalog_found = await _order_candidates_from_catalog(chat_id, limits, skip=ordered)
             from_catalog = len(catalog_found)
             candidates += catalog_found
-    except Exception as e:  # noqa: BLE001 — источники независимы
+    except Exception as e:
         log.warning("orders: отбор по ценам CSFloat / каталогу упал: %s", e, exc_info=True)
         await update.message.reply_text(f"⚠️ Отбор кандидатов по ценам не сработал: {e}")
 
@@ -9165,7 +9176,7 @@ async def _owns_updates(bot) -> bool:
         return True
     try:
         info = await bot.get_webhook_info()
-    except Exception:  # noqa: BLE001 — см. докстринг
+    except Exception:
         log.warning("orders: не узнал, на кого смотрит вебхук", exc_info=True)
         return True
     return (info.url or "") == f"{WEBHOOK_BASE_URL}/{_tg_webhook_path}"
@@ -9274,7 +9285,7 @@ async def webhook_watch_job(context: ContextTypes.DEFAULT_TYPE):
             info.pending_update_count,
         )
         await _start_chat_jobs(context.application)
-    except Exception:  # noqa: BLE001 — проверка вспомогательная, ронять нечего
+    except Exception:
         log.warning("webhook: проверка вебхука не удалась", exc_info=True)
     finally:
         context.job_queue.run_once(
@@ -9335,7 +9346,7 @@ async def _place_batch(query, context, chat_id: int, token: str, send) -> None:
         return
     try:
         await query.edit_message_reply_markup(reply_markup=None)
-    except Exception:  # noqa: BLE001 — кнопка уже снята, не беда
+    except Exception:
         pass
 
     budget_cents, max_count, auto_minutes = await _order_limits(chat_id)
@@ -9433,7 +9444,7 @@ async def orders_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "cancel":
         try:
             await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:  # noqa: BLE001 — сообщение старое или кнопку уже сняли
+        except Exception:
             pass
         await send("Снимаю ордера…")
         if arg == "all":
@@ -12356,6 +12367,17 @@ BOT_COMMANDS = [
 
 
 _chat_jobs_started = False
+# Ссылки на фоновые задачи: asyncio держит на них только слабую ссылку.
+_background_tasks: set[asyncio.Task] = set()
+
+
+CHAT_JOBS_RETRY_SECONDS = 60
+CHAT_JOBS_RETRY_ATTEMPTS = 30  # полчаса: дольше Upstash не лежит, а если лежит — уже не до джоб
+CHAT_JOBS_RETRY_JOB_NAME = "chat_jobs_retry"
+
+
+class _ChatRestoreFailed(Exception):
+    """Настройки чата пришли запасным путём — по ним джобы не восстанавливаем."""
 
 
 async def _start_chat_jobs(app: Application) -> None:
@@ -12364,103 +12386,149 @@ async def _start_chat_jobs(app: Application) -> None:
     if _chat_jobs_started:
         return
     _chat_jobs_started = True
-    asyncio.create_task(prewarm_loop())
+    _background_tasks.add(task := asyncio.create_task(prewarm_loop()))
+    task.add_done_callback(_background_tasks.discard)
+    await _restore_chat_jobs(app, None, attempt=1)
 
-    # Восстанавливаем джобы автоскана вотчлиста после рестарта/редеплоя —
-    # без этого расписание жило бы только в памяти процесса и слетало каждый раз.
-    chat_ids = await all_watchlist_chat_ids()
-    restored = 0
-    for chat_id in chat_ids:
-        # джоба нужна, если непуст хоть один из списков — обычный или флоатовый
-        if not await get_watchlist(chat_id) and not await get_float_watchlist(chat_id):
-            continue
-        if await get_watch_paused(chat_id):
-            # /watchpause переживает редеплой: не воскрешаем джобу для чата,
-            # который сам её остановил.
-            log.info("watchlist: chat_id=%s на паузе, джобу не восстанавливаю", chat_id)
-            continue
-        interval = await _get_watch_interval(chat_id)
-        _schedule_watchlist_job(app.job_queue, chat_id, interval)
-        restored += 1
-    log.info("watchlist: восстановлены джобы автоскана для %d чат(ов)", restored)
 
-    # Джобы арбитража живут отдельно от вотчлиста: он не привязан к списку
-    # предметов, поэтому и чаты берём по наличию настроек, а не по вотчлисту.
-    arb_restored = 0
-    for chat_id in await all_chat_ids_with_settings():
-        settings = await get_arb_settings(chat_id)
-        if settings["min_discount"] is None:
-            continue
-        _schedule_arb_job(app.job_queue, chat_id, _arb_interval(settings))
-        arb_restored += 1
+async def _restore_chat_jobs(app: Application, only: set[int] | None, *, attempt: int) -> None:
+    """
+    Восстанавливает джобы чатов после рестарта/редеплоя — без этого расписание
+    жило бы только в памяти процесса и слетало на каждом деплое Render.
 
-    # Автопрогон /markets — так же по настройкам. Без восстановления
-    # расписание жило бы только в памяти процесса, а Render передеплоивает
-    # часто: пользователь включил автопрогон, а он молча умер на первом же
-    # деплое.
-    markets_restored = 0
-    for chat_id in await all_chat_ids_with_settings():
-        interval = (await get_market_settings(chat_id))["interval"]
-        if not interval:
-            continue
-        _reschedule_markets_job(app.job_queue, chat_id, interval)
-        markets_restored += 1
-    if markets_restored:
-        log.info("markets: восстановлен автопрогон для %d чат(ов)", markets_restored)
+    Раньше один сбой Upstash в момент старта стирал ВСЁ молча: список чатов
+    при ошибке брался из локального файла (на Render он пустой), флаг «уже
+    запускал» стоял, и до следующего деплоя не крутилось ничего. Теперь список
+    чатов читается строго, каждый чат восстанавливается отдельно, а не
+    прочитанные — повторяются раз в минуту.
 
-    dips_restored = 0
-    for chat_id in await all_chat_ids_with_settings():
-        interval = (await get_dips_settings(chat_id))["interval"]
-        if not interval:
-            continue
-        _reschedule_dips_job(app.job_queue, chat_id, interval)
-        dips_restored += 1
-    if dips_restored:
-        log.info("dips: восстановлен автопрогон для %d чат(ов)", dips_restored)
-    if arb_restored:
-        log.info("arb: восстановлены джобы арбитража для %d чат(ов)", arb_restored)
+    only — повторять только эти чаты (None — все).
+    """
+    try:
+        if only is None:
+            watch_ids = set(await all_watchlist_chat_ids(strict=True))
+            settings_ids = set(await all_chat_ids_with_settings(strict=True))
+            chat_ids = watch_ids | settings_ids
+        else:
+            chat_ids = set(only)
+    except Exception as e:
+        log.warning("джобы чатов: список чатов не прочитан (%s) — попытка %d/%d",
+                    scan_errors.scrub(str(e)), attempt, CHAT_JOBS_RETRY_ATTEMPTS)
+        _schedule_chat_jobs_retry(app, None, attempt)
+        return
 
-    # Слежение за инвентарём — так же по настройкам, а не по вотчлисту. Без
-    # восстановления оно молча умирало бы на каждом передеплое Render, а
-    # передеплоивает он часто: пользователь включил /invwatch и потом неделю
-    # ждал бы уведомлений, которых никто не собирался слать.
-    inv_restored = 0
-    for chat_id in await all_chat_ids_with_settings():
-        if await get_inventory_growth(chat_id) is None:
-            continue
-        if not await get_inventory_steamid(chat_id):
-            continue
-        _schedule_inventory_job(app.job_queue, chat_id)
-        inv_restored += 1
-    if inv_restored:
-        log.info("inventory: восстановлены джобы слежения для %d чат(ов)", inv_restored)
-
-    # Поддержка ботовых ордеров на CSFloat. Без восстановления ордера после
-    # каждого передеплоя стояли бы брошенными: их обходят, а бот молчит.
-    # Первая сверка — не сразу, а через пару минут: старт и так занят
-    # прогревом, а ордерам минута не горит.
-    orders_restored = 0
-    for chat_id in await all_chat_ids_with_settings():
+    restored: dict[str, int] = {}
+    failed: set[int] = set()
+    for chat_id in sorted(chat_ids):
         try:
-            _, _, auto_minutes = await _order_limits(chat_id)
-            if not auto_minutes:
-                continue
-            if not await get_bot_orders(chat_id):
-                continue
-        except Exception:
-            # Реестр не прочитался — ордера МОГУТ быть. Сверка разберётся
-            # сама и, если их нет, просто не перепланирует себя.
-            log.warning("orders: chat_id=%s реестр на старте не прочитан", chat_id,
-                        exc_info=True)
-            auto_minutes = order_desk.DEFAULT_AUTO_MINUTES
-        _schedule_orders_job(app.job_queue, chat_id, auto_minutes, delay_minutes=3)
-        orders_restored += 1
-    if orders_restored:
-        log.info("orders: восстановлена поддержка ордеров для %d чат(ов)", orders_restored)
+            for kind in await _restore_one_chat(app, chat_id):
+                restored[kind] = restored.get(kind, 0) + 1
+        except Exception as e:
+            failed.add(chat_id)
+            log.warning("джобы чатов: chat_id=%s не восстановлен (%s)", chat_id,
+                        scan_errors.scrub(str(e)),
+                        exc_info=not isinstance(e, _ChatRestoreFailed))
+
+    summary = ", ".join(f"{k} {n}" for k, n in sorted(restored.items())) or "нечего"
+    log.info("джобы чатов: восстановлено — %s (чатов %d, не прочитано %d, попытка %d)",
+             summary, len(chat_ids), len(failed), attempt)
+    if failed:
+        _schedule_chat_jobs_retry(app, failed, attempt)
+
+
+def _schedule_chat_jobs_retry(app: Application, only: set[int] | None, attempt: int) -> None:
+    if attempt >= CHAT_JOBS_RETRY_ATTEMPTS:
+        log.error("джобы чатов: за %d попыток не восстановились (%s) — нужен редеплой "
+                  "или любая команда настройки в чате",
+                  attempt, "все" if only is None else sorted(only))
+        return
+    for job in app.job_queue.get_jobs_by_name(CHAT_JOBS_RETRY_JOB_NAME):
+        job.schedule_removal()
+    app.job_queue.run_once(
+        _chat_jobs_retry_job, when=CHAT_JOBS_RETRY_SECONDS, name=CHAT_JOBS_RETRY_JOB_NAME,
+        data={"only": None if only is None else sorted(only), "attempt": attempt + 1},
+    )
+
+
+async def _chat_jobs_retry_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = context.job.data or {}
+    only = data.get("only")
+    await _restore_chat_jobs(
+        context.application, None if only is None else set(only),
+        attempt=int(data.get("attempt", 2)),
+    )
+
+
+async def _restore_one_chat(app: Application, chat_id: int) -> list[str]:
+    """Ставит все нужные чату джобы. Падает, если чтение ушло в запасную копию."""
+    jq = app.job_queue
+    kinds: list[str] = []
+
+    def check_settings() -> None:
+        if settings_degraded(chat_id):
+            raise _ChatRestoreFailed("Upstash не отдал настройки чата")
+
+    # Решаем по ВСЕМ настройкам до того, как что-то ставить: на запасной копии
+    # (пустые умолчания) чат выглядел бы «ничего не включено».
+    bundle = await get_watchlist_bundle(chat_id)
+    if bundle["degraded"]:
+        raise _ChatRestoreFailed("Upstash не отдал вотчлист")
+    watch_interval = await _get_watch_interval(chat_id)
+    arb = await get_arb_settings(chat_id)
+    markets_interval = (await get_market_settings(chat_id))["interval"]
+    dips_interval = (await get_dips_settings(chat_id))["interval"]
+    inv_growth = await get_inventory_growth(chat_id)
+    inv_steamid = await get_inventory_steamid(chat_id) if inv_growth is not None else None
+    check_settings()
+
+    # джоба вотчлиста нужна, если непуст хоть один из списков — обычный или
+    # флоатовый; /watchpause переживает редеплой — не воскрешаем джобу для
+    # чата, который сам её остановил.
+    if bundle["items"] or bundle["float_items"]:
+        if bundle["paused"]:
+            log.info("watchlist: chat_id=%s на паузе, джобу не восстанавливаю", chat_id)
+        else:
+            _schedule_watchlist_job(jq, chat_id, watch_interval)
+            kinds.append("автоскан")
+    if arb["min_discount"] is not None:
+        _schedule_arb_job(jq, chat_id, _arb_interval(arb))
+        kinds.append("арбитраж")
+    if markets_interval:
+        _reschedule_markets_job(jq, chat_id, markets_interval)
+        kinds.append("markets")
+    if dips_interval:
+        _reschedule_dips_job(jq, chat_id, dips_interval)
+        kinds.append("dips")
+    if inv_growth is not None and inv_steamid:
+        _schedule_inventory_job(jq, chat_id)
+        kinds.append("инвентарь")
+
+    # Поддержка ботовых ордеров на CSFloat. Первая сверка — через пару минут:
+    # старт и так занят прогревом, а ордерам минута не горит.
+    try:
+        _, _, auto_minutes = await _order_limits(chat_id)
+        if not auto_minutes:
+            return kinds
+        if not await get_bot_orders(chat_id):
+            return kinds
+    except Exception:
+        # Реестр не прочитался — ордера МОГУТ быть. Сверка разберётся
+        # сама и, если их нет, просто не перепланирует себя.
+        log.warning("orders: chat_id=%s реестр на старте не прочитан", chat_id,
+                    exc_info=True)
+        auto_minutes = order_desk.DEFAULT_AUTO_MINUTES
+    _schedule_orders_job(jq, chat_id, auto_minutes, delay_minutes=3)
+    kinds.append("ордера")
+    return kinds
 
 
 async def _on_startup(app: Application):
     await app.bot.set_my_commands(BOT_COMMANDS)
+    if ALLOWED_CHAT_IDS:
+        log.info("доступ: бот отвечает только чатам %s", sorted(ALLOWED_CHAT_IDS))
+    else:
+        log.error("доступ: ALLOWED_CHAT_IDS не задан — бот отвечает ЛЮБОМУ в Telegram, "
+                  "включая ордера на твой CSFloat-ключ. Задай свой chat_id в Render.")
 
     # ДО всего остального, что может тронуть Steam (prewarm, автоскан) —
     # восстанавливаем кулдаун после 429, если рестарт застал его активным.
@@ -12976,6 +13044,42 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("не удалось отправить сообщение об ошибке в chat_id=%s", chat_id)
 
 
+def _parse_allowed_chat_ids(raw: str) -> frozenset[int]:
+    """ALLOWED_CHAT_IDS: chat_id через запятую/пробел. Мусор пропускаем с ошибкой в логе."""
+    out = set()
+    for part in re.split(r"[\s,;]+", raw.strip()):
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            log.error("ALLOWED_CHAT_IDS: «%s» — не число, пропускаю", part)
+    return frozenset(out)
+
+
+# Кому бот вообще отвечает. Бот работает на ОДИН глобальный CSFloat-ключ
+# владельца, общие прокси, общие цены и кулдауны — без этого списка любой, кто
+# нашёл бота в Telegram, мог ставить и снимать ордера за чужие деньги, сбросить
+# прокси и цены и скачать логи. Пусто — бот открыт всем (как раньше), но на
+# старте пишет об этом ошибку в лог.
+ALLOWED_CHAT_IDS = _parse_allowed_chat_ids(os.environ.get("ALLOWED_CHAT_IDS", ""))
+_denied_logged: set[int] = set()
+
+
+def _chat_allowed(update) -> bool:
+    if not ALLOWED_CHAT_IDS:
+        return True
+    chat = getattr(update, "effective_chat", None)
+    chat_id = chat.id if chat is not None else None
+    if chat_id in ALLOWED_CHAT_IDS:
+        return True
+    if chat_id not in _denied_logged:
+        # Один раз на чат, чтобы чужой спам не забил логи.
+        _denied_logged.add(chat_id)
+        log.warning("доступ: апдейт из чужого chat_id=%s — игнорирую", chat_id)
+    return False
+
+
 def _steam_first(handler):
     """
     Обработчик команды или кнопки: его запросы к Steam идут вне очереди.
@@ -12987,6 +13091,14 @@ def _steam_first(handler):
     """
     @functools.wraps(handler)
     async def wrapped(update, context):
+        if not _chat_allowed(update):
+            query = getattr(update, "callback_query", None)
+            if query is not None:
+                try:
+                    await query.answer()  # чтобы у чужого не крутились часики
+                except Exception as e:
+                    log.debug("доступ: не ответил на кнопку чужого: %s", e)
+            return None
         token = set_steam_priority(True)
         try:
             return await handler(update, context)
