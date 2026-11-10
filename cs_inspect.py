@@ -19,6 +19,7 @@ https://github.com/csfloat/cs-inspect-serializer
 
 from __future__ import annotations
 
+import math
 import re
 import struct
 import urllib.parse
@@ -52,6 +53,39 @@ def _read_varint(data: bytes, pos: int) -> tuple[int, int]:
         if not (b & 0x80):
             return result, pos
         shift += 7
+
+
+def _decode_fields(payload: bytes) -> tuple[dict[int, int], dict[int, int], dict[int, list[bytes]]]:
+    """
+    Все поля сообщения одного уровня: (varint, fixed32, length-delimited списками).
+    Нужен для наклеек: каждая — вложенное сообщение в поле 12, а её износ —
+    float в fixed32.
+    """
+    varints: dict[int, int] = {}
+    fixed32: dict[int, int] = {}
+    blobs: dict[int, list[bytes]] = {}
+    pos = 0
+    while pos < len(payload):
+        tag, pos = _read_varint(payload, pos)
+        field_number, wire_type = tag >> 3, tag & 0x7
+        if wire_type == 0:
+            varints[field_number], pos = _read_varint(payload, pos)
+        elif wire_type == 1:
+            pos += 8
+        elif wire_type == 2:
+            length, pos = _read_varint(payload, pos)
+            blobs.setdefault(field_number, []).append(payload[pos:pos + length])
+            pos += length
+        elif wire_type == 5:
+            if pos + 4 > len(payload):
+                raise InspectDecodeError("fixed32 обрывается за концом буфера")
+            fixed32[field_number] = struct.unpack("<I", payload[pos:pos + 4])[0]
+            pos += 4
+        else:
+            raise InspectDecodeError(f"неизвестный wire type {wire_type}")
+        if pos > len(payload):
+            raise InspectDecodeError("поле выходит за границы payload'а")
+    return varints, fixed32, blobs
 
 
 def _decode_varint_fields(payload: bytes) -> tuple[dict[int, int], set[int]]:
@@ -129,7 +163,7 @@ def _xor_mask(buffer: bytes, key: int) -> bytes:
     return bytes(b ^ key for b in buffer)
 
 
-def _decode_wrapped(buffer: bytes) -> dict[int, int]:
+def _wrapped_payload(buffer: bytes) -> bytes:
     """Формат с ведущим нулевым байтом — здесь контрольная сумма ЕСТЬ и проверяется."""
     if len(buffer) < 5 or buffer[0] != 0:
         raise InspectDecodeError("не 'wrapped' формат")
@@ -137,10 +171,14 @@ def _decode_wrapped(buffer: bytes) -> dict[int, int]:
     expected_checksum = struct.unpack(">I", buffer[-4:])[0]
     if _checksum(payload) != expected_checksum:
         raise InspectDecodeError("контрольная сумма не сошлась")
-    fields, present = _decode_varint_fields(payload)
+    _, present = _decode_varint_fields(payload)
     if not _has_inspect_payload(present):
         raise InspectDecodeError("payload разобрался, но в нём нет ожидаемых полей предмета")
-    return fields
+    return payload
+
+
+def _decode_wrapped(buffer: bytes) -> dict[int, int]:
+    return _decode_varint_fields(_wrapped_payload(buffer))[0]
 
 
 def _decode_masked(buffer: bytes) -> dict[int, int]:
@@ -152,15 +190,66 @@ def _decode_masked(buffer: bytes) -> dict[int, int]:
     на всех 25 из 25). Вместо суммы корректность снятия маски подтверждается
     тем, что payload разобрался и в нём есть осмысленный набор полей.
     """
+    return _decode_varint_fields(_masked_payload(buffer))[0]
+
+
+def _masked_payload(buffer: bytes) -> bytes:
     if len(buffer) < 5:
         raise InspectDecodeError("буфер слишком короткий")
     unmasked = _xor_mask(buffer, buffer[0])
     if unmasked[0] != 0:
         raise InspectDecodeError("не 'masked' формат")
-    fields, present = _decode_varint_fields(unmasked[1:-4])
+    payload = unmasked[1:-4]
+    _, present = _decode_varint_fields(payload)
     if not _is_masked_payload(present):
         raise InspectDecodeError("payload разобрался, но набор полей не похож на masked-предмет")
-    return fields
+    return payload
+
+
+def _payload_from_link(link: str | None) -> bytes | None:
+    """Раскрытый protobuf предмета из новой inspect-ссылки; None — старая ссылка или не разобралась."""
+    if not link:
+        return None
+    match = _HEX_RE.search(_normalize_link(link))
+    if not match:
+        return None
+    hex_str = match.group(1).strip()
+    try:
+        buffer = bytes.fromhex(hex_str)
+        return _wrapped_payload(buffer) if buffer and buffer[0] == 0 else _masked_payload(buffer)
+    except (ValueError, InspectDecodeError):
+        return None
+
+
+# Поля вложенного сообщения Sticker (cs-inspect-serializer, econ.ts).
+_STICKER_SLOT = 1
+_STICKER_ID = 2
+_STICKER_WEAR = 3
+
+
+def sticker_wears(link: str | None) -> list[float] | None:
+    """
+    Износ наклеек экземпляра по порядку слотов: 0.0 — целая, 1.0 — стёрта.
+
+    Steam кладёт поле wear только затёртым наклейкам: нет поля — наклейка
+    целая. None — ссылка старого формата (износ в ней не записан) или не
+    разобралась; пустой список — наклеек нет. Брелоки (поле 20) сюда не входят.
+    """
+    payload = _payload_from_link(link)
+    if payload is None:
+        return None
+    try:
+        _, _, blobs = _decode_fields(payload)
+        stickers = []
+        for blob in blobs.get(_FIELD_STICKERS, []):
+            varints, fixed, _ = _decode_fields(blob)
+            wear = _bytes_to_float(fixed[_STICKER_WEAR]) if _STICKER_WEAR in fixed else 0.0
+            if math.isnan(wear) or wear < 0:  # мусор
+                wear = 0.0
+            stickers.append((varints.get(_STICKER_SLOT, 0), min(wear, 1.0)))
+    except InspectDecodeError:
+        return None
+    return [wear for _, wear in sorted(stickers, key=lambda t: t[0])]
 
 
 def decode_hex(hex_str: str) -> dict:

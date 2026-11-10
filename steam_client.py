@@ -54,6 +54,7 @@ from dataclasses import dataclass, field
 
 import aiohttp
 
+import cs_inspect
 from http_session import get_session
 from proxy_pool import ProxyPool, mask as mask_proxy
 # Текст исключений отсюда уходит прямо в Telegram, а в него попадает адрес
@@ -726,6 +727,10 @@ class Listing:
     price: float
     stickers: list[str] = field(default_factory=list)  # человекочитаемые имена стикеров
     inspect_link: str | None = None  # steam://...csgo_econ_action_preview... — конкретно этот экземпляр
+    # Износ каждой наклейки (0 — целая, 1 — стёрта) в порядке stickers — из
+    # inspect-ссылки, локально (cs_inspect.sticker_wears). None — неизвестен:
+    # старая ссылка или число наклеек в ней не сошлось со страницей.
+    sticker_wear: list[float] | None = None
 
 
 def market_hash_name_from_url(url: str) -> str:
@@ -1318,7 +1323,12 @@ def _parse_listings_html(html: str) -> list[Listing]:
         inspect_m = INSPECT_RE.search(b)
         inspect_link = inspect_m.group(1) if inspect_m else None
 
-        out.append(Listing(price=price, stickers=stickers, inspect_link=inspect_link))
+        wear = cs_inspect.sticker_wears(inspect_link) if stickers else None
+        if wear is not None and len(wear) != len(stickers):
+            # По порядку их не сопоставить — честнее «неизвестно», чем чужой износ.
+            wear = None
+        out.append(Listing(price=price, stickers=stickers, inspect_link=inspect_link,
+                           sticker_wear=wear))
         if stickers:
             _parse_totals["with_stickers"] += 1
 

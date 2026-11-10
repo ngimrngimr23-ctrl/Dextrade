@@ -850,6 +850,14 @@ async def _compute_offers(
     return offers + float_offers, sticker_prices
 
 
+def _wear_tag(o, i: int) -> str:
+    """« (затёрта 49%)» после цены наклейки; у целой — пусто."""
+    wear = o.sticker_wear
+    if not o.worn or i >= len(o.worn) or not o.worn[i] or wear is None:
+        return ""
+    return f" (затёрта {wear[i] * 100:.0f}%)"
+
+
 def _format_offers_chunks(offers, sticker_prices, market_hash_name: str | None) -> list[str]:
     """Готовые куски текста (HTML) под лимит Telegram ~4096 символов — шлются по одному reply_text/send_message."""
     header = f"Найдено {len(offers)} офферов (цена голого скина ≈${offers[0].floor_price:.2f})"
@@ -875,7 +883,10 @@ def _format_offers_chunks(offers, sticker_prices, market_hash_name: str | None) 
             # все названия стикеров — в одном <code>, чтобы тап копировал их разом
             # (как раньше); цены стикеров — отдельной строкой ниже, вне <code>
             stickers_html = html_module.escape(", ".join(o.stickers))
-            prices_str = ", ".join(f"${sticker_prices.get(s, 0.0):.2f}" for s in o.stickers)
+            prices_str = ", ".join(
+                f"${sticker_prices.get(s, 0.0):.2f}" + _wear_tag(o, i)
+                for i, s in enumerate(o.stickers)
+            )
             streak_tag = f" 🔥 стрик x{o.streak}" if o.streak >= STREAK_THRESHOLD else ""
             # флоат показываем справочно, если удалось раскодировать локально
             float_tag = f" | флоат {o.float_value:.5f}" if o.float_value is not None else ""
@@ -885,6 +896,11 @@ def _format_offers_chunks(offers, sticker_prices, market_hash_name: str | None) 
                 f"  <code>{stickers_html}</code>\n"
                 f"  цены: {prices_str}"
             )
+            if any(o.worn):
+                block += (f"\n  затёртые не в счёт (были бы ≈${o.worn_value:.2f}) — "
+                          "стоимость и наценка по целым")
+            elif o.sticker_wear is None:
+                block += "\n  износ наклеек неизвестен (старая инспект-ссылка)"
         if o.inspect_link:
             block += f'\n  <a href="{html_module.escape(o.inspect_link)}">Инспект этого лота</a>'
         lines.append(block)

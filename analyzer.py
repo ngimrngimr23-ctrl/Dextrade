@@ -5,9 +5,10 @@ N% наценки сверху".
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import quote
 
+import envcfg
 from steam_client import Listing
 
 log = logging.getLogger("steam_bot.analyzer")
@@ -19,6 +20,18 @@ log = logging.getLogger("steam_bot.analyzer")
 MAX_PRICE_SPREAD_PCT = 40.0
 
 STREAK_THRESHOLD = 4  # от скольки подряд идущих одинаковых стикеров считаем это "стриком"
+
+# Наклейка с износом больше этого — «затёртая» и в стоимость набора не идёт.
+# 0 — любая потёртость. Износ из inspect-ссылки: 0 — целая, 1 — стёрта.
+STICKER_MAX_WEAR = envcfg.env_float("STICKER_MAX_WEAR", 0.0)
+
+
+def worn_flags(listing: Listing) -> list[bool]:
+    """Какие наклейки лота затёрты. Износ неизвестен — считаем целой (как и раньше)."""
+    wear = listing.sticker_wear
+    if wear is None or len(wear) != len(listing.stickers):
+        return [False] * len(listing.stickers)
+    return [w > STICKER_MAX_WEAR + 1e-6 for w in wear]
 
 
 @dataclass
@@ -37,6 +50,10 @@ class Offer:
     float_value: float | None = None
     # True, если лот попал в подборку ИМЕННО из-за редкого флоата, а не по стикерам.
     found_by_float: bool = False
+    # Износ наклеек (как Listing.sticker_wear) и какие из них затёрты — не в счёт.
+    sticker_wear: list[float] | None = None
+    worn: list[bool] = field(default_factory=list)
+    worn_value: float = 0.0  # сколько стоили бы затёртые, будь они целыми
 
 
 def _floor_price(listings: list[Listing]) -> float:
@@ -143,12 +160,22 @@ def find_offers(
             _drop("лот дороже порога")
             continue
 
-        stickers_value = sum(sticker_prices.get(s, 0.0) for s in listing.stickers)
+        # Затёртые наклейки в стоимость набора не идут: порог, вес набора и
+        # наценку считаем только по целым. Лишние затёртые лот не губят —
+        # если целые сами набирают порог, лот проходит, а затёртые помечены.
+        worn = worn_flags(listing)
+        full_value = sum(sticker_prices.get(s, 0.0) for s in listing.stickers)
+        stickers_value = sum(
+            sticker_prices.get(s, 0.0) for s, w in zip(listing.stickers, worn) if not w
+        )
         if stickers_value < min_stickers_value:
             # Отдельно считаем случай, когда цен на стикеры просто нет: это не
             # «дешёвый набор», а дыра в прайс-листе, и лечится она совсем
             # другим. Без разделения обе беды выглядели одинаково.
-            _drop("цен на стикеры нет" if stickers_value == 0 else "набор дешевле порога")
+            if full_value >= min_stickers_value:
+                _drop("порог добирают только затёртые наклейки")
+            else:
+                _drop("цен на стикеры нет" if full_value == 0 else "набор дешевле порога")
             continue
 
         # Наклейки должны перекрывать цену самого скина в min_sticker_ratio раз.
@@ -177,7 +204,10 @@ def find_offers(
         # ровно их полную стоимость (уже не выгодно), больше 100% — переплата.
         markup_pct = (overpay / stickers_value) * 100 if stickers_value else float("inf")
 
-        streak = _max_streak(listing.stickers)
+        # Затёртая наклейка стрик рвёт: «четыре одинаковых» ценны целыми.
+        streak = _max_streak([
+            f"\0worn{i}" if w else s for i, (s, w) in enumerate(zip(listing.stickers, worn))
+        ])
         effective_max_markup = (
             streak_max_markup_pct
             if streak >= STREAK_THRESHOLD and streak_max_markup_pct is not None
@@ -207,6 +237,9 @@ def find_offers(
                     streak=streak,
                     inspect_link=listing.inspect_link,
                     float_value=listing_floats.get(listing.inspect_link) if listing.inspect_link else None,
+                    sticker_wear=listing.sticker_wear,
+                    worn=worn,
+                    worn_value=full_value - stickers_value,
                 )
             )
 
