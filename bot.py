@@ -9178,15 +9178,25 @@ async def _orders_round(chat_id: int) -> order_desk.Round:
     )
 
 
-def _round_lines(rnd: order_desk.Round, *, title: str) -> list[str]:
+# Будничная перестановка цены (перебили — встали на шаг выше, или опустились
+# к потолку) в фоновой сверке в чат не пишется: на 15 ордерах это сообщение
+# каждые полчаса, за которым теряется «ордер исполнен». Видно в /myorders и логах.
+_QUIET_EVENTS = frozenset({order_desk.RAISED, order_desk.LOWERED})
+
+
+def _round_lines(rnd: order_desk.Round, *, title: str, quiet: bool = False) -> list[str]:
     lines = [f"<b>{title}</b>"]
-    for e in rnd.events:
+    events = [e for e in rnd.events if not (quiet and e.kind in _QUIET_EVENTS)]
+    moved = len(rnd.events) - len(events)
+    for e in events:
         lines.append(
             f"{_EVENT_MARKS.get(e.kind, '•')} <code>{html_module.escape(e.name)}</code> — "
             f"{html_module.escape(e.text)}"
         )
     if rnd.problem:
         lines.append(f"⚠️ {html_module.escape(scan_errors.scrub(rnd.problem))}")
+    if moved:
+        lines.append(f"Цену переставил у {moved} ордер(ов) — как обычно, после перебивки.")
     lines.append(
         f"Ботовых ордеров: {rnd.active} на {_usd(rnd.committed_cents)}. "
         f"Проверено стаканов: {rnd.checked}"
@@ -9354,8 +9364,8 @@ async def orders_maintain_job(context: ContextTypes.DEFAULT_TYPE):
         )
         # Пишем только когда есть что сказать: «всё стоит как стояло» каждые
         # полчаса — это шум, за которым потеряется «ордер исполнен».
-        if rnd.events:
-            for chunk in _chunk_lines(_round_lines(rnd, title="Ордера CSFloat")):
+        if any(e.kind not in _QUIET_EVENTS for e in rnd.events):
+            for chunk in _chunk_lines(_round_lines(rnd, title="Ордера CSFloat", quiet=True)):
                 await context.bot.send_message(
                     chat_id=chat_id, text=chunk, parse_mode="HTML",
                     disable_web_page_preview=True,
