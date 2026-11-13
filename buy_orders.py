@@ -250,20 +250,36 @@ HISTORY_GAP = (
     "стабильность цены не проверить"
 )
 
-CASE_OR_KEY = "кейсы и ключи от кейсов под ордера не берём"
+CONTAINER = "контейнеры (кейсы, капсулы, наборы) и ключи под ордера не берём"
+CASE_OR_KEY = CONTAINER  # прежнее имя
 
 
-def is_case_or_key(market_hash_name: str) -> bool:
+def is_container(market_hash_name: str) -> bool:
     """
-    Кейс («Kilowatt Case», «Operation Breakout Weapon Case») или ключ к нему
-    («Operation Hydra Case Key», «eSports Key»). У скинов, наклеек и прочего в
-    названии есть «|», у кейсов и ключей — нет, по этому их и отличаем, не
-    задевая, например, «Sticker | ... Case»-подобные имена.
+    Контейнер или расходник: кейс, капсула (наклеек, автографов, нашивок,
+    значков), сувенирный набор, коробка музыки, ключ, пропуск, жетоны, бирка.
+
+    Правило — БЕЛЫЙ список, а не чёрный. Первая версия ловила только имена на
+    « Case» и « Key» и пропустила капсулы: «London 2018 Minor Challengers
+    Autograph Capsule», «Collectible Pins Capsule Series 3», а «Katowice 2019
+    Minor Challengers (Holo/Foil)» слова «Capsule» в имени не несёт вовсе — по
+    словам контейнеры не перечислить. Зато у всего, что под ордера годится
+    (скины, наклейки, брелоки, агенты, нашивки, музыка), в имени есть «|», а
+    без «|» годятся только ножи и перчатки без раскраски («★ ...») и значки
+    («... Pin»). Всё прочее без «|» — контейнер или расходник. С «|» из
+    контейнеров бывают только капсулы старых турниров: «Autograph Capsule |
+    Fnatic | Cologne 2016». Сверено с каталогом ByMykel/CSGO-API crates.json:
+    правило закрывает все 479 контейнеров.
     """
     name = market_hash_name.strip()
+    if name.startswith(("Autograph Capsule |", "Sticker Capsule |")):
+        return True
     if "|" in name:
         return False
-    return name.endswith((" Case", " Key"))
+    return not (name.startswith("★") or name.endswith(" Pin"))
+
+
+is_case_or_key = is_container  # прежнее имя
 
 
 def plan(

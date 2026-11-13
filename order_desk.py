@@ -652,93 +652,105 @@ async def _maintain(
                 name = entry.get("name") or order.market_hash_name or "?"
                 now = time.time()
 
-                listing_id = entry.get("listing_id")
-                book = await _book(session, name, listing_id)
-                if book is None:
-                    # Лот, по которому читали стакан, мог уйти — ищем другой
-                    # по имени. Это /listings, то есть через прокси.
-                    try:
-                        lots, _ = await csfloat_client.fetch_listings_page(
-                            session, limit=1, sort_by="lowest_price",
-                            market_hash_name=name,
-                        )
-                    except (CSFloatError, CSFloatRateLimited) as e:
-                        log.info("orders: лот для стакана «%s» не нашёл — %s",
-                                 name, _reason(e))
-                        lots = []
-                    if lots:
-                        listing_id = lots[0].listing_id
-                        entry["listing_id"] = listing_id
-                        book = await csfloat_client.order_book(session, listing_id)
-                if book is None:
-                    # Поиск закрыт (прокси отказывают) — номер последней
-                    # продажи из истории, она с адреса Render открыта (см.
-                    # csfloat_client.recent_sale_listing_id).
-                    sold_id = await csfloat_client.recent_sale_listing_id(session, name)
-                    if sold_id and sold_id != listing_id:
-                        book = await csfloat_client.order_book(session, sold_id)
-                        if book is not None:
-                            entry["listing_id"] = sold_id
-                entry["checked_at"] = now
-                checked += 1
-                if book is None:
-                    blind += 1
-                    continue
+                if name != "?" and buy_orders.is_container(name):
+                    # Контейнер (кейс, капсула, сувенирный набор, ключ) — под
+                    # ордера не берём. Ордер мог встать до этого правила:
+                    # снимаем, стакан для этого не нужен.
+                    entry["checked_at"] = now
+                    checked += 1
+                    decision = buy_orders.Reprice(
+                        buy_orders.CANCEL, order.price_cents, buy_orders.CONTAINER)
+                    why = decision.why + " — снял ордер"
+                    log.info("orders: chat_id=%s «%s» — контейнер, снимаю ордер",
+                             chat_id, name)
+                else:
+                    listing_id = entry.get("listing_id")
+                    book = await _book(session, name, listing_id)
+                    if book is None:
+                        # Лот, по которому читали стакан, мог уйти — ищем другой
+                        # по имени. Это /listings, то есть через прокси.
+                        try:
+                            lots, _ = await csfloat_client.fetch_listings_page(
+                                session, limit=1, sort_by="lowest_price",
+                                market_hash_name=name,
+                            )
+                        except (CSFloatError, CSFloatRateLimited) as e:
+                            log.info("orders: лот для стакана «%s» не нашёл — %s",
+                                     name, _reason(e))
+                            lots = []
+                        if lots:
+                            listing_id = lots[0].listing_id
+                            entry["listing_id"] = listing_id
+                            book = await csfloat_client.order_book(session, listing_id)
+                    if book is None:
+                        # Поиск закрыт (прокси отказывают) — номер последней
+                        # продажи из истории, она с адреса Render открыта (см.
+                        # csfloat_client.recent_sale_listing_id).
+                        sold_id = await csfloat_client.recent_sale_listing_id(session, name)
+                        if sold_id and sold_id != listing_id:
+                            book = await csfloat_client.order_book(session, sold_id)
+                            if book is not None:
+                                entry["listing_id"] = sold_id
+                    entry["checked_at"] = now
+                    checked += 1
+                    if book is None:
+                        blind += 1
+                        continue
 
-                # Последняя известная медиана остаётся в реестре: снимок
-                # стареет за трое суток, а потолок без неё вернулся бы к
-                # нижнему лоту при постановке — к тому самому пику.
-                measured = snapshot.month_median(name) if snapshot else None
-                if measured is None:
-                    measured = await _history_median(name, fetch=False)
-                if measured is None and history_fetches < MAINTAIN_HISTORY_FETCHES \
-                        and steam_history.history_api_open():
-                    history_fetches += 1
-                    measured = await _history_median(name)
-                if measured is not None:
-                    entry["month_median"] = measured[0]
-                    entry.pop("month_median_from", None)
-                elif pricing.PRICELIST_MONTH_FACTOR > 0 and (
-                        not entry.get("month_median")
-                        or entry.get("month_median_from") == PRICELIST):
-                    # Медианы сделок нет и не было — месячная цена из прайс-листа.
-                    # Прочитанную раньше медиану сделок она не перебивает: та точнее.
-                    if pricelist is None:
-                        pricelist = await pricing.get_csgotrader_price_details() or {}
-                    cents = pricing.pricelist_month_cents(pricelist, name)
-                    if cents:
-                        entry["month_median"] = cents
-                        entry["month_median_from"] = PRICELIST
-                median = entry.get("month_median")
-                median_name = ("месячная цена" if entry.get("month_median_from") == PRICELIST
-                               else "медиана сделок Steam за месяц")
-                ceiling = _ceiling_now(
-                    entry, cached_prices.get(name),
-                    min_profit_pct=min_profit_pct, max_order_cents=max_order_cents,
-                    month_median_cents=median,
-                )
-                # Для /myorders: «ceiling» — потолок на момент постановки, он же
-                # основа расчёта, а этот — с медианой и порогами на сейчас.
-                entry["ceiling_now"] = ceiling
-                decision = buy_orders.reprice(
-                    current_cents=order.price_cents,
-                    ceiling_cents=ceiling,
-                    rivals_cents=_rivals(book, oid, order.price_cents),
-                )
-                why = decision.why
-                if median and order.price_cents > ceiling and ceiling < _ceiling_now(
-                    entry, cached_prices.get(name),
-                    min_profit_pct=min_profit_pct, max_order_cents=max_order_cents,
-                ):
-                    # Потолок опустила месячная цена — в уведомлении скажем,
-                    # почему ордер вдруг подешевел.
-                    why += f" ({median_name} ${median / 100:.2f})"
-                log.info(
-                    "orders: chat_id=%s «%s» $%.2f, потолок $%.2f%s — %s: %s",
-                    chat_id, name, order.price_cents / 100, ceiling / 100,
-                    f" ({median_name} ${median / 100:.2f})" if median else "",
-                    decision.action, why,
-                )
+                    # Последняя известная медиана остаётся в реестре: снимок
+                    # стареет за трое суток, а потолок без неё вернулся бы к
+                    # нижнему лоту при постановке — к тому самому пику.
+                    measured = snapshot.month_median(name) if snapshot else None
+                    if measured is None:
+                        measured = await _history_median(name, fetch=False)
+                    if measured is None and history_fetches < MAINTAIN_HISTORY_FETCHES \
+                            and steam_history.history_api_open():
+                        history_fetches += 1
+                        measured = await _history_median(name)
+                    if measured is not None:
+                        entry["month_median"] = measured[0]
+                        entry.pop("month_median_from", None)
+                    elif pricing.PRICELIST_MONTH_FACTOR > 0 and (
+                            not entry.get("month_median")
+                            or entry.get("month_median_from") == PRICELIST):
+                        # Медианы сделок нет и не было — месячная цена из прайс-листа.
+                        # Прочитанную раньше медиану сделок она не перебивает: та точнее.
+                        if pricelist is None:
+                            pricelist = await pricing.get_csgotrader_price_details() or {}
+                        cents = pricing.pricelist_month_cents(pricelist, name)
+                        if cents:
+                            entry["month_median"] = cents
+                            entry["month_median_from"] = PRICELIST
+                    median = entry.get("month_median")
+                    median_name = ("месячная цена" if entry.get("month_median_from") == PRICELIST
+                                   else "медиана сделок Steam за месяц")
+                    ceiling = _ceiling_now(
+                        entry, cached_prices.get(name),
+                        min_profit_pct=min_profit_pct, max_order_cents=max_order_cents,
+                        month_median_cents=median,
+                    )
+                    # Для /myorders: «ceiling» — потолок на момент постановки, он же
+                    # основа расчёта, а этот — с медианой и порогами на сейчас.
+                    entry["ceiling_now"] = ceiling
+                    decision = buy_orders.reprice(
+                        current_cents=order.price_cents,
+                        ceiling_cents=ceiling,
+                        rivals_cents=_rivals(book, oid, order.price_cents),
+                    )
+                    why = decision.why
+                    if median and order.price_cents > ceiling and ceiling < _ceiling_now(
+                        entry, cached_prices.get(name),
+                        min_profit_pct=min_profit_pct, max_order_cents=max_order_cents,
+                    ):
+                        # Потолок опустила месячная цена — в уведомлении скажем,
+                        # почему ордер вдруг подешевел.
+                        why += f" ({median_name} ${median / 100:.2f})"
+                    log.info(
+                        "orders: chat_id=%s «%s» $%.2f, потолок $%.2f%s — %s: %s",
+                        chat_id, name, order.price_cents / 100, ceiling / 100,
+                        f" ({median_name} ${median / 100:.2f})" if median else "",
+                        decision.action, why,
+                    )
 
                 if decision.action == buy_orders.KEEP:
                     if decision.outbid and not entry.get("outbid_noted"):
