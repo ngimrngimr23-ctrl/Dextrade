@@ -9208,6 +9208,10 @@ def _round_lines(rnd: order_desk.Round, *, title: str, quiet: bool = False) -> l
         lines.append(
             f"{_EVENT_MARKS.get(e.kind, '•')} <code>{html_module.escape(e.name)}</code> — "
             f"{html_module.escape(e.text)}"
+            + (
+                f' · <a href="{html_module.escape(_steam_market_url(e.name))}">в Steam</a>'
+                if e.kind == order_desk.FILLED and e.name != "?" else ""
+            )
         )
     if rnd.problem:
         lines.append(f"⚠️ {html_module.escape(scan_errors.scrub(rnd.problem))}")
