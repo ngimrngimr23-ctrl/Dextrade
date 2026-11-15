@@ -2374,6 +2374,86 @@ async def recent_sale_listing_id(
     return str(rows[0]["id"]) if rows else None
 
 
+TRADE_COLUMNS = (
+    "сторона", "id_сделки", "создана_utc", "состояние", "предмет", "цена_$",
+    "флоат", "паттерн", "наклейки", "тип_лота", "asset_id",
+)
+
+
+def _trade_row(row: dict, role: str) -> dict:
+    """Одна сделка CSFloat плоской строкой для выгрузки."""
+    contract = row.get("contract") if isinstance(row.get("contract"), dict) else {}
+    item = contract.get("item") if isinstance(contract.get("item"), dict) else {}
+    if not item and isinstance(row.get("item"), dict):
+        item = row["item"]
+    stickers = []
+    for st in item.get("stickers") or []:
+        if not isinstance(st, dict):
+            continue
+        label = str(st.get("name") or st.get("stickerId") or "?")
+        wear = st.get("wear")
+        if isinstance(wear, (int, float)) and wear > 0:
+            label += f" [износ {wear:.2f}]"
+        stickers.append(label)
+    cents = _cents_int(contract.get("price", row.get("price")))
+    return {
+        "сторона": "покупка" if role == "buyer" else "продажа",
+        "id_сделки": "" if row.get("id") in (None, "") else str(row.get("id")),
+        "создана_utc": row.get("created_at") or "",
+        "состояние": row.get("state") or "",
+        "предмет": item.get("market_hash_name") or row.get("market_hash_name") or "",
+        "цена_$": "" if cents is None else f"{cents / 100:.2f}",
+        "флоат": item.get("float_value", ""),
+        "паттерн": item.get("paint_seed", ""),
+        "наклейки": "; ".join(stickers),
+        "тип_лота": contract.get("type") or "",
+        "asset_id": item.get("asset_id") or "",
+    }
+
+
+async def my_trades(
+    session: aiohttp.ClientSession, role: str, *,
+    page_size: int = 100, max_pages: int = 30,
+) -> tuple[list[dict], str | None]:
+    """
+    Все свои сделки в одной роли (buyer/seller) плоскими строками.
+
+    Возвращает (строки, причина обрыва). Причина None — дочитали до конца;
+    иначе строки — то, что успели прочитать до отказа, и выгрузка неполная.
+    Состояние не фильтруем: отменённые и возвращённые сделки тоже нужны,
+    чтобы их можно было отделить при разборе, а не гадать, куда они делись.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for page in range(max_pages):
+        try:
+            status, data = await _authed(
+                session, "GET", "/me/trades",
+                params={"role": role, "limit": str(page_size), "page": str(page)},
+            )
+        except (CSFloatError, CSFloatRateLimited) as e:
+            return out, scrub(str(e))
+        if status != 200:
+            return out, f"HTTP {status}: {_api_message(data)[:120]}"
+        try:
+            rows, _ = _rows(data, "trades", "data", "items")
+        except _UnknownShape as e:
+            return out, str(e)
+        fresh = 0
+        for row in rows:
+            flat = _trade_row(row, role)
+            key = flat["id_сделки"]
+            if key and key in seen:
+                continue
+            seen.add(key)
+            out.append(flat)
+            fresh += 1
+        # Конец списка: страница неполная или сервер пошёл по кругу.
+        if len(rows) < page_size or not fresh:
+            return out, None
+    return out, f"прочитано только {max_pages} страниц — сделок больше"
+
+
 async def my_recent_purchases(
     session: aiohttp.ClientSession, *, limit: int = 30,
 ) -> list[Purchase] | None:

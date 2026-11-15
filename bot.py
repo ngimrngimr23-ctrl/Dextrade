@@ -39,6 +39,7 @@ Telegram.
 """
 
 import asyncio
+import csv
 import datetime as dt
 from collections import Counter
 import functools
@@ -9547,6 +9548,39 @@ def _cancel_lines(result: order_desk.CancelOutcome) -> list[str]:
     return lines
 
 
+async def trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/trades — выгрузить все сделки CSFloat (покупки и продажи) файлом CSV."""
+    await update.message.reply_text("Читаю сделки с CSFloat…")
+    rows: list[dict] = []
+    notes: list[str] = []
+    async with aiohttp.ClientSession() as session:
+        for role, word in (("buyer", "покупки"), ("seller", "продажи")):
+            part, problem = await csfloat_client.my_trades(session, role)
+            rows.extend(part)
+            if problem:
+                notes.append(f"⚠️ {word} прочитаны не все: {scan_errors.scrub(problem)}")
+    if not rows:
+        await update.message.reply_text(
+            "\n".join(notes) or "Сделок на CSFloat не нашлось."
+        )
+        return
+    rows.sort(key=lambda r: str(r["создана_utc"]))
+    text = io.StringIO()
+    writer = csv.DictWriter(text, fieldnames=csfloat_client.TRADE_COLUMNS)
+    writer.writeheader()
+    writer.writerows(rows)
+    bought = sum(1 for r in rows if r["сторона"] == "покупка")
+    caption = f"Сделки CSFloat: покупок {bought}, продаж {len(rows) - bought}."
+    if notes:
+        caption += "\n" + "\n".join(notes)
+    await update.message.reply_document(
+        # utf-8-sig — чтобы Excel открыл кириллицу без кракозябр.
+        document=io.BytesIO(text.getvalue().encode("utf-8-sig")),
+        filename="csfloat_trades.csv",
+        caption=caption[:1000],
+    )
+
+
 async def myorders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/myorders — все ордера на CSFloat: ботовые и ручные, баланс, бюджет."""
     chat_id = update.effective_chat.id
@@ -12268,6 +12302,12 @@ COMMANDS: tuple[Command, ...] = (
         "/myorders — все ордера на CSFloat: 🤖 поставленные ботом и ✋ ручные, "
         "баланс, сколько занято из бюджета. Кнопка «Сверить сейчас» — проверить "
         "стаканы немедленно.",
+    ),
+    Command(
+        "trades", trades_cmd, "Ордера CSFloat",
+        "Выгрузить сделки CSFloat",
+        "/trades — все сделки на CSFloat (покупки и продажи) одним файлом CSV: "
+        "дата, предмет, цена, флоат, наклейки, состояние сделки.",
     ),
     Command(
         "cancelorders", cancelorders, "Ордера CSFloat",
