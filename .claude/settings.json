@@ -5,7 +5,9 @@
   },
   "permissions": {
     "allow": [
-      "Bash(curl -sSL --compressed -o med/pages/*)"
+      "Bash(curl -sSL --compressed -o med/pages/*)",
+      "mcp__HF_Spaces",
+      "mcp__Hugging_Face"
     ]
   }
 }
