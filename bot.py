@@ -1469,12 +1469,17 @@ async def watchadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if block:
             lines.append(block)
     if warnings:
-        lines.append("Уточни, если не то:\n" + "\n".join(f"• {w}" for w in warnings))
+        lines.append("Уточни, если не то:\n" + "\n".join(f"• {w}" for w in warnings[:_ADD_LIST_LIMIT])
+                     + (f"\n…и ещё {len(warnings) - _ADD_LIST_LIMIT}" if len(warnings) > _ADD_LIST_LIMIT else ""))
     if unresolved:
-        lines.append("Не распознал:\n" + "\n".join(f"• {s}" for s in unresolved))
+        lines.append("Не распознал:\n" + "\n".join(f"• {s}" for s in unresolved[:_ADD_LIST_LIMIT])
+                     + (f"\n…и ещё {len(unresolved) - _ADD_LIST_LIMIT}" if len(unresolved) > _ADD_LIST_LIMIT else ""))
     interval = await _get_watch_interval(chat_id)
     lines.append(f"Всего в списке: {len(current)}. Следующий прогон — через {interval:g} мин после конца текущего/предыдущего.")
-    await update.message.reply_text("\n\n".join(lines))
+    # Нераспознанных и уточнений может быть сотни — одним сообщением Telegram
+    # такое не принимает («Text is too long»), и итог пропадал вместе с ними.
+    for part in _chunk_lines(lines, sep="\n\n"):
+        await update.message.reply_text(part)
 
 
 async def watchdel(update: Update, context: ContextTypes.DEFAULT_TYPE):
