@@ -5909,6 +5909,7 @@ def _volume_age(entry: dict, now: float) -> float | None:
 async def _live_prices_for(
     chat_id: int, names: list[str], *, max_age: float | None = None,
     need_volume: bool = False, budget: int | None = None,
+    snapshot_ok: bool = False,
 ) -> dict[str, LiveQuote]:
     """
     Живая цена Steam по списку имён — сколько получится в рамках бюджета.
@@ -5976,6 +5977,30 @@ async def _live_prices_for(
             entry["price"], entry.get("median"), entry.get("volume"), age,
             _volume_age(entry, now),
         )
+
+    # КОТИРОВКИ ИЗ ФАЙЛА. Когда адрес бота у Steam в бане, живых ответов нет,
+    # и единственные свежие цены — те, что сняли снаружи и переслали файлом
+    # (steam_snapshot.parse_quotes). Это тот же ответ priceoverview, только
+    # снятый не с Render. Берём их, пока они не старше max_age; без max_age
+    # (то есть «любой возраст») файл не подставляем — это решает вызывающий.
+    # Только по просьбе (snapshot_ok): /dips своё окно в полчаса не меняет.
+    if snapshot_ok and max_age is not None:
+        snap = await steam_snapshot.latest()
+        if snap is not None and snap.quotes:
+            for name in names:
+                if name in out:
+                    continue
+                quote = snap.quote(name, now)
+                if quote is None or quote[2] > max_age:
+                    continue
+                sold = snap.volume(name, now)
+                out[name] = LiveQuote(
+                    quote[0] / 100,
+                    quote[1] / 100 if quote[1] else None,
+                    sold[0] if sold else None,
+                    quote[2],
+                    sold[1] if sold else None,
+                )
 
     # budget — сколько живых запросов разрешено этому вызову. Умолчание общее
     # (STEAM_LIVE_BUDGET), но у проверки финалистов /orders своя цена вопроса:
@@ -6964,6 +6989,28 @@ ORDERS_STEAM_VERIFY_LIMIT = envcfg.env_int("ORDERS_STEAM_VERIFY_LIMIT", 25)
 # же окно, что у /dips (DIPS_MAX_QUOTE_AGE), и до постановки по кнопке цена
 # доживает не старше трёх четвертей часа.
 ORDERS_STEAM_MAX_AGE = envcfg.env_float("ORDERS_STEAM_MAX_AGE_MIN", 30) * 60
+
+
+def _orders_fresh_seconds(saved: dict) -> float:
+    """
+    Насколько старой может быть цена Steam, чтобы по ней ставить ордер.
+
+    Умолчание — ORDERS_STEAM_MAX_AGE (полчаса: живой ответ Steam). Человек
+    может растянуть окно командой /fresh: когда адрес бота у Steam в бане,
+    свежих ответов нет, а файл котировок, снятый снаружи, есть. Потолок —
+    срок годности цен снимка (steam_snapshot.MAX_AGE_HOURS).
+    """
+    hours = saved.get("fresh_hours")
+    if not hours or hours <= 0:
+        return ORDERS_STEAM_MAX_AGE
+    return min(float(hours), steam_snapshot.MAX_AGE_HOURS) * 3600
+
+
+def _age_label(seconds: float) -> str:
+    """«30 мин» / «3 ч» — для сообщений про окно свежести."""
+    if seconds < 5400:
+        return f"{seconds / 60:.0f} мин"
+    return f"{round(seconds / 3600, 1):g} ч"
 
 # Насколько низко относительно витрины CSFloat заявка ещё имеет шанс.
 #
@@ -8136,6 +8183,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       if saved.get("max_month_spread") is not None
                       else buy_orders.DEFAULT_MAX_MONTH_SPREAD_PCT),
     }
+    fresh_age = _orders_fresh_seconds(saved)
     await update.message.reply_text(
         "Ищу ордера: смотрю арбитраж, просадки и цены CSFloat, читаю стаканы…\n"
         "Сам ничего не ставлю — только по кнопке под отчётом."
@@ -8348,14 +8396,15 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pages = await _steam_histories(verified_names)
         for name, page in pages.items():
             quote = _quote_from_page(page)
-            if quote is not None and quote.age_seconds <= ORDERS_STEAM_MAX_AGE:
+            if quote is not None and quote.age_seconds <= fresh_age:
                 fresh[name] = quote
                 await set_steam_price(name, quote.ask, quote.volume, quote.median)
         rest = [n for n in verified_names if n not in fresh]
         if rest:
             fresh.update(await _live_prices_for(
-                chat_id, rest, max_age=ORDERS_STEAM_MAX_AGE,
+                chat_id, rest, max_age=fresh_age,
                 need_volume=True, budget=ORDERS_STEAM_VERIFY_LIMIT,
+                snapshot_ok=True,
             ))
 
         def _with_live(c: _OrderCandidate) -> _OrderCandidate:
@@ -8376,7 +8425,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Цена для расчёта — не голый нижний лот, а меньшее из него и
             # медианы сделок (buy_orders.steam_sale_cents): одинокая
             # завышенная заявка в Steam не должна поднимать нам потолок.
-            live = quote.age_seconds <= ORDERS_STEAM_MAX_AGE
+            live = quote.age_seconds <= fresh_age
             sale = buy_orders.steam_sale_cents(quote.ask, quote.median)
             ask = int(round(quote.ask * 100))
             return c._replace(
@@ -8398,10 +8447,10 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ages = [c.volume_age_seconds for c in ranked
                 if c.volume_age_seconds is not None]
         log.info(
-            "orders: цена Steam не старше %.0f мин у %d из %d финалист(ов) "
+            "orders: цена Steam не старше %s у %d из %d финалист(ов) "
             "(медиана сделок срезала нижний лот у %d), объём знаем у %d. "
             "Возраст замеров объёма: %s",
-            ORDERS_STEAM_MAX_AGE / 60,
+            _age_label(fresh_age),
             sum(1 for c in ranked if c.steam_verified), len(ranked),
             sum(1 for c in ranked if c.steam_ask_cents is not None),
             sum(1 for c in ranked if c.volume_per_day is not None),
@@ -8953,7 +9002,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + (f"по ценам CSFloat {from_csfloat}. " if cf_prices is not None
            else f"каталог {from_catalog}. ")
         + f"В финал вышло {len(ranked)}, свежая цена Steam (до "
-        f"{ORDERS_STEAM_MAX_AGE / 60:.0f} мин) у {checked}."
+        f"{_age_label(fresh_age)}) у {checked}."
     )
     lines.append(
         f"Пороги: прибыль от {limits['profit']:g}%, "
@@ -8991,7 +9040,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if plan.market_hash_name in blind:
             why = "стакан не прочитан — не знаю, кого перебивать"
         elif not verified_by_name.get(plan.market_hash_name, False):
-            why = (f"цены Steam моложе {ORDERS_STEAM_MAX_AGE / 60:.0f} мин нет — "
+            why = (f"цены Steam моложе {_age_label(fresh_age)} нет — "
                    "только оценка прайс-листа")
         elif not plan.instant and reach is not None and reach < ORDERS_MIN_REACH:
             why = "заявка ниже витрины в разы — не исполнится"
@@ -9120,8 +9169,9 @@ async def _offer_order_batch(
     instant = sum(1 for t in tickets if t.instant)
     lines = [
         f"<b>Можно поставить: {len(tickets)} ордер(ов) на {_usd(total)}</b>",
-        f"Прошли все проверки: цена Steam не старше {ORDERS_STEAM_MAX_AGE / 60:.0f} "
-        "мин, прочитанный стакан, заявка достаёт до рынка. Перед постановкой "
+        f"Прошли все проверки: цена Steam не старше "
+        f"{_age_label(_orders_fresh_seconds(await get_order_settings(chat_id)))}, "
+        "прочитанный стакан, заявка достаёт до рынка. Перед постановкой "
         "стакан перечитаю и встану на шаг выше верхнего ордера, но не выше "
         "потолка прибыли.",
     ]
@@ -9734,6 +9784,65 @@ async def cancelorders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def fresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/fresh [часы] — сколько часов цена Steam считается свежей для постановки ордеров."""
+    chat_id = update.effective_chat.id
+    saved = await get_order_settings(chat_id)
+    args = context.args or []
+    if not args:
+        window = _orders_fresh_seconds(saved)
+        snapshot = await steam_snapshot.latest()
+        quotes = snapshot.quotes if snapshot else None
+        lines = [f"<b>Окно свежести цены Steam:</b> {_age_label(window)}"
+                 + (" (умолчание)" if not saved.get("fresh_hours") else "")]
+        if quotes:
+            now = time.time()
+            ages = sorted(now - row[2] for row in quotes.values())
+            inside = sum(1 for a in ages if a <= window)
+            lines.append(
+                f"Котировок из файла: {len(quotes)}, самые свежие {_age_label(ages[0])} "
+                f"назад; в окне сейчас {inside}"
+            )
+        else:
+            lines.append("Файла свежих котировок в боте нет.")
+        lines += [
+            "",
+            "Это про то, по какой цене Steam бот ставит ордера. Живой ответ Steam "
+            "всегда подходит; если его нет (Steam блокирует адрес бота), берутся "
+            "котировки из присланного файла, пока они не старше окна.",
+            f"Поменять: <code>/fresh 3</code> — три часа (до {steam_snapshot.MAX_AGE_HOURS:.0f} ч). "
+            "Вернуть полчаса: <code>/fresh сброс</code>",
+        ]
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        return
+    word = args[0].lower()
+    if word in _OFF_WORDS or word in ("сброс", "reset", "default"):
+        await set_order_setting(chat_id, "fresh_hours", None)
+        await update.message.reply_text(
+            f"Окно свежести сброшено: снова {_age_label(ORDERS_STEAM_MAX_AGE)}."
+        )
+        return
+    try:
+        hours = float(word.replace(",", ".").rstrip("чh"))
+    except ValueError:
+        await update.message.reply_text(
+            "Не разобрал. Напиши число часов: /fresh 3 (или /fresh сброс)."
+        )
+        return
+    if not 0.1 <= hours <= steam_snapshot.MAX_AGE_HOURS:
+        await update.message.reply_text(
+            f"Окно — от 0.1 до {steam_snapshot.MAX_AGE_HOURS:.0f} часов: дальше цены "
+            "снимка бот всё равно не использует."
+        )
+        return
+    await set_order_setting(chat_id, "fresh_hours", hours)
+    await update.message.reply_text(
+        f"Готово: цена Steam для ордеров считается свежей {_age_label(hours * 3600)}. "
+        "Чем больше окно, тем старее цена, по которой ставятся деньги. "
+        "Искать ордера: /orders"
+    )
+
+
 async def orderbudget(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/orderbudget [$всего] [макс шт] — предохранители настоящих ордеров."""
     chat_id = update.effective_chat.id
@@ -10340,6 +10449,48 @@ def _snapshot_lines(snapshot, counts: dict[str, int], threshold: float) -> list[
     return lines
 
 
+async def _absorb_steam_quotes(update, quotes: dict) -> None:
+    """Принять файл свежих котировок Steam: дописать к снимку и сказать, как их использовать."""
+    chat_id = update.effective_chat.id
+    snapshot = await steam_snapshot.latest()
+    if snapshot is None:
+        await update.message.reply_text(
+            "Файл котировок читается, но дописать его не к чему: в боте нет "
+            "основного снимка цен Steam. Сначала пришли cs2_skins_steam_prices_history.csv."
+        )
+        return
+    merged = steam_snapshot.merge_quotes(snapshot, quotes)
+    try:
+        await steam_snapshot.save(merged)
+    except StorageUnavailable as e:
+        await update.message.reply_text(
+            f"⚠️ Файл прочитан ({len(quotes)} котировок), но не сохранён: "
+            f"{scan_errors.scrub(str(e))}. Попробуй прислать ещё раз."
+        )
+        return
+    now = time.time()
+    ages = sorted((now - row[3]) for row in quotes.values())
+    window = _orders_fresh_seconds(await get_order_settings(chat_id))
+    lines = [
+        f"✅ <b>Принял свежие котировки Steam: {len(quotes)} предметов</b>",
+        f"• снятые {_age_label(ages[0])}–{_age_label(ages[-1])} назад",
+        f"• /orders возьмёт их как свежую цену Steam, пока они не старше окна — "
+        f"сейчас оно <b>{_age_label(window)}</b>",
+    ]
+    if ages[0] > window:
+        lines.append(
+            "• ⚠️ даже самая свежая уже старше окна — поставь окно побольше, "
+            f"например <code>/fresh {max(1, int(ages[-1] / 3600) + 1)}</code>"
+        )
+    elif ages[-1] > window:
+        lines.append(
+            f"• часть котировок старше окна и не пригодится: <code>/fresh "
+            f"{max(1, int(ages[-1] / 3600) + 1)}</code> возьмёт все"
+        )
+    lines.append("Окно: /fresh. Искать ордера: /orders")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def _absorb_steam_snapshot(update, snapshot) -> None:
     """Принять присланный снимок цен Steam и сказать, что в нём."""
     chat_id = update.effective_chat.id
@@ -10513,6 +10664,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # разбора списка имён. В строках снимка есть «|», и разбор списка
         # принял бы пятнадцать тысяч строк цен за предметы для вотчлиста.
         if not is_pdf:
+            try:
+                quotes = steam_snapshot.parse_quotes(text)
+            except steam_snapshot.SnapshotError as e:
+                await update.message.reply_text(
+                    f"Похоже на файл котировок Steam, но принять его не могу: {e}"
+                )
+                return
+            if quotes is not None:
+                await _absorb_steam_quotes(update, quotes)
+                return
             try:
                 snapshot = steam_snapshot.parse(text)
             except steam_snapshot.SnapshotError as e:
@@ -12322,6 +12483,14 @@ COMMANDS: tuple[Command, ...] = (
         "/steamprices — какой снимок цен Steam у бота, насколько свежий и "
         "сколько скинов в нём стабильны за месяц. Обновить: переслать боту "
         "файл cs2_skins_steam_prices_history.csv.",
+    ),
+    Command(
+        "fresh", fresh_cmd, "Ордера CSFloat",
+        "Сколько держать цену Steam свежей",
+        "/fresh — показать окно свежести цены Steam для ордеров\n"
+        "/fresh 3 — считать цену свежей 3 часа (нужно, когда живой Steam "
+        "молчит и цены берутся из присланного файла котировок)\n"
+        "/fresh сброс — вернуть полчаса.",
     ),
     Command(
         "orderbudget", orderbudget, "Ордера CSFloat",

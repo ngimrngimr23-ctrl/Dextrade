@@ -98,6 +98,10 @@ class Snapshot(NamedTuple):
     volumes: dict[str, tuple[int, float]] | None = None
     # имя -> (медиана сделок за 30 дней в центах, когда замерено).
     medians: dict[str, tuple[int, float]] | None = None
+    # имя -> (нижний лот в центах, медиана сделок за сутки в центах или None,
+    # когда снято). Свежие замеры из файла котировок (parse_quotes): у каждого
+    # своё время, в отличие от цен снимка, у которых время одно на весь файл.
+    quotes: dict[str, tuple[int, int | None, float]] | None = None
 
     def age_hours(self, now: float | None = None) -> float:
         return max(0.0, ((now or time.time()) - self.collected_at) / 3600)
@@ -109,6 +113,13 @@ class Snapshot(NamedTuple):
     def volume(self, name: str, now: float | None = None) -> tuple[int, float] | None:
         """(продано за сутки, возраст замера в секундах). None — нет или устарел."""
         return _fresh((self.volumes or {}).get(name), now)
+
+    def quote(self, name: str, now: float | None = None) -> tuple[int, int | None, float] | None:
+        """(нижний лот в центах, медиана за сутки в центах, возраст в секундах)."""
+        row = (self.quotes or {}).get(name)
+        if row is None:
+            return None
+        return row[0], row[1], max(0.0, (now or time.time()) - row[2])
 
     def month_median(self, name: str, now: float | None = None) -> tuple[int, float] | None:
         """(медиана сделок за 30 дней в центах, возраст замера в секундах). None — нет или устарела."""
@@ -128,6 +139,10 @@ class Snapshot(NamedTuple):
                      f"{time.strftime('%d.%m %H:%M', time.gmtime(newest))} UTC)")
         if self.medians:
             text += f", медиана сделок за месяц у {len(self.medians)}"
+        if self.quotes:
+            newest = max(row[2] for row in self.quotes.values())
+            text += (f", свежие котировки у {len(self.quotes)} (снятые "
+                     f"{time.strftime('%d.%m %H:%M', time.gmtime(newest))} UTC)")
         return text
 
 
@@ -292,6 +307,73 @@ def _checked(prices, collected_at, *, has_time_column: bool, volumes=None,
     return Snapshot(collected_at, prices, volumes or None, medians or None)
 
 
+_QUOTE_NAME = "market_hash_name"
+_QUOTE_TIME = "quote_at_utc"
+
+
+def parse_quotes(text: str) -> dict[str, tuple[int, int | None, int | None, float]] | None:
+    """
+    Файл котировок (steam_quotes.csv) -> {имя: (лот в центах, медиана за сутки
+    в центах, продано за сутки, когда снято)}. None — это не файл котировок.
+
+    Отдельный от снимка файл: снимок заменяет прежний целиком, а котировки —
+    несколько сотен свежих замеров, которые должны ДОПИСАТЬСЯ к снимку, не
+    стерев объёмы и медианы остальных пятнадцати тысяч предметов.
+    Колонки: market_hash_name; ask_usd; median24_usd; volume24; quote_at_utc.
+    """
+    body = text.lstrip("\ufeff")
+    first = body.splitlines()[0] if body.strip() else ""
+    if _QUOTE_TIME not in first:
+        return None
+    delimiter = ";" if ";" in first else ","
+    rows = list(csv.reader(io.StringIO(body), delimiter=delimiter))
+    header = rows[0]
+    try:
+        name_i = header.index(_QUOTE_NAME)
+        ask_i = header.index("ask_usd")
+        time_i = header.index(_QUOTE_TIME)
+    except ValueError:
+        raise SnapshotError("в файле котировок нет колонок market_hash_name, ask_usd, quote_at_utc") from None
+    med_i = header.index("median24_usd") if "median24_usd" in header else None
+    vol_i = header.index("volume24") if "volume24" in header else None
+    now = time.time()
+    out: dict[str, tuple[int, int | None, int | None, float]] = {}
+    for row in rows[1:]:
+        if len(row) <= max(name_i, ask_i, time_i):
+            continue
+        name = row[name_i].strip()
+        ask = _number(row[ask_i])
+        at = _parse_time(row[time_i])
+        if not name or not ask or ask <= 0 or at is None or at > now + 3600:
+            continue
+        median = _number(row[med_i]) if med_i is not None and len(row) > med_i else None
+        volume = _number(row[vol_i]) if vol_i is not None and len(row) > vol_i else None
+        out[name] = (
+            round(ask * 100),
+            round(median * 100) if median and median > 0 else None,
+            int(volume) if volume is not None and volume >= 0 else None,
+            at,
+        )
+    if not out:
+        raise SnapshotError("в файле котировок нет ни одной годной строки")
+    return out
+
+
+def merge_quotes(snapshot: Snapshot, fresh: dict[str, tuple[int, int | None, int | None, float]]) -> Snapshot:
+    """Дописать котировки к снимку: цены, объёмы и медианы остальных не трогаем."""
+    quotes = dict(snapshot.quotes or {})
+    volumes = dict(snapshot.volumes or {})
+    for name, (ask, median, volume, at) in fresh.items():
+        old = quotes.get(name)
+        if old is None or at >= old[2]:
+            quotes[name] = (ask, median, at)
+        if volume is not None:
+            seen = volumes.get(name)
+            if seen is None or at >= seen[1]:
+                volumes[name] = (volume, at)
+    return snapshot._replace(quotes=quotes or None, volumes=volumes or None)
+
+
 def parse(text: str) -> Snapshot | None:
     """
     Снимок из текста файла. None — это не снимок (разбирать дальше как обычно).
@@ -313,14 +395,25 @@ async def save(snapshot: Snapshot) -> None:
     volumes = snapshot.volumes or {}
     medians = snapshot.medians or {}
 
+    quotes = snapshot.quotes or {}
+
     def stored(name: str, row: tuple) -> list:
         # [цена, лотов] или [цена, лотов, продано за сутки, когда замерено,
-        # медиана за месяц] — у объёма и медианы время замера общее.
+        # медиана за месяц] — у объёма и медианы время замера общее. Если у
+        # предмета есть котировка, к строке дописываются ещё [когда снята
+        # котировка, лот, медиана за сутки].
         sold, median = volumes.get(name), medians.get(name)
-        if sold is None and median is None:
+        quote = quotes.get(name)
+        if sold is None and median is None and quote is None:
             return list(row)
-        return list(row) + [sold[0] if sold else None, (sold or median)[1],
-                            median[0] if median else None]
+        out = list(row) + [
+            sold[0] if sold else None,
+            (sold or median)[1] if (sold or median) else None,
+            median[0] if median else None,
+        ]
+        if quote is not None:
+            out += [quote[2], quote[0], quote[1]]
+        return out
 
     await save_steam_snapshot(
         {"collected_at": snapshot.collected_at, "count": len(snapshot.prices),
@@ -379,6 +472,9 @@ async def latest() -> Snapshot | None:
          if len(row) >= 4 and row[2] is not None and row[3] is not None} or None,
         {name: (int(row[4]), float(row[3])) for name, row in raw.items()
          if len(row) >= 5 and row[4] is not None and row[3] is not None} or None,
+        {name: (int(row[6]), int(row[7]) if row[7] is not None else None, float(row[5]))
+         for name, row in raw.items()
+         if len(row) >= 8 and row[5] is not None and row[6] is not None} or None,
     )
     _cached_stamp = _stamp(meta)
     return _cached
@@ -399,7 +495,7 @@ async def current() -> tuple[Snapshot | None, str | None]:
     if snapshot is None:
         return None, None
     if snapshot.age_hours() > MAX_AGE_HOURS:
-        if snapshot.volumes or snapshot.medians:
+        if snapshot.volumes or snapshot.medians or snapshot.quotes:
             return snapshot._replace(prices={}), None
         return None, (
             f"{snapshot.describe()} — старше {MAX_AGE_HOURS:.0f} ч, не использую. "
