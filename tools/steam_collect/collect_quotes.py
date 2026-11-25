@@ -42,11 +42,13 @@ def ask(name):
     url = ("https://steamcommunity.com/market/priceoverview/?appid=730&currency=1"
            "&market_hash_name=" + urllib.parse.quote(name, safe=""))
     out = subprocess.run(
-        ["curl", "-sS", "-m", "25", "-w", "\n%{http_code}", url],
-        capture_output=True, text=True,
+        ["curl", "-sS", "--compressed", "-m", "25", "-w", "\n%{http_code}", url],
+        capture_output=True,
     )
-    body, _, code = out.stdout.rpartition("\n")
-    return int(code or 0), body
+    # Ответ бывает сжат или обрезан обрывом — декодируем без падения.
+    text = out.stdout.decode("utf-8", errors="replace")
+    body, _, code = text.rpartition("\n")
+    return int(code) if code.strip().isdigit() else 0, body
 
 
 def main():
@@ -72,6 +74,9 @@ def main():
                 return
             while True:
                 code, body = ask(name)
+                if code == 0:          # сеть оборвалась — короткая пауза и ещё раз
+                    time.sleep(10)
+                    code, body = ask(name)
                 if code == 429:
                     streak += 1
                     if streak >= GIVE_UP_AFTER:
